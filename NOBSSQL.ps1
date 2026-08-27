@@ -1,0 +1,3632 @@
+<#
+================================================================================
+ NOBSSQL.ps1  -  local web-based MySQL/MariaDB client
+ ------------------------------------------------------------------------------
+ A tiny PowerShell HTTP server (127.0.0.1 only, no admin) that shells out to
+ mysql.exe / mysqldump.exe and returns JSON; the UI is a self-contained HTML
+ page in your default browser.
+
+ Features: browse schemas + objects (tables/views/routines/triggers/events),
+ run SQL in tabs, editable result grids (insert/update/delete), view & edit
+ object DDL, create/drop schemas, drop/rename/truncate tables, data export and
+ import.
+
+ USAGE:  powershell -ExecutionPolicy Bypass -File .\NOBSSQL.ps1
+         (browser opens automatically; close THIS console to stop the server)
+
+ COPYRIGHT & LICENSE:
+ Copyright (c) 2026 [Viktor Ljuca/monsama.ch]. All rights reserved.
+ Licensed under the MIT License. See LICENSE file for details.
+================================================================================
+#>
+param([switch]$NoBrowser)
+
+$script:PackedPayload = ''
+
+$ErrorActionPreference = 'Stop'
+$script:MysqldumpPath = $null
+$script:MysqlPath     = $null
+$script:ServerIsMariaDB = $null
+$script:RunningQueries = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+$script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
+# MANY sequential queries (one per table/chunk) rather than one big one, so instead of trying to
+# kill whichever single sub-query happens to be in flight, each loop just checks this set between
+# iterations and stops cleanly if its requestId shows up here.
+$script:CancelledCompares = [System.Collections.Concurrent.ConcurrentDictionary[string,bool]]::new()
+
+$script:CfgFile = Join-Path $env:APPDATA 'NOBSSQL\config.json'
+$script:ToolsDir = Join-Path $env:APPDATA 'NOBSSQL\bin'
+
+# Snapshot builtin function names now, before any of our own functions exist,
+# so later we can diff out just the ones we need to hand to each runspace.
+$BuiltinFunctionNames = (Get-ChildItem function:).Name
+
+# Serializes writes to the small JSON config files (connections/library/config) so two
+# near-simultaneous saves from different runspaces can't clobber each other.
+function Use-FileLock {
+    param([string]$Name,[scriptblock]$Body)
+    $mtx = New-Object System.Threading.Mutex($false, "Global\NOBSSQL_$Name")
+    $got = $false
+    try {
+        $got = $mtx.WaitOne(5000)
+        & $Body
+    } finally {
+        if ($got) { $mtx.ReleaseMutex() }
+        $mtx.Dispose()
+    }
+}
+
+# Read the saved app config (config.json) - e.g. where mysql.exe lives.
+function Load-Cfg { if(Test-Path $script:CfgFile){ try { $raw=[IO.File]::ReadAllText($script:CfgFile); $raw=$raw.TrimStart([char]0xFEFF); if($raw.Trim()){ return ($raw | ConvertFrom-Json) } } catch {} } return $null }
+# Write the app config back to disk (config.json).
+function Save-Cfg { param($obj) Use-FileLock 'Cfg' { $d=Split-Path $script:CfgFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}; [IO.File]::WriteAllText($script:CfgFile, ($obj | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false))) } }
+# Find mysql.exe / mysqldump.exe: config -> packaged -> PATH -> common install folders.
+function Resolve-Tools {
+    $script:MysqlSource = $null; $script:MysqldumpSource = $null
+    # 0) user-configured / downloaded paths win
+    $cfg = Load-Cfg
+    if ($cfg) {
+        if ($cfg.mysql_bin -and (Test-Path $cfg.mysql_bin))         { $script:MysqlPath     = [string]$cfg.mysql_bin; $script:MysqlSource = 'Saved configuration' }
+        if ($cfg.mysqldump_bin -and (Test-Path $cfg.mysqldump_bin)) { $script:MysqldumpPath = [string]$cfg.mysqldump_bin; $script:MysqldumpSource = 'Saved configuration' }
+        if ($script:MysqlPath -and $script:MysqldumpPath) { return }
+    }
+    if ($script:PackedPayload -and $script:PackedPayload.Trim().Length -gt 0) {
+        try {
+            $dir = Join-Path $env:TEMP ("mysqlweb_" + [Guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            $zip = Join-Path $dir 'payload.zip'
+            [IO.File]::WriteAllBytes($zip, [Convert]::FromBase64String($script:PackedPayload))
+            Expand-Archive -Path $zip -DestinationPath $dir -Force
+            Remove-Item $zip -Force
+            $dd = Get-ChildItem -Path $dir -Recurse -Filter 'mysqldump.exe' | Select-Object -First 1
+            $mm = Get-ChildItem -Path $dir -Recurse -Filter 'mysql.exe'     | Select-Object -First 1
+            if ($dd) { $script:MysqldumpPath = $dd.FullName; $script:MysqldumpSource = 'Bundled with this script' }
+            if ($mm) { $script:MysqlPath     = $mm.FullName; $script:MysqlSource = 'Bundled with this script' }
+            if ($script:MysqlPath) { return }
+        } catch { }
+    }
+    $dirs = @((Get-Location).Path); if ($PSScriptRoot) { $dirs += $PSScriptRoot }
+    foreach ($b in ($dirs | Select-Object -Unique)) {
+        if (-not $script:MysqldumpPath -and (Test-Path (Join-Path $b 'mysqldump.exe'))) { $script:MysqldumpPath = Join-Path $b 'mysqldump.exe'; $script:MysqldumpSource = "Found next to the script ($b)" }
+        if (-not $script:MysqlPath     -and (Test-Path (Join-Path $b 'mysql.exe')))     { $script:MysqlPath     = Join-Path $b 'mysql.exe'; $script:MysqlSource = "Found next to the script ($b)" }
+    }
+    if (-not $script:MysqlPath)     { $c=Get-Command mysql.exe -ErrorAction SilentlyContinue;     if($c){$script:MysqlPath=$c.Source; $script:MysqlSource = 'Found on the system PATH'} }
+    if (-not $script:MysqldumpPath) { $c=Get-Command mysqldump.exe -ErrorAction SilentlyContinue; if($c){$script:MysqldumpPath=$c.Source; $script:MysqldumpSource = 'Found on the system PATH'} }
+    if (-not $script:MysqlPath -or -not $script:MysqldumpPath) {
+        foreach ($g in @("$env:ProgramFiles\MariaDB*\bin","$env:ProgramFiles\MySQL\*\bin","${env:ProgramFiles(x86)}\MySQL\*\bin","C:\xampp\mysql\bin")) {
+            $hit = Get-ChildItem -Path (Join-Path $g 'mysql.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) {
+                if(-not $script:MysqlPath){$script:MysqlPath=$hit.FullName; $script:MysqlSource = "Found in $($hit.Directory.FullName)"}
+                $d=Join-Path $hit.Directory.FullName 'mysqldump.exe'
+                if(-not $script:MysqldumpPath -and (Test-Path $d)){$script:MysqldumpPath=$d; $script:MysqldumpSource = "Found in $($hit.Directory.FullName)"}
+                break
+            }
+        }
+    }
+}
+
+# Build the SSL-related lines for the temporary my.cnf options file.
+function Get-SslLines {
+    param($Mode)
+    if (-not $Mode -or $Mode -eq 'default') { return @() }
+    $maria = ($script:ServerIsMariaDB -ne $false)
+    if ($maria) { switch ($Mode) { 'disabled'{return @('skip-ssl')} 'required'{return @('ssl')} 'verify'{return @('ssl','ssl-verify-server-cert')} } }
+    else        { switch ($Mode) { 'disabled'{return @('ssl-mode=DISABLED')} 'required'{return @('ssl-mode=REQUIRED')} 'verify'{return @('ssl-mode=VERIFY_IDENTITY')} } }
+    return @()
+}
+# Create a temp my.cnf so the CLI tools can log in WITHOUT the password showing on the command line.
+function New-Cnf {
+    param($conn)
+    $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$($conn.host)"); [void]$sb.AppendLine("port=$($conn.port)"); [void]$sb.AppendLine("user=$($conn.user)")
+    if ($conn.password) { [void]$sb.AppendLine("password=$($conn.password -replace '\\','\\')") }
+    foreach ($l in (Get-SslLines $conn.ssl)) { [void]$sb.AppendLine($l) }
+    # Create the file empty first, then lock its ACL down to the current user only,
+    # BEFORE writing the password content into it.
+    [IO.File]::WriteAllText($tmp, '', (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        $acl = Get-Acl $tmp
+        $acl.SetAccessRuleProtection($true, $false)
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($me, 'FullControl', 'Allow')
+        $acl.AddAccessRule($rule)
+        Set-Acl -Path $tmp -AclObject $acl
+    } catch { }
+    [IO.File]::WriteAllText($tmp, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    return $tmp
+}
+# Safely quote a single command-line argument for the external tools.
+function Format-OneArg {
+    param([string]$a)
+    if ($a -ne '' -and $a -notmatch '[ \t\n\v"]') { return $a }
+    $sb=New-Object System.Text.StringBuilder; [void]$sb.Append('"'); $bs=0
+    foreach ($ch in $a.ToCharArray()) {
+        if ($ch -eq '\'){ $bs++; continue }
+        if ($ch -eq '"'){ [void]$sb.Append('\'*($bs*2+1)); [void]$sb.Append('"'); $bs=0; continue }
+        if ($bs){ [void]$sb.Append('\'*$bs); $bs=0 }
+        [void]$sb.Append($ch)
+    }
+    if ($bs){ [void]$sb.Append('\'*($bs*2)) }
+    [void]$sb.Append('"'); $sb.ToString()
+}
+# Quote a whole list of command-line arguments.
+function Format-Args { param([string[]]$Arguments) ($Arguments | ForEach-Object { Format-OneArg $_ }) -join ' ' }
+
+# Run an external process (mysql/mysqldump) and capture its stdout + stderr.
+# If $RequestId is supplied, the running process is registered so /api/cancel-query can kill it.
+function Run-Proc {
+    param([string]$Exe,[string[]]$Arguments,[string]$RequestId,[string]$JobId)
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$Exe; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+    $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
+    $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
+    $psi.Arguments=Format-Args $Arguments
+    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
+    $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
+    if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
+    if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $p }
+    try {
+        $ot=$p.StandardOutput.ReadToEndAsync(); $et=$p.StandardError.ReadToEndAsync(); $p.WaitForExit()
+        $outTxt = try { $ot.Result } catch { '' }
+        $errTxt = try { $et.Result } catch { '' }
+        if ($entry.Cancelled) { $errTxt = 'Query cancelled by user.' }
+        @{ exit=$p.ExitCode; out=$outTxt; err=$errTxt }
+    } finally {
+        if ($RequestId) { $null = $script:RunningQueries.TryRemove($RequestId, [ref]$null) }
+        if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $null }
+    }
+}
+# Like Run-Proc, but also pipes SQL text into the process via standard input.
+function Run-Stdin {
+    param([string]$Exe,[string[]]$Arguments,[string]$Text,[string]$File,[string]$JobId,[string]$RequestId)
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$Exe; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+    $psi.RedirectStandardInput=$true; $psi.RedirectStandardError=$true; $psi.Arguments=Format-Args $Arguments
+    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
+    if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $p }
+    $qEntry=$null
+    if ($RequestId) { $qEntry=[pscustomobject]@{ Process=$p; Cancelled=$false }; $script:RunningQueries[$RequestId]=$qEntry }
+    try {
+        $et=$p.StandardError.ReadToEndAsync()
+        if ($File) {
+            $fs=[IO.File]::OpenRead($File); $buf=New-Object byte[] 1048576
+            try { while(($n=$fs.Read($buf,0,$buf.Length)) -gt 0){ try { $p.StandardInput.BaseStream.Write($buf,0,$n) } catch { break } }; try { $p.StandardInput.BaseStream.Flush() } catch {} } finally { $fs.Close(); try { $p.StandardInput.Close() } catch {} }
+        } else {
+            $bytes=[Text.Encoding]::UTF8.GetBytes($Text); try { $p.StandardInput.BaseStream.Write($bytes,0,$bytes.Length); $p.StandardInput.BaseStream.Flush() } catch {}; try { $p.StandardInput.Close() } catch {}
+        }
+        $p.WaitForExit()
+        $errTxt = try { $et.Result } catch { '' }
+        if ($qEntry -and $qEntry.Cancelled) { $errTxt = 'Cancelled by user.' }
+        @{ exit=$p.ExitCode; err=$errTxt }
+    } finally {
+        if ($JobId -and $script:RunningJobs.ContainsKey($JobId)) { $script:RunningJobs[$JobId].CurrentProcess = $null }
+        if ($RequestId) { $null = $script:RunningQueries.TryRemove($RequestId, [ref]$null) }
+    }
+}
+
+# Decode one field from the tab-separated output the mysql CLI produces.
+function ConvertFrom-BatchField {
+    param([string]$s)
+    if ($s.IndexOf('\') -lt 0) { return $s }
+    $sb=New-Object System.Text.StringBuilder
+    for($i=0;$i -lt $s.Length;$i++){ $c=$s[$i]
+        if($c -eq '\' -and $i -lt $s.Length-1){ $n=$s[$i+1]; $i++
+            switch($n){ 't'{[void]$sb.Append("`t")} 'n'{[void]$sb.Append("`n")} 'r'{[void]$sb.Append("`r")} '0'{[void]$sb.Append([char]0)} default{[void]$sb.Append($n)} }
+        } else { [void]$sb.Append($c) }
+    }
+    $sb.ToString()
+}
+$script:ReservedSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@('accessible','add','all','alter','analyze','and','as','asc','asensitive','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','cube','cume_dist','current_date','current_time','current_timestamp','current_user','cursor','database','databases','day_hour','day_microsecond','day_minute','day_second','dec','decimal','declare','default','delayed','delete','dense_rank','desc','describe','deterministic','distinct','distinctrow','div','double','drop','dual','each','else','elseif','empty','enclosed','escaped','except','exists','exit','explain','false','fetch','first_value','float','float4','float8','for','force','foreign','from','fulltext','function','generated','get','grant','group','grouping','groups','having','high_priority','hour_microsecond','hour_minute','hour_second','if','ignore','in','index','infile','inner','inout','insensitive','insert','int','int1','int2','int3','int4','int8','integer','intersect','interval','into','io_after_gtids','io_before_gtids','is','iterate','join','json_table','key','keys','kill','lag','last_value','lateral','lead','leading','leave','left','like','limit','linear','lines','load','localtime','localtimestamp','lock','long','longblob','longtext','loop','low_priority','master_bind','master_ssl_verify_server_cert','match','maxvalue','mediumblob','mediumint','mediumtext','middleint','minute_microsecond','minute_second','mod','modifies','natural','not','no_write_to_binlog','nth_value','ntile','null','numeric','of','on','optimize','optimizer_costs','option','optionally','or','order','out','outer','outfile','over','partition','percent_rank','precision','primary','procedure','purge','range','rank','read','reads','read_write','real','recursive','references','regexp','release','rename','repeat','replace','require','resignal','restrict','return','revoke','right','rlike','row','rows','row_number','schema','schemas','second_microsecond','select','sensitive','separator','set','show','signal','smallint','spatial','specific','sql','sqlexception','sqlstate','sqlwarning','sql_big_result','sql_calc_found_rows','sql_small_result','ssl','starting','stored','straight_join','system','table','terminated','then','tinyblob','tinyint','tinytext','to','trailing','trigger','true','undo','union','unique','unlock','unsigned','update','usage','use','using','utc_date','utc_time','utc_timestamp','values','varbinary','varchar','varcharacter','varying','virtual','when','where','while','window','with','write','xor','year_month','zerofill'))
+# True if a table/column name must be backtick-quoted (reserved word or odd characters).
+function Needs-Quote { param([string]$n) if ($n -eq '' -or $n -notmatch '^[A-Za-z_$][A-Za-z0-9_$]*$') { return $true } return $script:ReservedSet.Contains($n.ToLower()) }
+$script:CtrlChars = [char[]]@([char]0,[char]1,[char]2,[char]3,[char]4,[char]5,[char]6,[char]7,[char]8,[char]11,[char]12,[char]14,[char]15,[char]16,[char]17,[char]18,[char]19,[char]20,[char]21,[char]22,[char]23,[char]24,[char]25,[char]26,[char]27,[char]28,[char]29,[char]30,[char]31)
+# Turn a raw CLI cell value into a real value (the literal NULL marker becomes an actual null).
+function CellVal { param($raw)
+    if($raw -eq '\N' -or $raw -eq 'NULL'){ return $null }
+    $v=ConvertFrom-BatchField $raw
+    if($v.Length -gt 0 -and $v.IndexOfAny($script:CtrlChars) -ge 0){ $b=[Text.Encoding]::UTF8.GetBytes($v); return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
+    return $v
+}
+# Quote an identifier (table/column) with backticks when needed - prevents broken/injected SQL.
+function SqlId  { param($x) $s=[string]$x; if (Needs-Quote $s) { '`' + ($s -replace '`','``') + '`' } else { $s } }
+# Quote a value as a SQL string literal (single quotes, escaped) - or NULL.
+function SqlLit { param($x) if($null -eq $x){'NULL'} else { "'" + ((([string]$x) -replace '\\','\\') -replace "'","''") + "'" } }
+# Run-Query2 represents binary/control-character values (e.g. a bit(1) byte, or blob content
+# with unprintable bytes) as hex text like "0x00" for safe display - that is NOT a real value,
+# it's our own display encoding. If we quote it with SqlLit as a string, MySQL tries to store
+# the literal 4-character text '0x00' instead of the 1-byte value it represents, which is why
+# a bit(1)/binary column fails with "Data too long". This emits it as a raw (unquoted) hex
+# literal instead, which MySQL correctly interprets as the original binary value.
+function SqlValLit { param($x)
+    if($null -eq $x){ return 'NULL' }
+    $s = [string]$x
+    if($s -match '^0x[0-9A-Fa-f]+$'){ return $s }
+    return (SqlLit $x)
+}
+# Pull the first meaningful error line out of tool output.
+function FirstErr { param($e)
+    $lines=@(($e -split "`r?`n")|Where-Object{ $_.Trim() -and ($_ -notmatch '^\s*-+\s*$') })
+    $err=$lines | Where-Object{ $_ -match '(?i)error' } | Select-Object -First 1
+    if($err){ $err } elseif($lines.Count){ $lines[0] } else { '' }
+}
+
+$script:JStrSpecialChars = [char[]]@('\','"',"`r","`n","`t",[char]0,[char]1,[char]2,[char]3,[char]4,[char]5,[char]6,[char]7,[char]8,[char]11,[char]12,[char]14,[char]15,[char]16,[char]17,[char]18,[char]19,[char]20,[char]21,[char]22,[char]23,[char]24,[char]25,[char]26,[char]27,[char]28,[char]29,[char]30,[char]31)
+# Encode ONE raw value as JSON (we build JSON by hand to avoid ConvertTo-Json quirks).
+function J-Str { param($s)
+    if ($null -eq $s) { return 'null' }
+    $t=[string]$s
+    if ($t.Length -eq 0) { return '""' }
+    if ($t.IndexOfAny($script:JStrSpecialChars) -lt 0) { return '"'+$t+'"' }
+    $t=$t -replace '\\','\\'; $t=$t -replace '"','\"'; $t=$t -replace "`r",'\r'; $t=$t -replace "`n",'\n'; $t=$t -replace "`t",'\t'
+    $t=[regex]::Replace($t,'[\x00-\x08\x0B\x0C\x0E-\x1F]',{ param($m) '\u{0:x4}' -f [int][char]$m.Value[0] })
+    '"'+$t+'"'
+}
+# Encode an array of RAW values as a JSON array. Do NOT pass already-built JSON strings here.
+function J-Arr { param($items) '['+(($items|ForEach-Object{ J-Str $_ }) -join ',')+']' }
+
+# Fast path for large result grids: one StringBuilder pass, inlined escaping for the
+# common case (no special characters), falling back to J-Str only for the rare cell
+# that actually needs it. Avoids a PowerShell function call per cell at scale.
+function J-RowsFast {
+    param($rows)
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('[')
+    $rCount = $rows.Count
+    for ($r=0; $r -lt $rCount; $r++) {
+        if ($r -gt 0) { [void]$sb.Append(',') }
+        [void]$sb.Append('[')
+        $row = $rows[$r]
+        $cCount = $row.Count
+        for ($c=0; $c -lt $cCount; $c++) {
+            if ($c -gt 0) { [void]$sb.Append(',') }
+            $v = $row[$c]
+            if ($null -eq $v) { [void]$sb.Append('null') }
+            else {
+                $t = [string]$v
+                if ($t.Length -eq 0) { [void]$sb.Append('""') }
+                elseif ($t.IndexOfAny($script:JStrSpecialChars) -lt 0) { [void]$sb.Append('"'); [void]$sb.Append($t); [void]$sb.Append('"') }
+                else { [void]$sb.Append((J-Str $t)) }
+            }
+        }
+        [void]$sb.Append(']')
+    }
+    [void]$sb.Append(']')
+    $sb.ToString()
+}
+
+# --- run a query, return a hashtable with columns + row-arrays (or error) ---
+# Core query runner: send SQL to mysql.exe and parse the result into columns + rows.
+function Run-Query2 {
+    param($conn,$sql,$db,$RequestId)
+    $cnf=New-Cnf $conn
+    try {
+        $a=@("--defaults-extra-file=$cnf","--batch","--default-character-set=utf8mb4")
+        if($db){ $a+="--database=$db" }
+        $a+=@("-e",$sql)
+        $r=Run-Proc $script:MysqlPath $a $RequestId
+        if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
+        if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
+        $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
+        if($lines.Count -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
+        $headers=@($lines[0].Split([char]9))
+        $hCount=$headers.Count
+        $rows=New-Object System.Collections.ArrayList($lines.Count)
+        for($i=1;$i -lt $lines.Count;$i++){
+            $fields=$lines[$i].Split([char]9)
+            $fCount=$fields.Count
+            $cells=New-Object object[] $hCount
+            for($c=0;$c -lt $hCount;$c++){
+                if($c -ge $fCount){ $cells[$c]=$null; continue }
+                $raw=$fields[$c]
+                if($raw -eq '\N' -or $raw -eq 'NULL'){ $cells[$c]=$null; continue }
+                $v = if($raw.IndexOf('\') -lt 0){ $raw } else { ConvertFrom-BatchField $raw }
+                if($v.Length -gt 0 -and $v.IndexOfAny($script:CtrlChars) -ge 0){
+                    $b=[Text.Encoding]::UTF8.GetBytes($v)
+                    $cells[$c]='0x'+(([BitConverter]::ToString($b)) -replace '-','')
+                } else {
+                    $cells[$c]=$v
+                }
+            }
+            [void]$rows.Add($cells)
+        }
+        return @{ ok=$true; columns=$headers; rows=$rows }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+# Leaner variant of Run-Query2, purpose-built for bulk-fetching a PRIMARY KEY column list (e.g.
+# ~950,000 ids to work out what's missing/different in Compare). Run-Query2 is general-purpose -
+# it checks every single cell for NULL, decodes backslash-escapes, and hex-encodes control
+# characters, because a normal query result can contain any of that. A primary key column can
+# never be NULL and is essentially never anything but a plain integer or simple string, so none
+# of that per-cell work is needed here - and across hundreds of thousands of rows, skipping it
+# is the difference between this being usably fast and not.
+# TRADE-OFF (documented, not hidden): this uses --raw, so it does NOT decode backslash-escapes.
+# A PK value containing an actual embedded tab/newline/backslash (exceedingly rare in practice)
+# could be mis-parsed here. This function is ONLY used to compute missing/matching id sets for
+# comparison - the real row data movement (insert/update) always goes through the fully general,
+# correctness-first Run-Query2/SqlValLit path, so the worst case here is a wrong verdict for one
+# unusual row, never corrupted data.
+function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
+    $cnf=New-Cnf $conn
+    try {
+        $a=@("--defaults-extra-file=$cnf","--batch","--raw","--default-character-set=utf8mb4")
+        if($db){ $a+="--database=$db" }
+        $a+=@("-e",$sql)
+        $r=Run-Proc $script:MysqlPath $a $RequestId
+        if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
+        if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
+        $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
+        if($lines.Count -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
+        $headers=@($lines[0].Split([char]9))
+        $rows=New-Object System.Collections.ArrayList($lines.Count)
+        for($i=1;$i -lt $lines.Count;$i++){ [void]$rows.Add($lines[$i].Split([char]9)) }
+        return @{ ok=$true; columns=$headers; rows=$rows }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+
+
+# ---------------------------------------------------------------------------
+# API handlers
+# ---------------------------------------------------------------------------
+# Test the connection and return the server version (called when you click Connect).
+function Api-Connect { param($conn)
+    if (-not $script:MysqlPath -or -not (Test-Path $script:MysqlPath)) { return '{"ok":false,"error":"mysql.exe not found on this machine."}' }
+    $cnf=New-Cnf $conn
+    try {
+        $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
+        if($r.exit -eq 0){ $v=($r.out).Trim(); $script:ServerIsMariaDB=($v -match 'MariaDB'); return '{"ok":true,"version":'+(J-Str $v)+',"mariadb":'+(($script:ServerIsMariaDB).ToString().ToLower())+'}' }
+        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(FirstErr $r.err)))+'}'
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+# List databases with their sizes for the left sidebar.
+function Api-Schemas { param($conn)
+    $r=Run-Query2 $conn "SHOW DATABASES" $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    $dbs=@($r.rows | ForEach-Object { $_[0] } | Sort-Object)
+
+    # Fetch sizes for each schema
+    $sizes = @{}
+    foreach ($db in $dbs) {
+        $escapedDb = $db -replace "'", "''"
+		$sizeQuery = "SELECT SUM(DATA_LENGTH + INDEX_LENGTH) as total_size FROM information_schema.TABLES WHERE TABLE_SCHEMA = "+(SqlLit $db)+" AND TABLE_TYPE = 'BASE TABLE'"
+        $sizeR = Run-Query2 $conn $sizeQuery $null
+        if ($sizeR.ok -and $sizeR.rows.Count -gt 0 -and $sizeR.rows[0][0] -ne $null) {
+            $sizes[$db] = [math]::Round([double]$sizeR.rows[0][0], 2)
+        } else {
+            $sizes[$db] = 0
+        }
+    }
+
+    # Build schema list with sizes
+    $schemasWithSizes = @()
+    foreach ($db in $dbs) {
+        $schemasWithSizes += @{ name = $db; size = $sizes[$db] }
+    }
+
+    '{"ok":true,"schemas":[' + (($schemasWithSizes | ForEach-Object { '{"name":' + (J-Str $_.name) + ',"size":' + $_.size + '}' }) -join ',') + ']}'
+}
+# List everything inside a database: tables, views, routines, triggers, events.
+function Api-Objects { param($conn,$db)
+    $dbl=SqlLit $db
+    $sql="SELECT 'table' t,TABLE_NAME n FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE='BASE TABLE' " +
+         "UNION ALL SELECT 'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=$dbl AND TABLE_TYPE='VIEW' " +
+         "UNION ALL SELECT IF(ROUTINE_TYPE='PROCEDURE','procedure','function'),ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=$dbl " +
+         "UNION ALL SELECT 'trigger',TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=$dbl " +
+         "UNION ALL SELECT 'event',EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA=$dbl ORDER BY 1,2"
+    $r=Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    $g=@{ table=@(); view=@(); procedure=@(); function=@(); trigger=@(); event=@() }
+    foreach($row in $r.rows){ $t=$row[0]; if($g.ContainsKey($t)){ $g[$t]+=$row[1] } }
+    '{"ok":true,"tables":'+(J-Arr $g.table)+',"views":'+(J-Arr $g.view)+',"procedures":'+(J-Arr $g.procedure)+',"functions":'+(J-Arr $g.function)+',"triggers":'+(J-Arr $g.trigger)+',"events":'+(J-Arr $g.event)+'}'
+}
+# Return the CREATE statement (DDL) for a chosen object.
+function Api-Ddl { param($conn,$db,$type,$name)
+    $obj=(SqlId $db)+'.'+(SqlId $name)
+    switch ($type) {
+        'table'     { $sql="SHOW CREATE TABLE $obj" }
+        'view'      { $sql="SHOW CREATE VIEW $obj" }
+        'procedure' { $sql="SHOW CREATE PROCEDURE $obj" }
+        'function'  { $sql="SHOW CREATE FUNCTION $obj" }
+        'trigger'   { $sql="SHOW CREATE TRIGGER $obj" }
+        'event'     { $sql="SHOW CREATE EVENT $obj" }
+        default     { return '{"ok":false,"error":"unknown type"}' }
+    }
+    $r=Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    if($r.rows.Count -eq 0){ return '{"ok":false,"error":"no DDL returned"}' }
+    $cols=$r.columns; $idx=-1
+    for($i=0;$i -lt $cols.Count;$i++){ if($cols[$i] -match '(?i)create|statement'){ $idx=$i; break } }
+    if($idx -lt 0){ $idx=$cols.Count-1 }
+    $ddl=$r.rows[0][$idx]
+    '{"ok":true,"ddl":'+(J-Str $ddl)+'}'
+}
+# Find a table primary-key columns - needed so grid edits update the correct row.
+function Api-Pk { param($conn,$db,$table)
+	$dbl=SqlLit $db; $tl=SqlLit $table
+	$sql="SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION"
+    $r=Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    $pk=@($r.rows | ForEach-Object { $_[0] })
+    '{"ok":true,"pk":'+(J-Arr $pk)+'}'
+}
+
+function Api-SearchAllSchemas { param($conn,$term)
+    if(-not $term -or -not ([string]$term).Trim()){ return '{"ok":false,"error":"Empty search term."}' }
+    $t = SqlLit ('%'+$term+'%')
+    $sql = "SELECT TABLE_SCHEMA,'table',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_NAME LIKE $t " +
+           "UNION ALL SELECT TABLE_SCHEMA,'view',TABLE_NAME FROM information_schema.TABLES WHERE TABLE_TYPE='VIEW' AND TABLE_NAME LIKE $t " +
+           "UNION ALL SELECT ROUTINE_SCHEMA,IF(ROUTINE_TYPE='PROCEDURE','procedure','function'),ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_NAME LIKE $t " +
+           "UNION ALL SELECT TRIGGER_SCHEMA,'trigger',TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_NAME LIKE $t " +
+           "UNION ALL SELECT EVENT_SCHEMA,'event',EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_NAME LIKE $t " +
+           "ORDER BY 1,2,3"
+    $r=Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    $items = @($r.rows | ForEach-Object { '{"schema":'+(J-Str $_[0])+',"type":'+(J-Str $_[1])+',"name":'+(J-Str $_[2])+'}' })
+    '{"ok":true,"items":['+($items -join ',')+']}'
+}
+
+# Execute SQL that returns no rows (INSERT / UPDATE / DDL ...).
+function Run-Exec { param($conn,$sql)
+    $cnf=New-Cnf $conn
+    try { $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","-e",$sql)
+        if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+}
+# Read-only guard: true only if EVERY statement is a pure read (SELECT/SHOW/EXPLAIN...).
+function Test-SqlReadOnly { param([string]$sql)
+    if(-not $sql){ return $true }
+    $s = [regex]::Replace($sql, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $s = [regex]::Replace($s, '(?m)--.*$', ' ')
+    $s = [regex]::Replace($s, '(?m)#.*$', ' ')
+    $allow = 'SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','WITH','SET','HELP','VALUES','TABLE','ANALYZE','CHECK','CHECKSUM'
+    foreach($stmt in ($s -split ';')){
+        $t = $stmt.Trim()
+        if(-not $t){ continue }
+        $w = (($t -split '\s+',2)[0]).ToUpper()
+        if($allow -notcontains $w){ return $false }
+    }
+    return $true
+}
+# Endpoint: run a single non-SELECT statement.
+function Api-Exec { param($conn,$data) Run-Exec $conn ([string]$data.sql) }
+# Endpoint: run a multi-statement SQL script.
+function Api-Script { param($conn,$data)
+    $cnf=New-Cnf $conn
+    $tmp=Join-Path $env:TEMP ("mysqlscript_"+[Guid]::NewGuid().ToString('N')+".sql")
+    $requestId=[string]$data.requestId
+    try {
+        $scriptSql = [string]$data.sql
+        if($data.db){ $bt=[string][char]96; $dbEsc=([string]$data.db).Replace($bt,$bt+$bt); $scriptSql = "USE $bt$dbEsc$bt;`n" + $scriptSql }
+        [IO.File]::WriteAllText($tmp, $scriptSql, (New-Object System.Text.UTF8Encoding($false)))
+        $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId
+        if ($r.exit -ne 0 -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
+            $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId
+            if($r.exit -eq 0){ return '{"ok":true,"message":"Auto-retried with --binary-mode (statement contained raw NUL bytes)."}' }
+        }
+        if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+}
+# Endpoint: apply grid edits (insert/update/delete rows) the user made in the results table.
+# NOTE: not currently called by the frontend (row edits are built and sent as plain SQL via
+# applyChanges()/`lit()` -> /api/script instead), but the endpoint is still registered, so it
+# uses the same hex-aware SqlValLit as everywhere else that touches real row data - a value
+# that LOOKS like a plain SqlLit-quoted string here could otherwise silently corrupt a
+# bit/binary column exactly like the bug already fixed in Compare's row apply.
+function Api-RowOp { param($conn,$data)
+    $obj=(SqlId $data.db)+'.'+(SqlId $data.table)
+    $op=[string]$data.op
+    if($op -eq 'update'){
+        $sets=@(); foreach($p in $data.set.PSObject.Properties){ $sets+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
+        $whs=@();  foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
+        if($whs.Count -eq 0){ return '{"ok":false,"error":"no key columns; cannot update safely"}' }
+        $sql="UPDATE $obj SET "+($sets -join ',')+" WHERE "+($whs -join ' AND ')+" LIMIT 1"
+    } elseif($op -eq 'delete'){
+        $whs=@(); foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
+        if($whs.Count -eq 0){ return '{"ok":false,"error":"no key columns; cannot delete safely"}' }
+        $sql="DELETE FROM $obj WHERE "+($whs -join ' AND ')+" LIMIT 1"
+    } elseif($op -eq 'insert'){
+        $cols=@(); $vals=@(); foreach($p in $data.values.PSObject.Properties){ $cols+=(SqlId $p.Name); $vals+=(SqlValLit $p.Value) }
+        if($cols.Count -eq 0){ return '{"ok":false,"error":"no values"}' }
+        $sql="INSERT INTO $obj ("+($cols -join ',')+") VALUES ("+($vals -join ',')+")"
+    } else { return '{"ok":false,"error":"bad op"}' }
+    Run-Exec $conn $sql
+}
+# Endpoint: run a SELECT and return rows for the results grid.
+function Api-Query { param($conn,$sql,$db,$RequestId)
+    if(-not $sql -or -not ([string]$sql).Trim()){ return '{"ok":false,"error":"Empty query."}' }
+    $sw=[System.Diagnostics.Stopwatch]::StartNew()
+    $r=Run-Query2 $conn $sql $db $RequestId
+    $swFetch=$sw.ElapsedMilliseconds
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    if($r.columns.Count -eq 0){ $sw.Stop(); return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
+    $rowsJson = J-RowsFast $r.rows
+    $sw.Stop()
+    $jsonMs = $sw.ElapsedMilliseconds - $swFetch
+    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+',"fetchMs":'+$swFetch+',"jsonMs":'+$jsonMs+'}'
+}
+# Endpoint: cancel a running query started with the given requestId (kills its mysql.exe process).
+function Api-CancelQuery { param($data)
+    $rid = [string]$data.requestId
+    if (-not $rid) { return '{"ok":false,"error":"no requestId"}' }
+    $entry = $null
+    if ($script:RunningQueries.TryGetValue($rid, [ref]$entry)) {
+        try {
+            $entry.Cancelled = $true
+            if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
+            return '{"ok":true,"message":"Cancel signal sent."}'
+        } catch {
+            return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}'
+        }
+    }
+    return '{"ok":false,"error":"Query not found - it may have already finished."}'
+}
+# Endpoint: cancel a running export/import job. Kills the in-flight process and
+# sets a flag so the job's loop stops starting new tables/files.
+function Api-CancelJob { param($data)
+    $jid = [string]$data.jobId
+    if (-not $jid) { return '{"ok":false,"error":"no jobId"}' }
+    $job = $null
+    if ($script:RunningJobs.TryGetValue($jid, [ref]$job)) {
+        $job.Cancelled = $true
+        try { if ($job.CurrentProcess -and -not $job.CurrentProcess.HasExited) { $job.CurrentProcess.Kill() } } catch {}
+        return '{"ok":true,"message":"Cancel requested."}'
+    }
+    return '{"ok":false,"error":"Job not found - it may have already finished."}'
+}
+# Endpoint: export data (mysqldump for whole schemas, or CSV / INSERT statements).
+function Api-Export { param($conn,$data)
+    if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found."}' }
+    $dbs=@($data.dbs); if($dbs.Count -eq 0){ return '{"ok":false,"error":"No databases selected."}' }
+    $jobId=[string]$data.jobId
+    $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
+    if($jobId){ $script:RunningJobs[$jobId]=$job }
+    $folder=[string]$data.folder
+    if(-not (Test-Path $folder)){ try { New-Item -ItemType Directory -Path $folder -Force|Out-Null } catch { return '{"ok":false,"error":'+(J-Str ("Cannot create folder: "+$_.Exception.Message))+'}' } }
+    $o=$data.options; $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
+    $excl=@{}; if($data.excludes){ foreach($e in @($data.excludes)){ $excl[[string]$e]=$true } }
+    # mode: 'table' (one file per table, the default), 'db' (one file per database), 'single' (one combined file)
+    $mode=[string]$data.mode; if(-not $mode){ if($data.single){$mode='single'}else{$mode='table'} }
+    try {
+        $stamp = if($data.stamp){ '_'+(Get-Date -Format 'yyyyMMdd_HHmmss') } else { '' }
+        # Flags shared by EVERY mysqldump call in this run (per-table-safe: no database-level flags here).
+        $common=@("--defaults-extra-file=$cnf","--default-character-set=$($o.charset)")
+        if($o.singletx){$common+='--single-transaction'}; if($o.quick){$common+='--quick'}; if($o.hexblob){$common+='--hex-blob'}
+        if($o.triggers){$common+='--triggers'}else{$common+='--skip-triggers'}
+        if($o.diskeys){$common+='--disable-keys'}; if($o.notablespaces){$common+='--no-tablespaces'}; if($o.colstats){$common+='--column-statistics=0'}
+        if($o.compress){$common+='--compress'}; if($o.gtid){$common+='--set-gtid-purged=OFF'}
+        if($o.complete){$common+='--complete-insert'}; if($o.extinsert){$common+='--extended-insert'}else{$common+='--skip-extended-insert'}
+        if($o.tzutc){$common+='--tz-utc'}else{$common+='--skip-tz-utc'}
+        if($o.maxpacket){ $common+=("--max-allowed-packet="+[string]$o.maxpacket) }
+
+        if($mode -eq 'single'){
+            # One combined file for all selected databases.
+            $file=Join-Path $folder ("all_selected$stamp.sql")
+            $a=@()+$common+@('--databases')
+            if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
+            if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
+            if(-not $o.createdb){$a+='--no-create-db'}
+            foreach($k in $excl.Keys){ $a+=("--ignore-table="+$k) }
+            $a+=$dbs; $a+="--result-file=$file"
+            $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+            if($job.Cancelled){
+                if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
+                [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
+            }
+            elseif($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) all_selected : "+(FirstErr $r.err)) }
+        }
+        elseif($mode -eq 'db'){
+            # One file per database (includes routines/events/create-db as chosen).
+            foreach($d in $dbs){
+                if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining databases skipped)"); break }
+                $safe=($d -replace '[^\w\.\-]','_'); $file=Join-Path $folder "$safe$stamp.sql"
+                $a=@()+$common+@('--databases')
+                if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
+                if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
+                if(-not $o.createdb){$a+='--no-create-db'}
+                foreach($k in $excl.Keys){ if($k -like ($d+'.*')){ $a+=("--ignore-table="+$k) } }
+                $a+=$d; $a+="--result-file=$file"
+                $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                if($job.Cancelled){
+                    if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
+                    [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
+                    break
+                }
+                if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(FirstErr $r.err)) }
+            }
+        }
+        else {
+            # PER TABLE (default): dump every table/view to its own file, like Workbench's Dump Project Folder.
+            :dbloop foreach($d in $dbs){
+                if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining databases skipped)"); break }
+                $q=Run-Query2 $conn ("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA="+(SqlLit $d)+" ORDER BY TABLE_NAME") $null
+                if(-not $q.ok){ [void]$log.Add("FAILED (list tables) $d : "+$q.err); continue }
+                $tabs=@($q.rows | ForEach-Object { [string]$_[0] })
+                $dsafe=($d -replace '[^\w\.\-]','_')
+                if($tabs.Count -eq 0){ [void]$log.Add("(no tables) $d") }
+                foreach($t in $tabs){
+                    if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining tables skipped)"); break dbloop }
+                    if($excl.ContainsKey("$d.$t")){ [void]$log.Add("(excluded) $d.$t"); continue }
+                    $tsafe=($t -replace '[^\w\.\-]','_'); $file=Join-Path $folder "$dsafe.$tsafe$stamp.sql"
+                    $a=@()+$common
+                    if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
+                    $a+=@($d,$t); $a+="--result-file=$file"
+                    $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                    if($job.Cancelled){
+                        if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
+                        [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
+                        break dbloop
+                    }
+                    if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(FirstErr $r.err)) }
+                }
+                if($job.Cancelled){ break }
+                # Routines + events are database-level, so they go in one extra file per database.
+                if($o.routines -or $o.events){
+                    $file=Join-Path $folder "$dsafe.routines_events$stamp.sql"
+                    $a=@()+$common+@('--no-create-info','--no-data','--no-create-db','--skip-triggers')
+                    if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
+                    $a+=$d; $a+="--result-file=$file"
+                    $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                    if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(FirstErr $r.err)) }
+                }
+            }
+        }
+        if($job.Cancelled){ '{"ok":true,"cancelled":true,"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"log":'+(J-Arr $log)+'}' }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
+}
+# Endpoint: import one or more .sql dump files.
+function Api-Import { param($conn,$data)
+    $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
+    $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
+    $jobId=[string]$data.jobId
+    $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
+    if($jobId){ $script:RunningJobs[$jobId]=$job }
+    try {
+        $target=[string]$data.targetDb
+        if($target -and $data.createDb){ $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-e",('CREATE DATABASE IF NOT EXISTS '+(SqlId $target))); [void]$log.Add($(if($r.exit -eq 0){"Ensured database $target"}else{"Create DB failed: "+(FirstErr $r.err)})) }
+        foreach($f in $files){
+            if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining files skipped)"); break }
+            if(-not (Test-Path $f)){ [void]$log.Add("SKIP (missing): $f"); continue }
+            $binMode = [bool]$data.binaryMode
+            $a=@("--defaults-extra-file=$cnf"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($data.fkOff){$a+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a+=$target}
+            $r=Run-Stdin $script:MysqlPath $a $null $f $jobId
+            if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
+            $autoRetried = $false
+            if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
+                $a2=@("--defaults-extra-file=$cnf","--binary-mode"); if($data.force){$a2+='--force'}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
+                $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId
+                $autoRetried = $true
+            }
+            [void]$log.Add($(if($r.exit -eq 0){"OK  "+[IO.Path]::GetFileName($f)+$(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})}else{"FAILED ($($r.exit)) "+[IO.Path]::GetFileName($f)+" : "+(FirstErr $r.err)+$(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})}))
+        }
+        if($job.Cancelled){ '{"ok":true,"cancelled":true,"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"log":'+(J-Arr $log)+'}' }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
+}
+
+# ---------------------------------------------------------------------------
+# HTTP server
+# ---------------------------------------------------------------------------
+# Parse a raw HTTP request from the browser into method / path / headers / body.
+function Read-Request { param($client)
+    $ns=$client.GetStream(); $ns.ReadTimeout=8000
+    $ms=New-Object System.IO.MemoryStream; $buf=New-Object byte[] 16384; $headerEnd=-1
+    try {
+        while($true){
+            $read=$ns.Read($buf,0,$buf.Length); if($read -le 0){ break }
+            $ms.Write($buf,0,$read); $arr=$ms.ToArray()
+            for($i=0;$i -le $arr.Length-4;$i++){ if($arr[$i]-eq 13 -and $arr[$i+1]-eq 10 -and $arr[$i+2]-eq 13 -and $arr[$i+3]-eq 10){ $headerEnd=$i; break } }
+            if($headerEnd -ge 0){
+                $htext=[Text.Encoding]::ASCII.GetString($arr,0,$headerEnd); $cl=0
+                if($htext -match '(?im)^Content-Length:\s*(\d+)'){ $cl=[int]$Matches[1] }
+                $bodyStart=$headerEnd+4; $have=$arr.Length-$bodyStart
+                while($have -lt $cl){ $read=$ns.Read($buf,0,$buf.Length); if($read -le 0){break}; $ms.Write($buf,0,$read); $have+=$read }
+                $arr=$ms.ToArray(); $body=''
+                if($cl -gt 0){ $take=[Math]::Min($cl,$arr.Length-$bodyStart); $body=[Text.Encoding]::UTF8.GetString($arr,$bodyStart,$take) }
+                $first=($htext -split "`r`n")[0]; $parts=$first -split ' '
+                return @{ method=$parts[0]; path=$parts[1]; body=$body }
+            }
+        }
+    } catch { }
+    return @{ method='GET'; path='/'; body='' }
+}
+# Write a raw HTTP response back to the browser.
+function Send-Http { param($client,[string]$status,[string]$ctype,[byte[]]$body)
+    $head="HTTP/1.1 $status`r`nContent-Type: $ctype`r`nContent-Length: $($body.Length)`r`nCache-Control: no-store`r`nConnection: close`r`n`r`n"
+    $hb=[Text.Encoding]::ASCII.GetBytes($head); $ns=$client.GetStream(); $ns.Write($hb,0,$hb.Length); if($body.Length){ $ns.Write($body,0,$body.Length) }; $ns.Flush()
+}
+# Shortcut: send a JSON response (200 OK).
+function Send-Json { param($client,[string]$json) Send-Http $client '200 OK' 'application/json; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes($json)) }
+
+# Endpoint: import a CSV file into a table.
+function Api-ImportCsv { param($conn,$data)
+    $file=[string]$data.file
+    if(-not $file -or -not (Test-Path $file)){ return '{"ok":false,"error":"CSV file not found."}' }
+    $fsz = (Get-Item $file).Length
+    if ($fsz -gt 200MB -and -not [bool]$data.forceLarge) {
+        return '{"ok":false,"error":"This CSV is '+([math]::Round($fsz/1MB,0))+' MB. The built-in CSV import loads the whole file into memory and is not recommended above ~200 MB - use mysqlimport or LOAD DATA INFILE for very large files instead. Pass forceLarge to proceed anyway."}'
+    }
+    $db=[string]$data.db; $table=[string]$data.table
+    if(-not $db -or -not $table){ return '{"ok":false,"error":"No target table."}' }
+    $dbl=SqlLit $db; $tl=SqlLit $table
+	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
+    if(-not $cr.ok){ return '{"ok":false,"error":'+(J-Str $cr.err)+'}' }
+    $tableCols=@($cr.rows | ForEach-Object { $_[0] })
+    if($tableCols.Count -eq 0){ return '{"ok":false,"error":"Table not found or has no columns."}' }
+    try { if($data.hasHeader){ $rows=@(Import-Csv -Path $file) } else { $rows=@(Import-Csv -Path $file -Header $tableCols) } }
+    catch { return '{"ok":false,"error":'+(J-Str ("CSV parse error: "+$_.Exception.Message))+'}' }
+    if($rows.Count -eq 0){ return '{"ok":false,"error":"CSV has no data rows."}' }
+    $csvCols=@($rows[0].PSObject.Properties.Name)
+    $useCols=@($csvCols | Where-Object { $tableCols -contains $_ })
+    if($useCols.Count -eq 0){ return '{"ok":false,"error":"No CSV columns match the table columns (check the header row)."}' }
+    $tbl=(SqlId $db)+'.'+(SqlId $table)
+    $colList=($useCols | ForEach-Object { SqlId $_ }) -join ','
+    $sb=New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('SET FOREIGN_KEY_CHECKS=0;'); [void]$sb.AppendLine('SET UNIQUE_CHECKS=0;')
+    if($data.truncate){ [void]$sb.AppendLine('TRUNCATE TABLE '+$tbl+';') }
+    $batch=New-Object System.Collections.ArrayList; $n=0
+    foreach($row in $rows){
+        $vals=@()
+        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or $v -eq ''){ $vals+='NULL' } elseif($v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
+        [void]$batch.Add('('+($vals -join ',')+')'); $n++
+        if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
+    }
+    if($batch.Count){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';') }
+    $cnf=New-Cnf $conn
+    $tmp=Join-Path $env:TEMP ("mysqlcsv_"+[Guid]::NewGuid().ToString('N')+".sql")
+    try {
+        [IO.File]::WriteAllText($tmp,$sb.ToString(),(New-Object System.Text.UTF8Encoding($false)))
+        $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf") $null $tmp
+        if($r.exit -eq 0){ return '{"ok":true,"message":'+(J-Str ("Imported $n row(s) into $db.$table (columns: "+($useCols -join ', ')+")"))+'}' }
+        return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}'
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+}
+# Endpoint: open a native file/folder picker dialog for the UI.
+function Api-Browse { param($data)
+    $path=[string]$data.path; $filter=[string]$data.filter; $dirsOnly=[bool]$data.dirsOnly
+    try {
+        if(-not $path -or $path -eq 'ROOT'){
+            $roots=New-Object System.Collections.ArrayList
+            if($env:USERPROFILE -and (Test-Path $env:USERPROFILE)){ [void]$roots.Add([pscustomobject]@{name='Home ('+(Split-Path $env:USERPROFILE -Leaf)+')';path=$env:USERPROFILE}) }
+            Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue | ForEach-Object { [void]$roots.Add([pscustomobject]@{name=$_.Root;path=$_.Root}) }
+            $dj=($roots | ForEach-Object { '{"name":'+(J-Str $_.name)+',"path":'+(J-Str $_.path)+'}' }) -join ','
+            return '{"ok":true,"path":"","parent":"ROOT","dirs":['+$dj+'],"files":[]}'
+        }
+        if(-not (Test-Path $path)){ return '{"ok":false,"error":"path not found"}' }
+        $item=$null
+        try { $item=Get-Item -LiteralPath $path -Force -ErrorAction Stop } catch { return '{"ok":false,"error":'+(J-Str ("Could not access this path: "+$_.Exception.Message))+'}' }
+        if(-not $item){ return '{"ok":false,"error":"Could not access this path (unknown reason)."}' }
+        $dir = if($item.PSIsContainer){ $item.FullName } else { $item.DirectoryName }
+        if(-not $dir){ return '{"ok":false,"error":"Could not resolve a directory for this path."}' }
+        $parent=(Split-Path $dir -Parent); if(-not $parent){ $parent='ROOT' }
+        $subs=@(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue | Sort-Object Name)
+        $dj=($subs | ForEach-Object { '{"name":'+(J-Str $_.Name)+',"path":'+(J-Str $_.FullName)+'}' }) -join ','
+        $fj=''
+        if(-not $dirsOnly){
+            $ff = if($filter){ Get-ChildItem -LiteralPath $dir -File -Force -Filter $filter -ErrorAction SilentlyContinue } else { Get-ChildItem -LiteralPath $dir -File -Force -ErrorAction SilentlyContinue }
+            $fj=(@($ff | Sort-Object Name) | ForEach-Object { '{"name":'+(J-Str $_.Name)+',"path":'+(J-Str $_.FullName)+'}' }) -join ','
+        }
+        return '{"ok":true,"path":'+(J-Str $dir)+',"parent":'+(J-Str $parent)+',"dirs":['+$dj+'],"files":['+$fj+']}'
+    } catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
+}
+
+# --- Saved connections (passwords encrypted with Windows DPAPI, per-user) ---
+$script:ConnFile = Join-Path $env:APPDATA 'NOBSSQL\connections.json'
+$script:LibFile = Join-Path $env:APPDATA 'NOBSSQL\library.json'
+# Read the saved-query library from disk (library.json).
+function Load-Lib {
+    if(-not (Test-Path $script:LibFile)){ return @() }
+    try {
+        $raw=[IO.File]::ReadAllText($script:LibFile); $raw=$raw.TrimStart([char]0xFEFF)
+        if(-not $raw.Trim()){ return @() }
+        $parsed = $raw | ConvertFrom-Json
+        $acc = New-Object System.Collections.ArrayList
+        foreach($x in @($parsed)){ if($x -and $x.PSObject -and $x.PSObject.Properties['name']){ [void]$acc.Add($x) } }
+        return @($acc.ToArray())
+    } catch { return @() }
+}
+# Write the saved-query library to disk.
+function Save-Lib { param($list)
+    Use-FileLock 'Lib' {
+        $d=Split-Path $script:LibFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}
+        $parts=@(); foreach($it in @($list)){ if($it -and $it.PSObject -and $it.PSObject.Properties['name']){ $parts += ($it | ConvertTo-Json -Depth 5 -Compress) } }
+        [IO.File]::WriteAllText($script:LibFile, '['+($parts -join ',')+']', (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+# Endpoint: return all saved queries.
+function Api-LibList {
+    $items = Load-Lib | ForEach-Object { '{"name":'+(J-Str $_.name)+',"sql":'+(J-Str $_.sql)+',"schema":'+(J-Str $_.schema)+',"ts":'+([long]($_.ts)).ToString()+'}' }
+    '{"ok":true,"items":['+($items -join ',')+']}'
+}
+# Endpoint: add or update one saved query.
+function Api-LibSave { param($data)
+    $name=[string]$data.name; if(-not $name){ return '{"ok":false,"error":"name required"}' }
+    $ts = if($data.ts){ [long]$data.ts } else { [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+    $list=@(Load-Lib | Where-Object { $_.name -ne $name })
+    $list=,([pscustomobject]@{name=$name;sql=[string]$data.sql;schema=[string]$data.schema;ts=$ts}) + $list
+    Save-Lib $list; '{"ok":true}'
+}
+# Endpoint: delete one saved query by name.
+function Api-LibDelete { param($data)
+    $list=@(Load-Lib | Where-Object { $_.name -ne [string]$data.name }); Save-Lib $list; '{"ok":true}'
+}
+# Endpoint: delete ALL saved queries.
+function Api-LibClear { Save-Lib @(); '{"ok":true}' }
+# Endpoint: replace the whole library at once (used by Import).
+function Api-LibReplace { param($data)
+    $list=New-Object System.Collections.ArrayList
+    foreach($x in @($data.items)){
+        if($x -and $x.name){
+            $t = if($x.ts){ [long]$x.ts } else { [long]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) }
+            [void]$list.Add([pscustomobject]@{name=[string]$x.name;sql=[string]$x.sql;schema=[string]$x.schema;ts=$t})
+        }
+    }
+    Save-Lib $list; '{"ok":true}'
+}
+# Endpoint: delete ALL saved connections (used by Clear all app data).
+function Api-ConnClear { Save-Conns @(); '{"ok":true}' }
+# Endpoint: mark one connection primary so it auto-opens on startup (clears the others).
+function Api-ConnSetPrimary { param($data)
+    $name=[string]$data.name
+    $list = Load-Conns | ForEach-Object {
+        $pass = if($_.pass){ [string]$_.pass } else { '' }
+        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
+    }
+    Save-Conns @($list); '{"ok":true}'
+}
+# Recursively collect real connection objects - self-heals a file that got wrongly nested.
+function Add-ConnObjs { param($x,$acc)
+    if($null -eq $x){ return }
+    if($x -is [string]){ return }
+    if($x -is [System.Collections.IEnumerable]){ foreach($y in $x){ Add-ConnObjs $y $acc }; return }
+    if($x.PSObject -and $x.PSObject.Properties['name']){ [void]$acc.Add($x) }
+}
+# Read saved connections (connections.json). Passwords are DPAPI-encrypted per Windows user.
+function Load-Conns {
+    if(-not (Test-Path $script:ConnFile)){ return @() }
+    try {
+        $raw=[IO.File]::ReadAllText($script:ConnFile); $raw=$raw.TrimStart([char]0xFEFF)
+        if(-not $raw.Trim()){ return @() }
+        $parsed = $raw | ConvertFrom-Json
+        $acc = New-Object System.Collections.ArrayList
+        Add-ConnObjs $parsed $acc
+        return @($acc.ToArray())
+    } catch { return @() }
+}
+# Write saved connections back to disk as a flat JSON array.
+function Save-Conns { param($list)
+    Use-FileLock 'Conn' {
+        $d=Split-Path $script:ConnFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}
+        $acc = New-Object System.Collections.ArrayList
+        Add-ConnObjs $list $acc
+        $parts=@(); foreach($it in $acc){ $parts += ($it | ConvertTo-Json -Depth 5 -Compress) }
+        $json='['+($parts -join ',')+']'
+        [IO.File]::WriteAllText($script:ConnFile, $json, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+# Endpoint: report whether the mysql client tools were found.
+function Api-ToolsStatus {
+    Resolve-Tools
+    $m = if($script:MysqlPath){$script:MysqlPath}else{'(not found)'}
+    $d = if($script:MysqldumpPath){$script:MysqldumpPath}else{'(not found)'}
+    $ms = if($script:MysqlSource){$script:MysqlSource}else{''}
+    $ds = if($script:MysqldumpSource){$script:MysqldumpSource}else{''}
+    '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
+}
+# Endpoint: return the current tool paths / config for the Settings dialog.
+function Api-GetConfig {
+    $cfg = Load-Cfg
+    $mb = if($cfg -and $cfg.mysql_bin){[string]$cfg.mysql_bin}else{''}
+    $db = if($cfg -and $cfg.mysqldump_bin){[string]$cfg.mysqldump_bin}else{''}
+    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+'}}'
+}
+# Endpoint: save tool paths from the Settings dialog.
+function Api-SaveConfig { param($data)
+    $cfg = Load-Cfg; if(-not $cfg){ $cfg=[pscustomobject]@{} }
+    $mb=''; $db=''
+    if($data.config){ if($data.config.mysql_bin){$mb=[string]$data.config.mysql_bin}; if($data.config.mysqldump_bin){$db=[string]$data.config.mysqldump_bin} }
+    $out=[pscustomobject]@{ mysql_bin=$mb; mysqldump_bin=$db }
+    Save-Cfg $out
+    if($mb -and (Test-Path $mb)){ $script:MysqlPath=$mb }
+    if($db -and (Test-Path $db)){ $script:MysqldumpPath=$db }
+    '{"ok":true}'
+}
+function Api-DownloadTools {
+    try {
+        $ProgressPreference='SilentlyContinue'
+        $ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+        $root = Invoke-RestMethod -Uri 'https://downloads.mariadb.org/rest-api/mariadb/' -UseBasicParsing -UserAgent $ua -ErrorAction Stop
+        $branch = ($root.major_releases |
+            Where-Object { $_.release_status -eq 'Stable' -and $_.release_support_type -eq 'Long Term Support' } |
+            Sort-Object { [version]$_.release_id } -Descending | Select-Object -First 1).release_id
+        if(-not $branch){ return '{"ok":false,"error":"No stable LTS branch found."}' }
+        $binfo = Invoke-RestMethod -Uri "https://downloads.mariadb.org/rest-api/mariadb/$branch/" -UseBasicParsing -UserAgent $ua -ErrorAction Stop
+        $patch = ($binfo.releases.PSObject.Properties.Name | Sort-Object { [version]$_ } -Descending | Select-Object -First 1)
+        if(-not $patch){ return '{"ok":false,"error":"No patch version found."}' }
+        $candidates = $binfo.releases.$patch.files |
+            Where-Object { $_.os -match 'Windows' -and $_.file_name -match '\.zip$' -and $_.file_name -notmatch 'debug' }
+        $zipEntry = $candidates | Where-Object { $_.cpu -match '64' } | Select-Object -First 1
+        if(-not $zipEntry){ $zipEntry = $candidates | Select-Object -First 1 }
+        if(-not $zipEntry){ return '{"ok":false,"error":"No Windows zip found for this release."}' }
+        $tmpZip = Join-Path $env:TEMP $zipEntry.file_name
+        # The REST API's own file_download_url has been observed returning 403 regardless of http/https.
+        # A direct mirror URL (same layout MariaDB Foundation publishes at mirror.mariadb.org) works reliably,
+        # so try that first and only fall back to the API-provided URL if the mirror layout ever changes.
+        $mirrorUrl = "https://mirror.mariadb.org/mariadb-$patch/winx64-packages/$($zipEntry.file_name)"
+        $apiUrl = [string]$zipEntry.file_download_url -replace '^http://','https://'
+        $curlOk = $false
+        foreach ($tryUrl in @($mirrorUrl, $apiUrl)) {
+            if ($curlOk) { break }
+            try {
+                & curl.exe -fL --retry 3 -A $ua -o $tmpZip $tryUrl
+                if ($LASTEXITCODE -eq 0 -and (Test-Path $tmpZip) -and (Get-Item $tmpZip).Length -gt 1MB) { $curlOk = $true }
+                else { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+            } catch { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+        }
+        if(-not $curlOk){
+            foreach ($tryUrl in @($mirrorUrl, $apiUrl)) {
+                if (Test-Path $tmpZip) { break }
+                try { Invoke-WebRequest -Uri $tryUrl -OutFile $tmpZip -UseBasicParsing -UserAgent $ua -ErrorAction Stop } catch { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        if(-not (Test-Path $tmpZip) -or (Get-Item $tmpZip).Length -lt 1MB){ return '{"ok":false,"error":"Download failed from both the mirror and the API-provided URL."}' }
+
+        # Verify integrity before extracting, if the API published a checksum for this file.
+        $expectedHash = $null
+        if ($zipEntry.checksum -and $zipEntry.checksum.sha256sum) { $expectedHash = [string]$zipEntry.checksum.sha256sum }
+        if ($expectedHash) {
+            $actualHash = (Get-FileHash -Path $tmpZip -Algorithm SHA256).Hash
+            if ($actualHash -notmatch [regex]::Escape($expectedHash)) {
+                Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+                return '{"ok":false,"error":"Checksum mismatch for downloaded file - it may be corrupted or tampered with. Download aborted."}'
+            }
+        }
+
+        if(-not(Test-Path $script:ToolsDir)){ New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null }
+        $want = @('mysqldump.exe','mysql.exe','mysqlimport.exe','mysqlcheck.exe','mariadb.exe','mariadb-dump.exe')
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip=[IO.Compression.ZipFile]::OpenRead($tmpZip); $got=@()
+        foreach($e in $zip.Entries){ if($want -contains $e.Name){ [IO.Compression.ZipFileExtensions]::ExtractToFile($e,(Join-Path $script:ToolsDir $e.Name),$true); $got+=$e.Name } }
+        $zip.Dispose(); Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+        if($got.Count -eq 0){ return '{"ok":false,"error":"Archive downloaded but no client binaries inside."}' }
+        $mb = @('mysql.exe','mariadb.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        $db = @('mysqldump.exe','mariadb-dump.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+        Save-Cfg ([pscustomobject]@{ mysql_bin=[string]$mb; mysqldump_bin=[string]$db })
+        if($mb){ $script:MysqlPath=[string]$mb }; if($db){ $script:MysqldumpPath=[string]$db }
+        '{"ok":true,"message":'+(J-Str ("Downloaded MariaDB $patch client tools to $script:ToolsDir"))+',"config":{"mysql_bin":'+(J-Str ([string]$mb))+',"mysqldump_bin":'+(J-Str ([string]$db))+'}}'
+    } catch {
+        $detail = $_.Exception.Message
+        try {
+            $resp = $_.Exception.Response
+            if ($resp) {
+                $stream = $resp.GetResponseStream()
+                $reader = New-Object IO.StreamReader($stream)
+                $body = $reader.ReadToEnd()
+                $reader.Close()
+                if ($body) {
+                    $snippet = if ($body.Length -gt 800) { $body.Substring(0,800) } else { $body }
+                    $detail = $detail + " | Response body: " + $snippet
+                }
+                $hdrNames = @()
+                try { $hdrNames = $resp.Headers.AllKeys } catch {}
+                if ($hdrNames.Count -gt 0) { $detail = $detail + " | Headers: " + ($hdrNames -join ', ') }
+            }
+        } catch {}
+        return '{"ok":false,"error":'+(J-Str $detail)+'}'
+    }
+}
+function Api-ConnList {
+    $items = Load-Conns | ForEach-Object { $pr = if($_.primary){'true'}else{'false'}; $ro = if($_.readonly){'true'}else{'false'}; '{"name":'+(J-Str $_.name)+',"host":'+(J-Str $_.host)+',"port":'+(J-Str $_.port)+',"user":'+(J-Str $_.user)+',"ssl":'+(J-Str $_.ssl)+',"primary":'+$pr+',"accent":'+(J-Str ([string]$_.accent))+',"env":'+(J-Str ([string]$_.env))+',"readonly":'+$ro+'}' }
+    '{"ok":true,"items":['+($items -join ',')+']}'
+}
+# Look up a saved connection by name (host/port/user/ssl/password/readonly) - used by the
+# Compare Databases feature, which needs TWO independent connections that may not be the one
+# currently loaded in the connection form.
+function Resolve-SavedConn { param($name)
+    $c = Load-Conns | Where-Object { $_.name -eq [string]$name } | Select-Object -First 1
+    if(-not $c){ return $null }
+    $pass=''
+    if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; password=$pass; readonly=[bool]$c.readonly }
+}
+# Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
+# every table in the given schema, via one information_schema query (cheap, single round trip).
+function Get-SchemaColumns { param($conn,$db)
+    $sql = "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " ORDER BY TABLE_NAME,ORDINAL_POSITION"
+    $r = Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return $null }
+    $map = [ordered]@{}
+    foreach($row in $r.rows){
+        $t = [string]$row[0]
+        if(-not $map.Contains($t)){ $map[$t] = New-Object System.Collections.ArrayList }
+        [void]$map[$t].Add([pscustomobject]@{ name=[string]$row[1]; type=[string]$row[2]; null=[string]$row[3]; default=$row[4]; extra=[string]$row[5] })
+    }
+    $map
+}
+function Get-CreateTableSql { param($conn,$db,$table)
+    $r = Run-Query2 $conn ("SHOW CREATE TABLE " + (SqlId $table)) $db
+    if($r.ok -and $r.rows.Count -gt 0){ [string]$r.rows[0][1] } else { $null }
+}# Fetches CREATE TABLE for MANY tables via mysqldump (ONE process invocation per chunk of up
+# to 50 tables), instead of one mysql.exe process per table. Process-spawn overhead (loading the
+# client, connecting, authenticating, exiting) is the actual cause of slow schema compares when
+# many tables are flagged "missing on target" - this cuts hundreds of spawns down to a handful.
+# Falls back gracefully (empty map) on any failure; the caller re-fetches per-table if needed.
+function Get-CreateTableSqlBatch { param($conn,$db,$tables,$RequestId)
+    $result = @{}
+    if(-not $tables -or $tables.Count -eq 0){ return $result }
+    $chunkSize = 50
+    $cnf = New-Cnf $conn
+    try {
+        for($i=0; $i -lt $tables.Count; $i += $chunkSize){
+            if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
+            $endIdx = [Math]::Min($i+$chunkSize,$tables.Count) - 1
+            $chunk = $tables[$i..$endIdx]
+            $a = @("--defaults-extra-file=$cnf","--no-data","--compact","--skip-comments",$db) + $chunk
+            $r = Run-Proc $script:MysqldumpPath $a $RequestId
+            if($r.exit -ne 0 -or -not $r.out){ continue }
+            $parts = $r.out -split '(?=CREATE TABLE `)'
+            foreach($part in $parts){
+                if($part -notmatch '^CREATE TABLE `([^`]+)`'){ continue }
+                $result[$Matches[1]] = $part.Trim()
+            }
+        }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    $result
+}
+
+# Best-effort DEFAULT clause: numeric and keyword defaults (CURRENT_TIMESTAMP, NULL) are emitted
+# bare; everything else is quoted as a string literal. Always double-check via Preview SQL.
+function ColDefaultClause { param($default)
+    if($null -eq $default){ return '' }
+    $d = [string]$default
+    if($d -match '^-?[0-9]+(\.[0-9]+)?$'){ return " DEFAULT $d" }
+    if($d -match '^(CURRENT_TIMESTAMP(\(\d*\))?|NULL)$'){ return " DEFAULT $d" }
+    return " DEFAULT " + (SqlLit $d)
+}
+function ColDefLine { param($col)
+    $nullPart = if($col.null -eq 'YES'){'NULL'}else{'NOT NULL'}
+    $extraPart = if($col.extra){' ' + $col.extra}else{''}
+    (SqlId $col.name) + ' ' + $col.type + ' ' + $nullPart + (ColDefaultClause $col.default) + $extraPart
+}
+# Compares every table in $srcCols/$tgtCols and returns an array of table-diff objects:
+# {name, status, sql:[{stmt,checked,kind}]} - status is one of missing_target/missing_source/diff/same.
+function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
+    $names = @{}
+    foreach($k in $srcCols.Keys){ $names[$k]=$true }; foreach($k in $tgtCols.Keys){ $names[$k]=$true }
+    $out = New-Object System.Collections.ArrayList
+    $cancelled = $false
+    # Two-phase: classify every table first WITHOUT fetching DDL (fast), collecting the names of
+    # "missing_target" tables; their DDL is then fetched all at once in a batch (see below) rather
+    # than one mysqldump/mysql.exe process per table, which is what actually made large compares slow.
+    $missingTargetEntries = New-Object System.Collections.ArrayList
+    foreach($t in ($names.Keys | Sort-Object)){
+        if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ $cancelled = $true; break }
+        $inSrc = $srcCols.Contains($t); $inTgt = $tgtCols.Contains($t)
+        if($inSrc -and -not $inTgt){
+            $entry = [pscustomobject]@{ name=$t; status='missing_target'; sql=@() }
+            [void]$out.Add($entry)
+            [void]$missingTargetEntries.Add($entry)
+            continue
+        }
+        if($inTgt -and -not $inSrc){
+            [void]$out.Add([pscustomobject]@{ name=$t; status='missing_source'; sql=@([pscustomobject]@{stmt=('DROP TABLE '+(SqlId $t)+';');checked=$false;kind='drop_table'}) })
+            continue
+        }
+        $sCols = $srcCols[$t]; $tCols = $tgtCols[$t]
+        $tByName = @{}; foreach($c in $tCols){ $tByName[$c.name]=$c }
+        $sByName = @{}; foreach($c in $sCols){ $sByName[$c.name]=$c }
+        $diffs = New-Object System.Collections.ArrayList
+        foreach($c in $sCols){
+            if(-not $tByName.Contains($c.name)){
+                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' ADD COLUMN '+(ColDefLine $c)+';'); checked=$true; kind='add_column' })
+            } else {
+                $tc = $tByName[$c.name]
+                if($c.type -ne $tc.type -or $c.null -ne $tc.null -or [string]$c.default -ne [string]$tc.default){
+                    [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' MODIFY COLUMN '+(ColDefLine $c)+';'); checked=$true; kind='modify_column' })
+                }
+            }
+        }
+        foreach($c in $tCols){
+            if(-not $sByName.Contains($c.name)){
+                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' DROP COLUMN '+(SqlId $c.name)+';'); checked=$false; kind='drop_column' })
+            }
+        }
+        if($diffs.Count -eq 0){ [void]$out.Add([pscustomobject]@{ name=$t; status='same'; sql=@() }) }
+        else { [void]$out.Add([pscustomobject]@{ name=$t; status='diff'; sql=@($diffs) }) }
+    }
+    if(-not $cancelled -and $missingTargetEntries.Count -gt 0){
+        $namesToFetch = @($missingTargetEntries | ForEach-Object { $_.name })
+        $ddlMap = Get-CreateTableSqlBatch $srcConn $srcDb $namesToFetch $RequestId
+        foreach($me in $missingTargetEntries){
+            if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ $cancelled = $true; break }
+            $ddl = $null
+            if($ddlMap.ContainsKey($me.name)){ $ddl = $ddlMap[$me.name] }
+            if(-not $ddl){ $ddl = Get-CreateTableSql $srcConn $srcDb $me.name }
+            $me.sql = @([pscustomobject]@{stmt=$ddl;checked=$true;kind='create_table'})
+        }
+    }
+    [pscustomobject]@{ tables=$out; cancelled=$cancelled }
+}
+function Api-CompareDbs { param($data)
+    $c = Resolve-SavedConn $data.connName
+    if(-not $c){ return '{"ok":false,"error":"Connection not found."}' }
+    $r = Run-Query2 $c 'SHOW DATABASES' $null
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    $names = @($r.rows | ForEach-Object { [string]$_[0] })
+    '{"ok":true,"databases":'+(J-Arr $names)+',"readonly":'+($(if($c.readonly){'true'}else{'false'}))+'}'
+}
+function Api-CompareTables { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $src -or -not $tgt){ return '{"ok":false,"error":"Connection not found."}' }
+    $sql1 = "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + (SqlLit ([string]$data.sourceDb)) + " ORDER BY TABLE_NAME"
+    $sql2 = "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + (SqlLit ([string]$data.targetDb)) + " ORDER BY TABLE_NAME"
+    $r1 = Run-Query2 $src $sql1 $null; $r2 = Run-Query2 $tgt $sql2 $null
+    if(-not $r1.ok){ return '{"ok":false,"error":'+(J-Str $r1.err)+'}' }
+    if(-not $r2.ok){ return '{"ok":false,"error":'+(J-Str $r2.err)+'}' }
+    $set = @{}; foreach($row in $r1.rows){ $set[[string]$row[0]]=$true }; foreach($row in $r2.rows){ $set[[string]$row[0]]=$true }
+    $names = @($set.Keys | Sort-Object)
+    '{"ok":true,"tables":'+(J-Arr $names)+'}'
+}
+# Reusable primary-key lookup (plain array, not a JSON response) - used by the row-level
+# compare below. Returns $null on failure, an empty array if the table has no primary key.
+function Get-TablePkCols { param($conn,$db,$table)
+    $sql = "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " AND CONSTRAINT_NAME='PRIMARY' ORDER BY ORDINAL_POSITION"
+    $r = Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return $null }
+    # IMPORTANT: for a single-column PK, PowerShell's pipeline silently "unrolls" a one-element
+    # array into a bare string on return (e.g. @("id") becomes just "id" to the caller) - then
+    # $pk[0] indexes into the STRING and returns its first CHARACTER ('i'), not the column name.
+    # The leading comma forces the array to be emitted as a single object, not enumerated.
+    $arr = @($r.rows | ForEach-Object { [string]$_[0] })
+    return ,$arr
+}
+# Same idea as Get-TablePkCols, but for foreign keys (columns with a REFERENCED_TABLE_NAME).
+# Same single-column-array unroll gotcha applies here too - the leading comma guards it.
+function Get-TableFkCols { param($conn,$db,$table)
+    $sql = "SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY ORDINAL_POSITION"
+    $r = Run-Query2 $conn $sql $null
+    if(-not $r.ok){ return $null }
+    $arr = @($r.rows | ForEach-Object { [string]$_[0] })
+    return ,$arr
+}
+# JSON endpoint mirroring Api-Pk's shape, used when opening a table tab so the grid can
+# highlight foreign-key columns the same way it already highlights the primary key.
+function Api-Fk { param($conn,$db,$table)
+    $fk = Get-TableFkCols $conn $db $table
+    if($null -eq $fk){ return '{"ok":false,"error":"Could not read foreign keys."}' }
+    '{"ok":true,"fk":'+(J-Arr $fk)+'}'
+}
+
+# Finds rows present in the source table but missing (by primary key) on the target - INSERT
+# only, never UPDATE/DELETE. Row data is fetched from the source and re-inserted with the exact
+# same primary key value(s), so ids stay identical between the two databases. Capped at 2000
+# rows per comparison to stay interactive; a larger gap should go through Export/Import instead.
+# Fetches full row data for a SPECIFIC list of primary-key values, chunked for safety (same
+# reasoning as elsewhere: a huge WHERE...IN(...) as a mysql.exe command-line argument can exceed
+# Windows' command-line length limit). Shared by Api-CompareRows (its first page) and
+# Api-CompareRowsFetchByPk (loading a later page the client already knows about, without
+# re-scanning the whole table again).
+function Get-RowsByPk { param($conn,$db,$table,$pkCols,$pkValues,$RequestId)
+    if(-not $pkValues -or $pkValues.Count -eq 0){ return @{ ok=$true; columns=@(); rows=(New-Object System.Collections.ArrayList) } }
+    $pkList = ($pkCols | ForEach-Object { SqlId $_ }) -join ','
+    $fetchChunk = 200
+    $fullCols = $null
+    $fullRows = New-Object System.Collections.ArrayList
+    for($fi=0; $fi -lt $pkValues.Count; $fi += $fetchChunk){
+        if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
+        $fEnd = [Math]::Min($fi+$fetchChunk,$pkValues.Count) - 1
+        $chunk = $pkValues[$fi..$fEnd]
+        if($pkCols.Count -eq 1){
+            $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
+            $where = (SqlId $pkCols[0]) + ' IN (' + $vals + ')'
+        } else {
+            $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $where = '(' + $pkList + ') IN (' + $tuples + ')'
+        }
+        $fr = Run-Query2 $conn ("SELECT * FROM " + (SqlId $db) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $RequestId
+        if(-not $fr.ok){ return @{ ok=$false; err=$fr.err } }
+        if($null -eq $fullCols){ $fullCols = $fr.columns }
+        foreach($row in $fr.rows){ [void]$fullRows.Add($row) }
+    }
+    @{ ok=$true; columns=$fullCols; rows=$fullRows }
+}
+# Standalone endpoint for loading a LATER page of missing rows the client already knows about
+# (from Api-CompareRows' allMissingPks) - a lightweight, bounded fetch that never re-scans the
+# whole table, unlike re-running the full comparison.
+function Api-CompareRowsFetchByPk { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName
+    if(-not $src){ return '{"ok":false,"error":"Source connection not found."}' }
+    $table = [string]$data.table; $srcDb = [string]$data.sourceDb
+    $pkCols = @($data.pkCols)
+    $pkValues = @($data.pks)
+    if($pkCols.Count -eq 0){ return '{"ok":false,"error":"Missing primary key columns."}' }
+    $rid = [string]$data.requestId
+    $r = Get-RowsByPk $src $srcDb $table $pkCols $pkValues $rid
+    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
+    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+(J-RowsFast $r.rows)+'}'
+}
+function Api-CompareRows { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $src -or -not $tgt){ return '{"ok":false,"error":"Connection not found."}' }
+    $rid = [string]$data.requestId
+    $table = [string]$data.table; $srcDb = [string]$data.sourceDb; $tgtDb = [string]$data.targetDb
+    $pk = Get-TablePkCols $src $srcDb $table
+    if(-not $pk -or $pk.Count -eq 0){ return '{"ok":false,"error":"Table has no primary key - cannot compare rows."}' }
+    $fk = Get-TableFkCols $src $srcDb $table
+    if($null -eq $fk){ $fk = @() }
+    $pkList = ($pk | ForEach-Object { SqlId $_ }) -join ','
+    # Every fetch below is registered under $rid (via Run-Query2's RequestId param) so Cancel can
+    # actually KILL the in-flight mysql.exe process for large tables, not just stop between chunks.
+    $srcR = Run-Query2Bulk $src ("SELECT $pkList FROM " + (SqlId $srcDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $srcR.ok){ return '{"ok":false,"error":'+(J-Str $srcR.err)+'}' }
+    $tgtR = Run-Query2Bulk $tgt ("SELECT $pkList FROM " + (SqlId $tgtDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $tgtR.ok){
+        # The target table hasn't been created yet (e.g. structure hasn't been synced) - treat
+        # it as a new, empty table rather than failing: every source row is then "missing".
+        if($tgtR.err -match '1146' -or $tgtR.err -match "doesn't exist"){ $tgtR = @{ ok=$true; rows=(New-Object System.Collections.ArrayList) } }
+        else { return '{"ok":false,"error":'+(J-Str $tgtR.err)+'}' }
+    }
+    $tgtSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($row in $tgtR.rows){ [void]$tgtSet.Add(($row -join "`u{1}")) }
+    $missingRows = New-Object System.Collections.ArrayList
+    foreach($row in $srcR.rows){ if(-not $tgtSet.Contains(($row -join "`u{1}"))){ [void]$missingRows.Add($row) } }
+    $missingTotal = $missingRows.Count
+    $cap = 2000
+    $truncated = $missingTotal -gt $cap
+    $useRows = if($truncated){ $missingRows.GetRange(0,$cap) } else { $missingRows }
+    $roJson = $(if($tgt.readonly){'true'}else{'false'})
+    if($useRows.Count -eq 0){
+        return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":[],"rows":[],"missingTotal":0,"truncated":false,"targetReadonly":'+$roJson+',"allMissingPks":[]}'
+    }
+    $fetch = Get-RowsByPk $src $srcDb $table $pk $useRows $rid
+    if(-not $fetch.ok){ return '{"ok":false,"error":'+(J-Str $fetch.err)+'}' }
+    $cancelled = ($rid -and $script:CancelledCompares.ContainsKey($rid))
+    if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
+    # allMissingPks: the FULL (uncapped) list of missing primary-key values, sent to the client
+    # alongside the first page. It's just id values, not full row data, so it's cheap compared to
+    # what a full table re-scan would cost - the client can use it to load later pages, or to
+    # remove just-inserted rows and pull the next batch, WITHOUT ever re-scanning the table again.
+    # J-RowsFast (StringBuilder + plain loop, no pipeline) is dramatically faster than piping
+    # through ForEach-Object for large collections - measured ~6x faster at 200,000 rows, and
+    # the gap widens further at scale. This list can have hundreds of thousands of entries, so
+    # using the pipeline version here would silently reintroduce the exact kind of slowness this
+    # whole feature was built to eliminate.
+    '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":'+(J-Arr $fetch.columns)+',"rows":'+(J-RowsFast $fetch.rows)+',"missingTotal":'+$missingTotal+',"truncated":'+($(if($truncated){'true'}else{'false'}))+',"targetReadonly":'+$roJson+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+',"allMissingPks":'+(J-RowsFast $missingRows)+'}'
+}
+# Inserts the (client-selected) missing rows into the target, batched, using the exact column
+# list and values fetched from the source - so ids/keys match the source exactly. Always
+# INSERT-only; never touches an existing target row.
+# Finds rows present on BOTH sides (same primary key) whose CONTENT differs - detection only,
+# never writes anything. Capped tighter (500) than the missing-rows check since this fetches
+# full row data from BOTH source and target for every candidate, which is heavier.
+function Api-CompareRowsDiff { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $src -or -not $tgt){ return '{"ok":false,"error":"Connection not found."}' }
+    $rid = [string]$data.requestId
+    $table = [string]$data.table; $srcDb = [string]$data.sourceDb; $tgtDb = [string]$data.targetDb
+    $pk = Get-TablePkCols $src $srcDb $table
+    if(-not $pk -or $pk.Count -eq 0){ return '{"ok":false,"error":"Table has no primary key - cannot compare rows."}' }
+    $fk = Get-TableFkCols $src $srcDb $table
+    if($null -eq $fk){ $fk = @() }
+    $pkList = ($pk | ForEach-Object { SqlId $_ }) -join ','
+    # Every fetch below is registered under $rid (via Run-Query2's RequestId param) so Cancel can
+    # actually KILL the in-flight mysql.exe process for large tables, not just stop between chunks.
+    $srcR = Run-Query2Bulk $src ("SELECT $pkList FROM " + (SqlId $srcDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $srcR.ok){ return '{"ok":false,"error":'+(J-Str $srcR.err)+'}' }
+    $tgtR = Run-Query2Bulk $tgt ("SELECT $pkList FROM " + (SqlId $tgtDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $tgtR.ok){
+        # Target table doesn't exist yet - treat as empty (nothing in common, so no content diffs).
+        if($tgtR.err -match '1146' -or $tgtR.err -match "doesn't exist"){ $tgtR = @{ ok=$true; rows=(New-Object System.Collections.ArrayList) } }
+        else { return '{"ok":false,"error":'+(J-Str $tgtR.err)+'}' }
+    }
+    $tgtSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($row in $tgtR.rows){ [void]$tgtSet.Add(($row -join "`u{1}")) }
+    $common = New-Object System.Collections.ArrayList
+    foreach($row in $srcR.rows){ if($tgtSet.Contains(($row -join "`u{1}"))){ [void]$common.Add($row) } }
+    $commonTotal = $common.Count
+    $cap = 500
+    $truncated = $commonTotal -gt $cap
+    $useCommon = if($truncated){ $common.GetRange(0,$cap) } else { $common }
+    $roJson = $(if($tgt.readonly){'true'}else{'false'})
+    if($useCommon.Count -eq 0){
+        return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"fkCols":'+(J-Arr $fk)+',"diffs":[],"commonTotal":'+$commonTotal+',"comparedCount":0,"truncated":false,"targetReadonly":'+$roJson+'}'
+    }
+    $fetchChunk = 200
+    $fullCols = $null
+    $srcFull = @{}; $tgtFull = @{}
+    $cancelled = $false
+    for($fi=0; $fi -lt $useCommon.Count; $fi += $fetchChunk){
+        if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
+        $fEnd = [Math]::Min($fi+$fetchChunk,$useCommon.Count) - 1
+        $chunk = $useCommon[$fi..$fEnd]
+        if($pk.Count -eq 1){
+            $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
+            $where = (SqlId $pk[0]) + ' IN (' + $vals + ')'
+        } else {
+            $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $where = '(' + $pkList + ') IN (' + $tuples + ')'
+        }
+        $sr = Run-Query2 $src ("SELECT * FROM " + (SqlId $srcDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+        if(-not $sr.ok){ return '{"ok":false,"error":'+(J-Str $sr.err)+'}' }
+        if($null -eq $fullCols){ $fullCols = $sr.columns }
+        $pkIdx = @($pk | ForEach-Object { [Array]::IndexOf($fullCols,$_) })
+        foreach($row in $sr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $srcFull[$k] = $row }
+        $tr = Run-Query2 $tgt ("SELECT * FROM " + (SqlId $tgtDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+        if(-not $tr.ok){ return '{"ok":false,"error":'+(J-Str $tr.err)+'}' }
+        foreach($row in $tr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $tgtFull[$k] = $row }
+    }
+    $pkIdxFinal = @($pk | ForEach-Object { [Array]::IndexOf($fullCols,$_) })
+    $diffsJ = New-Object System.Collections.ArrayList
+    foreach($k in $srcFull.Keys){
+        if(-not $tgtFull.ContainsKey($k)){ continue }
+        $sRow = $srcFull[$k]; $tRow = $tgtFull[$k]
+        $cdJ = New-Object System.Collections.ArrayList
+        for($ci=0; $ci -lt $fullCols.Count; $ci++){
+            $sv = [string]$sRow[$ci]; $tv = [string]$tRow[$ci]
+            if($sv -ne $tv){ [void]$cdJ.Add('{"col":'+(J-Str $fullCols[$ci])+',"src":'+(J-Str $sRow[$ci])+',"tgt":'+(J-Str $tRow[$ci])+'}') }
+        }
+        if($cdJ.Count -gt 0){
+            $pkVals = @($pkIdxFinal | ForEach-Object { $sRow[$_] })
+            [void]$diffsJ.Add('{"pk":'+(J-Arr $pkVals)+',"colDiffs":['+($cdJ -join ',')+']}')
+        }
+    }
+    if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
+    '{"ok":true,"pkCols":'+(J-Arr $pk)+',"fkCols":'+(J-Arr $fk)+',"diffs":['+($diffsJ -join ',')+'],"commonTotal":'+$commonTotal+',"comparedCount":'+$useCommon.Count+',"truncated":'+($(if($truncated){'true'}else{'false'}))+',"targetReadonly":'+$roJson+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+'}'
+}
+# Applies the (client-selected) content updates: one UPDATE per row, using the SOURCE value for
+# each column flagged as different, matched by primary key. This OVERWRITES existing target
+# data for those rows - the only write path in Compare that does so - and is always
+# client-confirmed with an explicit warning before this is ever called.
+function Api-CompareRowsApplyDiff { param($data)
+    $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
+    if($tgt.readonly){ return '{"ok":false,"error":"Target connection is read-only / safe mode - blocked."}' }
+    $db = [string]$data.targetDb; $table = [string]$data.table
+    $pkCols = @($data.pkCols); $updates = @($data.updates)
+    if($pkCols.Count -eq 0 -or $updates.Count -eq 0){ return '{"ok":false,"error":"No rows to update."}' }
+    $obj = (SqlId $db) + '.' + (SqlId $table)
+    $log = New-Object System.Collections.ArrayList
+    $cnf = New-Cnf $tgt
+    try {
+        foreach($u in $updates){
+            $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValLit $cd.src) }
+            $whs = @(); $pkv = @($u.pk)
+            for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValLit $pkv[$i]) }
+            if($sets.Count -eq 0 -or $whs.Count -eq 0){ [void]$log.Add("SKIPPED (no columns/key)"); continue }
+            $sql = "UPDATE $obj SET " + ($sets -join ',') + ' WHERE ' + ($whs -join ' AND ') + ' LIMIT 1'
+            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null
+            $pkDesc = ($pkv -join ',')
+            if($r2.exit -eq 0){ [void]$log.Add("OK  updated id="+$pkDesc) }
+            else { [void]$log.Add("FAILED id="+$pkDesc+" : "+(FirstErr $r2.err)) }
+        }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    '{"ok":true,"log":'+(J-Arr $log)+'}'
+}
+# Inserts EVERY missing row (source rows absent from target), not just the first 2000 that fit
+# in the interactive review list. Unlike Api-CompareRows/Api-CompareRowsApply, this never sends
+# the row data to the browser at all - it fetches a chunk of missing rows from source and
+# inserts that SAME chunk into target immediately, chunk by chunk, so the full amount of data
+# moved is not limited by what's practical to render as a checkbox list. Still insert-only.
+function Api-CompareRowsInsertAll { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $src -or -not $tgt){ return '{"ok":false,"error":"Connection not found."}' }
+    if($tgt.readonly){ return '{"ok":false,"error":"Target connection is read-only / safe mode - blocked."}' }
+    $rid = [string]$data.requestId
+    $table = [string]$data.table; $srcDb = [string]$data.sourceDb; $tgtDb = [string]$data.targetDb
+    $pk = Get-TablePkCols $src $srcDb $table
+    if(-not $pk -or $pk.Count -eq 0){ return '{"ok":false,"error":"Table has no primary key - cannot compare rows."}' }
+    $pkList = ($pk | ForEach-Object { SqlId $_ }) -join ','
+    # Every fetch below is registered under $rid (via Run-Query2's RequestId param) so Cancel can
+    # actually KILL the in-flight mysql.exe process for large tables, not just stop between chunks.
+    $srcR = Run-Query2Bulk $src ("SELECT $pkList FROM " + (SqlId $srcDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $srcR.ok){ return '{"ok":false,"error":'+(J-Str $srcR.err)+'}' }
+    $tgtR = Run-Query2Bulk $tgt ("SELECT $pkList FROM " + (SqlId $tgtDb) + '.' + (SqlId $table)) $null $rid
+    if(-not $tgtR.ok){
+        if($tgtR.err -match '1146' -or $tgtR.err -match "doesn't exist"){ $tgtR = @{ ok=$true; rows=(New-Object System.Collections.ArrayList) } }
+        else { return '{"ok":false,"error":'+(J-Str $tgtR.err)+'}' }
+    }
+    $tgtSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($row in $tgtR.rows){ [void]$tgtSet.Add(($row -join "`u{1}")) }
+    $missingRows = New-Object System.Collections.ArrayList
+    foreach($row in $srcR.rows){ if(-not $tgtSet.Contains(($row -join "`u{1}"))){ [void]$missingRows.Add($row) } }
+    $missingTotal = $missingRows.Count
+    if($missingTotal -eq 0){ return '{"ok":true,"missingTotal":0,"inserted":0,"cancelled":false,"log":[]}' }
+
+    $cancelled = $false
+    $chunkSize = 200
+    $log = New-Object System.Collections.ArrayList
+    $inserted = 0
+    $cnf = New-Cnf $tgt
+    try {
+        for($fi=0; $fi -lt $missingRows.Count; $fi += $chunkSize){
+            if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
+            $fEnd = [Math]::Min($fi+$chunkSize,$missingRows.Count) - 1
+            $chunk = $missingRows[$fi..$fEnd]
+            if($pk.Count -eq 1){
+                $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
+                $where = (SqlId $pk[0]) + ' IN (' + $vals + ')'
+            } else {
+                $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+                $where = '(' + $pkList + ') IN (' + $tuples + ')'
+            }
+            $fr = Run-Query2 $src ("SELECT * FROM " + (SqlId $srcDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+            if(-not $fr.ok){ [void]$log.Add("FAILED (fetch) rows "+$fi+"-"+$fEnd+" : "+$fr.err); continue }
+            if($fr.rows.Count -eq 0){ continue }
+            $colList = ($fr.columns | ForEach-Object { SqlId $_ }) -join ','
+            $obj = (SqlId $tgtDb) + '.' + (SqlId $table)
+            $valuesSql = ($fr.rows | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
+            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null $null $rid
+            if($r2.exit -eq 0){ $inserted += $fr.rows.Count; [void]$log.Add("OK  inserted "+$fr.rows.Count+" row(s) ("+($inserted)+" of "+$missingTotal+" so far)") }
+            else { [void]$log.Add("FAILED (insert) rows "+$fi+"-"+$fEnd+" : "+(FirstErr $r2.err)) }
+        }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
+    '{"ok":true,"missingTotal":'+$missingTotal+',"inserted":'+$inserted+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+',"log":'+(J-Arr $log)+'}'
+}
+function Api-CompareRowsApply { param($data)
+    $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
+    if($tgt.readonly){ return '{"ok":false,"error":"Target connection is read-only / safe mode - blocked."}' }
+    $db = [string]$data.targetDb; $table = [string]$data.table
+    $cols = @($data.columns); $rows = @($data.rows)
+    if($cols.Count -eq 0 -or $rows.Count -eq 0){ return '{"ok":false,"error":"No rows to insert."}' }
+    $colList = ($cols | ForEach-Object { SqlId $_ }) -join ','
+    $obj = (SqlId $db) + '.' + (SqlId $table)
+    $log = New-Object System.Collections.ArrayList
+    $batchSize = 500
+    $cnf = New-Cnf $tgt
+    try {
+        for($i=0; $i -lt $rows.Count; $i += $batchSize){
+            $endIdx = [Math]::Min($i+$batchSize,$rows.Count) - 1
+            $batch = $rows[$i..$endIdx]
+            $valuesSql = ($batch | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
+            # IMPORTANT: pipe the SQL via stdin (Run-Stdin), not as a "-e" command-line argument
+            # (Run-Proc) - a batch of rows easily exceeds Windows' command-line length limit
+            # ("The filename or extension is too long"), especially for wide tables.
+            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null
+            $batchNum = [int]($i/$batchSize)+1
+            if($r2.exit -eq 0){ [void]$log.Add("OK  inserted "+$batch.Count+" row(s) (batch $batchNum)") }
+            else { [void]$log.Add("FAILED batch $batchNum : "+(FirstErr $r2.err)) }
+        }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    '{"ok":true,"log":'+(J-Arr $log)+'}'
+}
+# Marks a compare operation's requestId as cancelled; the running loop (Compare-TableSets,
+# Api-CompareRows, Api-CompareRowsDiff) checks this between iterations and stops cleanly.
+function Api-CompareCancel { param($data)
+    $rid = [string]$data.requestId
+    if(-not $rid){ return '{"ok":true}' }
+    # Mark cancelled first (so any loop that's between chunks stops on its next check), THEN
+    # actually kill whatever's currently running under this id - a compare's slow phase is
+    # usually one single huge SELECT, not a chunk loop, so without this Cancel would only ever
+    # take effect once that one call finally finishes on its own.
+    $script:CancelledCompares[$rid] = $true
+    $entry = $null
+    if ($script:RunningQueries.TryGetValue($rid, [ref]$entry)) {
+        try {
+            $entry.Cancelled = $true
+            if (-not $entry.Process.HasExited) { $entry.Process.Kill() }
+        } catch {}
+    }
+    '{"ok":true}'
+}
+function Api-CompareSchemas { param($data)
+    $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $src){ return '{"ok":false,"error":"Source connection not found."}' }
+    if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
+    $srcDb = [string]$data.sourceDb; $tgtDb = [string]$data.targetDb
+    if(-not $srcDb -or -not $tgtDb){ return '{"ok":false,"error":"Pick a database on both sides."}' }
+    $srcCols = Get-SchemaColumns $src $srcDb; if($null -eq $srcCols){ return '{"ok":false,"error":"Could not read the source schema."}' }
+    $tgtCols = Get-SchemaColumns $tgt $tgtDb; if($null -eq $tgtCols){ return '{"ok":false,"error":"Could not read the target schema."}' }
+    if($null -ne $data.tables){
+        $keep = @{}; foreach($tn in @($data.tables)){ $keep[[string]$tn]=$true }
+        $srcCols2=[ordered]@{}; foreach($k in $srcCols.Keys){ if($keep.ContainsKey($k)){ $srcCols2[$k]=$srcCols[$k] } }
+        $tgtCols2=[ordered]@{}; foreach($k in $tgtCols.Keys){ if($keep.ContainsKey($k)){ $tgtCols2[$k]=$tgtCols[$k] } }
+        $srcCols=$srcCols2; $tgtCols=$tgtCols2
+    }
+    $rid = [string]$data.requestId
+    $cmpResult = Compare-TableSets $src $srcDb $srcCols $tgtCols $rid
+    if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
+    $tj = New-Object System.Collections.ArrayList
+    foreach($t in $cmpResult.tables){
+        $sj = New-Object System.Collections.ArrayList
+        foreach($s in $t.sql){ [void]$sj.Add('{"stmt":'+(J-Str $s.stmt)+',"checked":'+($(if($s.checked){'true'}else{'false'}))+',"kind":'+(J-Str $s.kind)+'}') }
+        [void]$tj.Add('{"name":'+(J-Str $t.name)+',"status":'+(J-Str $t.status)+',"sql":['+($sj -join ',')+']}')
+    }
+    '{"ok":true,"tables":['+($tj -join ',')+'],"targetReadonly":'+($(if($tgt.readonly){'true'}else{'false'}))+',"cancelled":'+($(if($cmpResult.cancelled){'true'}else{'false'}))+'}'
+}
+function Api-CompareApply { param($data)
+    $tgt = Resolve-SavedConn $data.targetConnName
+    if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
+    if($tgt.readonly){ return '{"ok":false,"error":"Target connection is read-only / safe mode - blocked."}' }
+    $db = [string]$data.targetDb
+    $stmts = @($data.statements)
+    $log = New-Object System.Collections.ArrayList
+    foreach($stmt in $stmts){
+        $r = Run-Query2 $tgt $stmt $db
+        if($r.ok){ [void]$log.Add('OK  '+$stmt) } else { [void]$log.Add('FAILED  '+$stmt+'  :  '+$r.err) }
+    }
+    '{"ok":true,"log":['+(($log|ForEach-Object{ J-Str $_ }) -join ',')+']}'
+}
+
+function Api-ConnGet { param($data)
+    $c = Load-Conns | Where-Object { $_.name -eq [string]$data.name } | Select-Object -First 1
+    if(-not $c){ return '{"ok":false}' }
+    $pass=''
+    if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+}
+function Api-ConnSave { param($data)
+    $name=[string]$data.name; if(-not $name){ return '{"ok":false,"error":"name required"}' }
+    $c=$data.conn; $enc=''
+    $before=@(Load-Conns)
+    $savePw = $true
+    if($data.PSObject.Properties['savepw']){ $savePw = [bool]$data.savepw }
+    if(-not $savePw){
+        $enc = ''   # explicitly do not store / remove the saved password
+    } elseif($c.password){
+        $sec=ConvertTo-SecureString ([string]$c.password) -AsPlainText -Force; $enc=ConvertFrom-SecureString $sec
+    } else {
+        $prev = $before | Where-Object { $_.name -eq $name } | Select-Object -First 1; if($prev -and $prev.pass){ $enc = [string]$prev.pass }
+    }
+    $prevPrimary = $false
+    $prevObj = $before | Where-Object { $_.name -eq $name } | Select-Object -First 1
+    if($prevObj -and $prevObj.primary){ $prevPrimary = $true }
+    # accent colour / environment label / read-only flag: use provided value, else keep the previous one
+    if($data.PSObject.Properties['accent']){ $accent=[string]$data.accent } elseif($prevObj){ $accent=[string]$prevObj.accent } else { $accent='' }
+    if($data.PSObject.Properties['env']){ $env=[string]$data.env } elseif($prevObj){ $env=[string]$prevObj.env } else { $env='' }
+    if($data.PSObject.Properties['readonly']){ $ro=[bool]$data.readonly } elseif($prevObj -and $prevObj.readonly){ $ro=$true } else { $ro=$false }
+    $list=@($before | Where-Object { $_.name -ne $name })
+    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
+    Save-Conns $list
+    '{"ok":true}'
+}
+function Api-ConnDelete { param($data)
+    $list=@(Load-Conns | Where-Object { $_.name -ne [string]$data.name }); Save-Conns $list; '{"ok":true}'
+}
+
+$Token = [Guid]::NewGuid().ToString('N')
+$Html = @'
+<!doctype html><html><head><meta charset="utf-8"><title>NOBS SQL Editor</title>
+<style>
+ :root{--bg:#fff;--fg:#1c1c1c;--panel:#eef0f3;--panel2:#e6e6e6;--bd:#ccc;--bd2:#e2e2e2;--hover:#eaf2fb;--accent:#1565c0;--muted:#777;--gridh:#f0f0f0;--even:#fafafa;--dirty:#fff6cc;--del:#ffdede;--btn:#fafafa;--log:#1e1e1e;--logfg:#d4d4d4;--str:#a31515;--kw:#0000c0;--com:#008000;--num:#098658;--in:#fff;--sb:rgba(0,0,0,.28);--sbh:rgba(0,0,0,.48)}
+ body.dark{--bg:#1e1e1e;--fg:#e0e0e0;--panel:#2a2d31;--panel2:#333;--bd:#444;--bd2:#3a3a3a;--hover:#33404d;--accent:#3b82f6;--muted:#999;--gridh:#2d2d2d;--even:#262626;--dirty:#4a4526;--del:#4a2626;--btn:#333;--log:#141414;--logfg:#d4d4d4;--str:#ce9178;--kw:#569cd6;--com:#6a9955;--num:#b5cea8;--in:#2a2a2a;--sb:rgba(255,255,255,.24);--sbh:rgba(255,255,255,.42)}
+ *{box-sizing:border-box}
+*{scrollbar-width:thin;scrollbar-color:var(--sb) transparent}
+::-webkit-scrollbar{width:11px;height:11px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--sb);border-radius:8px;border:3px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--sbh);border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-corner{background:transparent} html,body{height:100%;margin:0;font-family:system-ui,"Segoe UI",Roboto,Arial,sans-serif;font-size:13px;color:var(--fg);background:var(--bg)}
+ body{display:flex;flex-direction:column}
+ #bar{display:flex;flex-direction:column;gap:5px;padding:6px 8px;background:var(--panel);border-bottom:1px solid var(--bd)} .barrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap} .brand{font-size:12px;font-weight:600;color:var(--muted);white-space:nowrap;margin-right:2px;letter-spacing:.2px} .fld{display:inline-flex;align-items:center;gap:3px;white-space:nowrap;font-size:12px;color:var(--muted)}
+ input,select,textarea{background:var(--in);color:var(--fg);border:1px solid var(--bd);border-radius:3px;padding:3px 6px;box-sizing:border-box}
+ #bar input,#bar select{height:28px}
+ #bar input.h{width:130px}#bar input.s{width:52px}#bar input.p{width:120px} #pass{-webkit-text-security:disc;text-security:disc}
+ button{padding:0 9px;height:28px;box-sizing:border-box;border:1px solid var(--bd);border-radius:4px;background:var(--btn);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;line-height:1;vertical-align:middle;font-size:13px}
+ button:hover:not(:disabled){filter:brightness(1.08)} button:active:not(:disabled){filter:brightness(.93)} button:disabled{opacity:.45;cursor:not-allowed;filter:none} button:focus-visible{outline:2px solid var(--accent);outline-offset:1px} .chip{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.5;letter-spacing:.4px;white-space:nowrap;border:1px solid transparent;box-shadow:inset 0 0 0 1px rgba(255,255,255,.10)} .chip.ok{background:#2e7d46;color:#fff} .chip.bad{background:#c0504d;color:#fff} button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18)} button.go{background:#2e7d32;color:#fff;border-color:#276b2b} button.sm{padding:0 6px;font-size:12px} button.warn{background:#b23b3b;color:#fff;border-color:#933}
+ #main{flex:1;display:flex;min-height:0}
+ #side{width:280px;min-width:170px;flex:0 0 auto;display:flex;flex-direction:column} #sideResize{flex:0 0 7px;cursor:col-resize;background:var(--bd);position:relative;touch-action:none;z-index:5} #sideResize:hover,#sideResize.drag{background:var(--accent)} body.disconnected #sideResize{pointer-events:auto !important;opacity:1 !important}
+ .hdr{background:var(--panel2);padding:4px 8px;font-weight:600;font-size:11px;letter-spacing:.5px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;height:52px;box-sizing:border-box}
+ #schemas{flex:0 0 40%;overflow:auto;border-bottom:1px solid var(--bd)} #objects{flex:1;overflow:auto}
+ .item{padding:3px 10px 3px 16px;cursor:pointer;white-space:nowrap} #schemas .item{overflow:hidden;text-overflow:ellipsis} .uitem{padding:3px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .uitem:hover{background:var(--hover)} .uitem.sel{background:var(--accent);color:#fff} .item:hover{background:var(--hover)} .item.sel{background:var(--accent);color:#fff}
+ .ohdr{padding:3px 8px;font-weight:600;font-size:11px;color:var(--muted);background:var(--panel);border-top:1px solid var(--bd2);position:sticky;top:0}
+ #content{flex:1;display:flex;flex-direction:column;min-width:0}
+ #tabsbar{display:flex;gap:4px;background:var(--panel2);padding:0 6px;overflow-x:auto;overflow-y:hidden;height:52px;box-sizing:border-box;align-items:center;border-bottom:1px solid var(--bd)}
+ .tab{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 12px;background:var(--btn);border:1px solid var(--bd);border-radius:6px;cursor:pointer;white-space:nowrap;box-sizing:border-box}
+ .tab.active{background:var(--bg);font-weight:600} .tab .x{margin-left:0;color:var(--muted);font-size:14px;line-height:1} .tab .x:hover{color:#c00}
+ .tab.dragging{opacity:.4}
+ .tab.dragover{box-shadow:inset 2px 0 0 var(--accent)}
+ .runningdot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--accent);margin-right:6px;animation:rundotpulse 1s ease-in-out infinite}
+ @keyframes rundotpulse{0%,100%{opacity:1}50%{opacity:.25}}
+ .tabpane{flex:1;display:none;flex-direction:column;min-height:0} .tabpane.active{display:flex}
+ .edwrap{position:relative;height:calc(50% - 34px);min-height:44px;border-bottom:1px solid var(--bd);overflow:hidden}
+ .edwrap.big{height:280px}
+ .edsplit{height:7px;cursor:row-resize;background:var(--panel2);border-bottom:1px solid var(--bd);flex:0 0 auto} .edsplit:hover{background:var(--accent)}
+ .hl,.editor{position:absolute;inset:0;margin:0;padding:8px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:13px;line-height:1.4;white-space:pre;overflow:auto;border:0;tab-size:4}
+ .hl{pointer-events:none;z-index:1;color:var(--fg)} .editor{z-index:2;color:transparent;background:transparent;caret-color:var(--fg);resize:none;outline:none}
+ .c-str{color:var(--str)} .c-kw{color:var(--kw);font-weight:600} .c-com{color:var(--com);font-style:italic} .c-num{color:var(--num)}
+ .toolbar{padding:4px 8px;background:var(--panel);border-bottom:1px solid var(--bd2);display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+ .tbsep{width:1px;align-self:stretch;background:var(--bd);margin:2px 8px}
+ .result{flex:1;overflow:auto} table.grid{border-collapse:collapse;width:100%;table-layout:fixed} .grid th .rz{position:absolute;right:-3px;top:0;width:7px;height:100%;cursor:col-resize;z-index:3} .grid th .rz:hover,.grid th .rz.drag{background:var(--accent);opacity:.55}
+ table.grid th{position:sticky;top:0;background:var(--gridh);border:none;border-right:1px solid var(--bd);box-shadow:inset 0 -2px 0 var(--bd);padding:3px 8px;text-align:left;white-space:nowrap;z-index:1}
+table.grid td{border:none;border-right:1px solid var(--bd2);border-bottom:1px solid var(--bd2);padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+table.grid td:first-child{text-align:center;vertical-align:middle;padding:0}
+table.grid td:first-child input[type="checkbox"]{display:block;margin:0 auto}
+table.grid td:has(input[type="checkbox"]){text-align:center;vertical-align:middle;padding:0}
+table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:middle}
+.wraptext table.grid td{white-space:normal;word-break:break-word}
+.grid th input[type=checkbox],.grid td input[type=checkbox]{vertical-align:middle;margin:0;display:inline-block}
+ table.grid th:first-child,table.grid td:first-child{text-align:center;padding-left:2px;padding-right:2px} table.grid input[type=checkbox]{margin:0;vertical-align:middle}
+ table.grid td.editable{cursor:cell} table.grid tr:nth-child(even) td{background:var(--even)}
+ table.grid tr.insrow td{background:rgba(80,200,120,.14);border-bottom:1px solid rgba(80,200,120,.25)}
+ table.grid tr.insrow td.editable:hover{background:rgba(80,200,120,.22)}
+ table.grid tr.insrow td.delcell{color:#7ee0a0}
+ table.grid td.kbfocus{outline:2px solid var(--accent);outline-offset:-2px}
+ td.dirty{background:var(--dirty)!important} tr.del td{background:var(--del)!important;text-decoration:line-through}
+ table.grid td input{width:100%;border:1px solid var(--accent);font:inherit;padding:1px 3px;background:var(--in);color:var(--fg)} input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
+ .delcell{color:#c00;cursor:pointer;text-align:center;width:22px}
+ .status{padding:3px 8px;font-size:12px;color:var(--fg);border-top:1px solid var(--bd2);background:var(--panel)} .status.err{color:#e06}
+ #loghdr{background:#333;color:#ddd;padding:2px 8px;font-size:11px;display:flex;justify-content:space-between}
+ #log{height:104px;overflow:auto;background:var(--log);color:var(--logfg);font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px;padding:6px 8px;white-space:pre-wrap}
+ .modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:9000} kbd{display:inline-block;padding:1px 7px;border:1px solid var(--bd);border-bottom-width:2px;border-radius:4px;background:var(--panel);font-family:'Cascadia Code',Consolas,monospace;font-size:11px;white-space:nowrap}
+ #mInput{z-index:9600} #mRowForm{z-index:9500}
+ .modal.show{display:flex} .box{background:var(--bg);color:var(--fg);border-radius:6px;padding:16px;max-width:900px;width:94%;max-height:92%;overflow:auto;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+ .box h3{margin:0 0 10px} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:4px 18px}
+ label.ck{display:block;padding:2px 0} .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap} .muted{color:var(--muted);font-size:12px}
+ #ctx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:180px}
+ #colPicker{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
+ .cphdr{display:flex;justify-content:space-between;align-items:center;padding:4px 12px 6px;font-size:11px;color:var(--muted);border-bottom:1px solid var(--bd2);margin-bottom:4px}
+ .cplink{color:var(--accent);cursor:pointer}
+ .cpitem{display:flex;align-items:center;gap:6px;padding:3px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
+ .cpitem:hover{background:var(--hover,rgba(127,127,127,.12))}
+ #ctx .item{padding:5px 12px} #ctx .sep{height:1px;background:var(--bd2);margin:3px 0}
+ .item.kbsel{background:var(--hover);outline:1px solid var(--accent);outline-offset:-1px}
+ #acx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9600;display:none;max-height:230px;overflow:auto;min-width:160px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px}
+ #acx .ai{padding:3px 10px;cursor:pointer;white-space:nowrap} #acx .ai.on{background:var(--accent);color:#fff}
+ table.dz{border-collapse:collapse;width:100%} table.dz th{border:none;border-bottom:2px solid var(--bd);padding:4px 6px;text-align:left;color:var(--muted);font-weight:600;font-size:12px} table.dz td{border:none;border-bottom:1px solid var(--bd2);padding:4px} table.dz tr:last-child td{border-bottom:none} table.dz input,table.dz select{width:100%}
+.pill{background:var(--accent);color:#fff;border-radius:10px;padding:0 7px;font-size:11px}
+#toasts{position:fixed;bottom:16px;right:16px;z-index:99997;display:flex;flex-direction:column;gap:8px;max-width:360px}
+.toast{background:var(--panel2);border:1px solid var(--bd);border-left:4px solid var(--accent);border-radius:6px;padding:10px 14px;font-size:13px;box-shadow:0 4px 14px rgba(0,0,0,.3);animation:toastin .2s ease-out}
+.toast.err{border-left-color:#c0504d}
+@keyframes toastin{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+ @keyframes expmove{0%{margin-left:-40%}50%{margin-left:60%}100%{margin-left:-40%}}
+ body.disconnected .needsconn{display:none !important}
+ body.disconnected #main.needsconn{display:flex !important;visibility:hidden}
+ body.ro .write{opacity:.4;pointer-events:none;filter:grayscale(45%);cursor:not-allowed} #ctx .item.rodis{opacity:.4;pointer-events:none;cursor:not-allowed} .ctxsub{display:none;position:absolute;background:var(--panel);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.35);min-width:180px;z-index:9999;padding:3px 0} .ctxsub .item{white-space:nowrap} #objects .item{display:flex;justify-content:space-between;gap:8px;align-items:center} #objects .onm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} #objects .osz{color:var(--muted);font-size:11px;flex:none} #overview h2{margin:2px 0 12px;font-size:15px;font-weight:600} table.ovgrid{border-collapse:collapse;width:auto;min-width:60%} table.ovgrid th{border:none;border-bottom:2px solid var(--bd);padding:4px 12px;text-align:left;white-space:nowrap} .ovgrid td{border:none;border-bottom:1px solid var(--bd2);padding:4px 12px;text-align:left;white-space:nowrap} table.ovgrid th{background:var(--gridh);font-weight:600} table.ovgrid td.num{text-align:right} table.ovgrid tbody tr{cursor:pointer} table.ovgrid tbody tr:hover{background:var(--hover,rgba(127,127,127,.12))}
+.expdbrow{margin:1px 0}
+.exptoggle{display:inline-block;width:14px;cursor:pointer;color:var(--muted);user-select:none;font-size:10px;text-align:center}
+.exptoggle:hover{color:var(--accent)}
+.exptbls{margin:2px 0 6px 22px;max-height:170px;overflow:auto;border-left:2px solid var(--bd2);padding-left:8px}
+</style></head><body>
+<div id="deadOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.78);align-items:center;justify-content:center;flex-direction:column">
+ <div style="background:var(--panel,#1e1e1e);border:1px solid var(--bd,#444);border-radius:10px;padding:24px 28px;max-width:440px;text-align:center;color:var(--fg,#eee)">
+  <div style="font-size:16px;font-weight:600;margin-bottom:8px">Local server not responding</div>
+  <div style="font-size:13px;line-height:1.6;margin-bottom:16px;opacity:.85">The NOBS SQL Editor background server has stopped or is unreachable.<br>Re-run <b>NOBSSQL.ps1</b> if needed, then click Retry.</div>
+  <button class="primary" onclick="location.reload()">Retry</button>
+ </div>
+</div>
+<div id="bar">
+ <div class="barrow">
+  <b class="brand">NOBS SQL Editor</b>
+	<select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select><span id="connStatus" class="chip bad" style="margin-left:6px">Not connected</span><span id="envChip" class="chip bad" style="display:none;margin-left:6px"></span><span id="schemaBadge" class="chip ok" style="display:none;margin-left:6px"></span>
+  <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()">New</button><button class="sm" title="Save these connection details" onclick="saveConn()">Save</button><button id="mgrBtn" class="sm" title="Edit, clone, delete or set primary for the selected connection" onclick="connMenu(event)">Manage &#9662;</button>
+  <span style="flex:1"></span>
+  <span style="flex:1"></span><span id="topActions" class="needsconn" style="display:inline-flex;gap:9px;align-items:center"><button class="primary" onclick="newTab()" title="Open a new query tab">+ New Query</button><span class="tbsep"></span><button title="View users and privileges" onclick="openUsers()">Users</button><button title="Browse and reopen previous queries" onclick="openHistory()">History</button><button title="Save and browse reusable queries" onclick="openLibrary()">Library</button><span class="tbsep"></span><button title="Export databases with mysqldump" onclick="openExport()">Export</button><button title="Import SQL files or a whole folder" onclick="openImport()">Import</button><button title="Compare table structure between two databases" onclick="openCompare()">Compare DB</button></span><button class="sm" title="Configure or download the mysql / mysqldump client tools" onclick="openSettings()">Settings</button><span class="tbsep" style="margin:2px 10px"></span><button class="sm warn" title="Stop the local server and exit (the clean way to close the app)" onclick="quit()">Quit</button>
+ </div>
+ <div class="barrow">
+  <span class="fld">Host <input id="host" class="h" value="127.0.0.1" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Port <input id="port" class="s" value="3306" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">User <input id="user" class="s" style="width:80px" value="root" autocomplete="off" name="mwt_user" data-lpignore="true" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Pass <input id="pass" class="p" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="mwt_secret" data-lpignore="true" data-form-type="other" onkeydown="if(event.key==='Enter')connect()"></span>
+  <select id="ssl"><option value="default">default</option><option value="disabled">disabled</option><option value="required">required</option><option value="verify">verify</option></select>
+  <button class="primary" title="Connect to the server with the details above" onclick="connect()">Connect</button><button class="sm" title="Disconnect and lock the UI" onclick="disconnect()">Disconnect</button>
+  <span style="flex:1"></span>
+ </div>
+</div>
+<div id="main" class="needsconn">
+ <div id="side">
+  <div class="hdr"><span>SCHEMAS</span><span><button class="sm" title="Create a new schema" onclick="newSchema()">+ Schema</button> <button class="sm" title="Open the table designer" onclick="designTable(null)">+ Table</button> <button class="sm" title="Refresh the schema list and tables" onclick="refreshSchemasAndTables()">&#8635;</button></span></div>
+  <div id="schemas" tabindex="0"></div>
+  <div class="hdr"><span>OBJECTS</span><span id="objdb" class="muted"></span></div>
+<div style="display:flex;gap:4px;margin:4px 6px;align-items:center">
+<input id="objFilter" placeholder="filter objects..." oninput="renderObjects()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;font-size:12px">
+<button class="sm" id="allSchemasBtn" title="Search this name across all schemas" onclick="searchAllSchemas()" style="padding:2px 6px;font-size:11px">All DBs</button>
+</div>
+  <div id="objects" tabindex="0"></div>
+ </div>
+ <div id="sideResize" title="Drag to resize the sidebar (double-click to reset)"></div>
+ <div id="content"><div id="tabsbar"></div><div id="panes" style="flex:1;display:flex;flex-direction:column;min-height:0"><div id="overview" style="display:none;flex:1;overflow:auto;padding:14px"></div></div></div>
+</div>
+<div id="loghdr"><span>Action Output</span><span style="cursor:pointer" onclick="document.getElementById('log').textContent=''">clear</span></div><div id="log"></div>
+<div id="ctx"></div>
+<div id="colPicker"></div>
+<div id="acx"></div>
+<div class="modal" id="mBrowse"><div class="box" style="max-width:660px"><h3 id="brTitle">Browse</h3>
+ <div class="row"><button class="sm" onclick="brUp()">&#8593; Up</button> <b id="brPath" style="font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></b></div>
+ <div id="brList" style="height:340px;overflow:auto;border:1px solid var(--bd2);padding:2px"></div>
+ <div class="row"><span id="brActions"></span><span style="flex:1"></span><button onclick="brClose()">Cancel</button></div></div></div>
+
+<div class="modal" id="mView"><div class="box" style="max-width:780px"><h3 id="vTitle">Value</h3>
+ <textarea id="vText" style="width:100%;height:340px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></textarea>
+ <div class="row" id="vActions"></div></div></div>
+<div class="modal" id="mCsv"><div class="box"><h3 id="csvTitle">Import CSV into table</h3>
+ <div class="row">CSV file <input id="csvFile" style="flex:1"><button onclick="browse({title:'Select CSV file',filter:'*.csv',mode:'file',onPick:pp=>$('csvFile').value=pp})">Browse...</button></div>
+ <div class="row"><label title="The first row of the CSV contains the column names"><input type="checkbox" id="csvHeader" checked> first row is header</label>
+  <span style="margin-left:12px">Mode:</span>
+  <label title="Add the CSV rows to the existing table (does not delete anything)"><input type="radio" name="csvmode" id="csvAppend" checked> Append</label>
+  <label title="Empty the table first, then load (use this to restore a table from its own export)"><input type="radio" name="csvmode" id="csvReplace"> Replace (truncate first)</label></div>
+ <div class="muted" style="font-size:11px">Columns are matched to the table by header name; unmatched CSV columns are ignored, and empty cells import as NULL. For an exact restore of a whole database, prefer Export/Import (mysqldump).</div>
+ <div class="row"><button class="go" onclick="runCsvImport()">Import</button><button onclick="hide('mCsv')">Close</button></div>
+ <div id="csvLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:200px;overflow:auto;margin-top:6px"></div></div></div>
+<div class="modal" id="mExport"><div class="box"><h3>Data Export</h3>
+ <div class="row"><b>Databases</b> <button onclick="expAll(true)">All</button><button onclick="expAll(false)">None</button></div>
+ <div id="expDbs" style="max-height:150px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div>
+ <div class="row"><b>Options</b></div><div class="grid2" id="expOpts"></div>
+ <div class="row">Charset <select id="expCharset"><option>utf8mb4</option><option>utf8</option><option>latin1</option><option>binary</option></select>
+  <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle"> single file</label>
+  <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked> timestamp</label>
+  <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label></div>
+ <div class="row">Folder <input id="expFolder" style="flex:1" value="C:\temp"><button onclick="browse({title:'Select export folder',mode:'folder',start:$('expFolder').value,onPick:pp=>$('expFolder').value=pp})">Browse...</button></div>
+ <div class="row"><button class="go" id="expGoBtn" onclick="runExport()">Start Export</button><button class="warn" id="expCancelBtn" style="display:none" onclick="cancelJob('exp')">Cancel</button><button onclick="hide('mExport')">Close</button></div>
+ <div id="expProgress" style="display:none;margin-top:8px">
+   <div style="height:6px;border-radius:3px;background:var(--panel2);overflow:hidden"><div id="expBar" style="height:100%;width:40%;background:var(--accent);animation:expmove 1.1s ease-in-out infinite"></div></div>
+   <div id="expProgLabel" class="muted" style="font-size:11px;margin-top:4px"></div>
+ </div>
+ <div id="expLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
+
+<div class="modal" id="mImport"><div class="box"><h3>Data Import</h3><div class="row">SQL file paths (one per line):</div>
+ <textarea id="impFiles" style="width:100%;height:90px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;white-space:pre;overflow:auto"></textarea>
+ <div class="row"><button onclick="impAddFiles()">Add files...</button><button onclick="impAddFolder()">Add folder (all .sql)...</button><button class="sm" onclick="$('impFiles').value=''">Clear</button></div>
+ <div class="row">Target DB <input id="impDb" list="impDbList" placeholder="(blank if dump has CREATE DATABASE)" style="width:320px"><datalist id="impDbList"></datalist></div>
+ <div class="row"><label title="Create the target database first if it doesn't exist"><input type="checkbox" id="impCreate"> create DB</label><label title="Disable foreign-key and unique checks during import (for out-of-order or circular tables)"><input type="checkbox" id="impFk" checked> disable FK checks</label><label title="Keep going when a file or statement fails instead of stopping (mysql --force)"><input type="checkbox" id="impForce"> continue on errors</label><label title="Required if the dump contains raw NUL bytes in binary/text columns (fixes: ASCII '\0' appeared in the statement). Safe to leave on for any dump that might contain binary data."><input type="checkbox" id="impBinary"> binary-mode</label></div>
+ <div class="row"><button class="go" id="impGoBtn" onclick="runImport()">Run Import</button><button class="warn" id="impCancelBtn" style="display:none" onclick="cancelJob('imp')">Cancel</button><button onclick="hide('mImport')">Close</button></div>
+ <div id="impProgress" style="display:none;margin-top:8px">
+   <div style="height:6px;border-radius:3px;background:var(--panel2);overflow:hidden"><div id="impBar" style="height:100%;width:40%;background:var(--accent);animation:expmove 1.1s ease-in-out infinite"></div></div>
+   <div id="impProgLabel" class="muted" style="font-size:11px;margin-top:4px"></div>
+ </div>
+ <div id="impLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
+
+<div class="modal" id="mCompare"><div class="box" style="width:820px;max-width:94vw">
+ <h3>Compare Databases</h3>
+ <div class="row" style="display:flex;gap:10px">
+   <div style="flex:1"><div class="muted" style="font-size:11px;margin-bottom:3px">Source</div>
+     <select id="cmpSrcConn" style="width:100%" onchange="cmpLoadDbs('src')"></select>
+     <select id="cmpSrcDb" style="width:100%;margin-top:4px" onchange="cmpSrcDbChanged()"></select></div>
+   <div style="align-self:center;color:var(--accent);font-size:16px;padding-top:16px">&#8594;</div>
+   <div style="flex:1"><div class="muted" style="font-size:11px;margin-bottom:3px">Target</div>
+     <select id="cmpTgtConn" style="width:100%" onchange="cmpLoadDbs('tgt')"></select>
+     <select id="cmpTgtDb" style="width:100%;margin-top:4px" onchange="cmpResetTablePicker()"></select></div>
+ </div>
+ <div class="row"><a href="#" onclick="cmpToggleTablePicker();return false" style="font-size:11px;color:var(--accent)">Choose specific tables (optional)</a></div>
+<div id="cmpTablesBox" style="display:none;max-height:140px;overflow:auto;border:1px solid var(--bd2);border-radius:4px;padding:4px 8px;margin-bottom:6px"></div>
+<div class="row"><button class="go" onclick="runCompare()">Run comparison</button><span id="cmpRoNote" class="muted" style="font-size:11px;margin-left:8px;display:none;color:var(--del)">Target is read-only / safe mode - apply will be blocked.</span></div>
+ <div class="row" id="cmpResultsSearchRow" style="display:none"><input id="cmpResultSearch" type="text" placeholder="filter results by table name\u2026" oninput="cmpFilterResults()" style="width:100%;font-size:12px"></div>
+ <div id="cmpResults" style="max-height:320px;overflow:auto;margin-top:6px"></div>
+ <div class="row" style="display:flex;justify-content:space-between;align-items:center">
+   <span id="cmpSummary" class="muted" style="font-size:11px"></span>
+   <span style="display:inline-flex;gap:6px"><button onclick="previewCompareSql()">Preview SQL</button><button class="go write" onclick="applyCompare()">Apply to target</button><button onclick="cmpCloseAndCancel()">Close</button></span>
+ </div>
+ <div id="cmpLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:140px;overflow:auto;margin-top:6px"></div>
+</div></div>
+
+<div class="modal" id="mCompareRows"><div class="box" style="width:900px;max-width:96vw">
+ <h3 id="cmprTitle">Row comparison</h3>
+
+ <div class="muted" style="font-size:12px;font-weight:600;margin-top:4px">Missing on target</div>
+ <div id="cmprNote" class="muted" style="font-size:11px;margin-bottom:6px"></div>
+ <div class="row"><a href="#" onclick="cmprSetAll(true);return false" style="font-size:11px;color:var(--accent)">All</a> / <a href="#" onclick="cmprSetAll(false);return false" style="font-size:11px;color:var(--accent)">None</a> <span id="cmprSummary" class="muted" style="font-size:11px;margin-left:8px"></span></div>
+ <div id="cmprGrid" style="max-height:220px;overflow:auto;border:1px solid var(--bd2);border-radius:4px;margin-top:4px"></div>
+ <div class="row" style="display:flex;align-items:center;gap:10px">
+   <button class="go write" onclick="cmprApply()">Insert selected rows</button>
+   <span id="cmprRoNote" class="muted" style="font-size:11px;display:none;color:var(--del)">Target is read-only / safe mode - blocked.</span>
+ </div>
+
+ <div class="muted" style="font-size:12px;font-weight:600;margin-top:14px">Column differences (rows matched by id, content compared column-by-column)</div>
+ <div id="cmprDiffNote" class="muted" style="font-size:11px;margin-bottom:6px"></div>
+ <div class="row"><a href="#" onclick="cmprDiffSetAll(true);return false" style="font-size:11px;color:var(--accent)">All</a> / <a href="#" onclick="cmprDiffSetAll(false);return false" style="font-size:11px;color:var(--accent)">None</a> <span id="cmprDiffSummary" class="muted" style="font-size:11px;margin-left:8px"></span></div>
+ <div id="cmprDiffGrid" style="max-height:220px;overflow:auto;border:1px solid var(--bd2);border-radius:4px;margin-top:4px"></div>
+ <div class="row" style="display:flex;align-items:center;gap:10px">
+   <button class="warn write" onclick="cmprDiffApply()" title="Overwrites the target row's differing columns with the source values shown">Update selected rows (overwrites target)</button>
+   <span id="cmprDiffRoNote" class="muted" style="font-size:11px;display:none;color:var(--del)">Target is read-only / safe mode - blocked.</span>
+ </div>
+
+ <div class="row" style="display:flex;justify-content:flex-end;margin-top:6px"><button onclick="cmprCloseAndCancel()">Close</button></div>
+ <div id="cmprLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
+</div></div>
+
+<div class="modal" id="mUsers"><div class="box"><h3>Users &amp; Privileges</h3>
+ <div class="row" style="align-items:flex-start"><div id="userSel" style="min-width:240px;height:260px;overflow:auto;border:1px solid var(--bd2);border-radius:4px"></div>
+  <div style="flex:1"><div id="grantsBox" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;height:260px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div></div></div>
+ <div class="row"><button onclick="newUser()">Create user...</button><button onclick="grantUser()">Grant...</button><button onclick="revokeUser()">Revoke...</button><button onclick="changePassword()">Change password...</button><button onclick="lockUser(true)" title="Disable this login (ACCOUNT LOCK)">Lock</button><button onclick="lockUser(false)" title="Re-enable this login (ACCOUNT UNLOCK)">Unlock</button><button class="warn" onclick="dropUser()">Drop user</button><button onclick="hide('mUsers')">Close</button></div></div></div>
+
+<div class="modal" id="mHist"><div class="box"><h3>Query History</h3>
+ <div id="histList" style="max-height:400px;overflow:auto"></div>
+ <div class="row"><button class="warn" onclick="clearHistory()">Clear history</button><button onclick="hide('mHist')">Close</button></div></div></div>
+<div class="modal" id="mRowForm"><div class="box" style="width:560px;max-width:94vw"><h3 id="rfTitle">Edit row</h3>
+ <div id="rfFields" style="max-height:60vh;overflow:auto"></div>
+ <div class="row" style="justify-content:flex-end;margin-top:6px"><button onclick="hide('mRowForm')">Cancel</button><button class="go" onclick="rfSave()">Save to pending</button></div></div></div>
+<div class="modal" id="mSettings"><div class="box" style="width:620px;max-width:94vw">
+ <h3 style="margin-bottom:3px">Client tools</h3>
+ <div class="muted" style="font-size:12px">Export, Import and multi-statement Run use the MySQL/MariaDB command-line tools.<br>They are not bundled - point to an existing install, or download them automatically.</div>
+ <div style="margin:10px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">STATUS</div>
+ <div id="cfgStatus" style="background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:8px 12px;font-size:12px"></div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">PATHS</div>
+ <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; bundled with this script &rarr; next to the script &rarr; system PATH &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL, XAMPP).</div>
+ <div class="row"><span style="width:92px">mysql</span><input id="cfgMysql" style="flex:1" placeholder="full path to mysql.exe (or mariadb.exe)"><button onclick="browse({title:'Select mysql.exe / mariadb.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysql').value=pp})">Browse...</button></div>
+ <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
+ <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB)</span></div>
+ <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
+ <div id="cfgPaths" class="muted" style="font-size:11px;font-family:Consolas,monospace;margin-top:10px;border-top:1px solid var(--bd2);padding-top:8px;line-height:1.6"></div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LOCAL DATA</div>
+ <div class="row"><button class="warn" onclick="clearAllData()">Clear all app data</button></div>
+ <hr style="border:none;border-top:1px solid var(--bd2);margin:10px 0">
+ <div class="row" style="gap:8px"><button class="sm needsconn" title="Clear the database overview cache and reload" onclick="clearOverviewCache()">Refresh Cache</button><button class="sm" title="Toggle light / dark theme" onclick="toggleTheme()">Switch Theme</button><button class="sm" title="Keyboard shortcuts" onclick="show('mShortcuts')">Shortcut Info</button></div>
+ <div class="row" style="justify-content:flex-end;margin-top:12px"><button onclick="hide('mSettings')">Close</button><button class="go" onclick="saveSettings()">Save</button></div></div></div>
+<div class="modal" id="mShortcuts"><div class="box" style="width:560px;max-width:92vw"><h3 style="margin-top:0">Keyboard shortcuts &amp; tips</h3>
+ <table style="border-collapse:collapse;font-size:13px"><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>F5</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the whole query</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the selected text (or all, if nothing is selected)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Autocomplete</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Indent (in the editor)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + S</kbd></td><td style="padding:3px 0;color:var(--muted)">Apply pending grid edits (save changes)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + T</kbd></td><td style="padding:3px 0;color:var(--muted)">New query tab</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + W</kbd></td><td style="padding:3px 0;color:var(--muted)">Close current tab</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + L</kbd></td><td style="padding:3px 0;color:var(--muted)">Focus the editor and select all</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Connect (when focused in Host / Port / User / Pass)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">Close a dialog or the autocomplete popup</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Drag column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize a results column</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Double-click column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Auto-fit a results column</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Drag sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize the schema/objects sidebar</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Double-click sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Reset the sidebar width</td></tr></table>
+ <div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="hide('mShortcuts')">Close</button></div></div></div>
+<div class="modal" id="mInput"><div class="box" style="width:460px;max-width:92vw;display:flex;flex-direction:column;overflow:hidden"><h3 id="inpTitle" style="flex:none;margin-top:0">Input</h3>
+ <div id="inpFields" style="flex:1 1 auto;min-height:0;overflow:auto"></div>
+ <div class="row" style="justify-content:flex-end;margin-top:6px;flex:none"><button onclick="inpCancel()">Cancel</button><button class="go" id="inpOk" onclick="inpOk()">OK</button></div></div></div>
+<div class="modal" id="mLib"><div class="box" style="width:640px;max-width:92vw"><h3>Query Library</h3>
+ <div class="row"><input id="libName" placeholder="Name for the current query" style="flex:1" onkeydown="if(event.key==='Enter')libSaveCurrent()"><button class="go" onclick="libSaveCurrent()">Save current query</button></div>
+ <div class="row"><input id="libSearch" placeholder="Search saved queries..." oninput="libRender()" style="flex:1"></div>
+ <div id="libList" style="max-height:380px;overflow:auto;border:1px solid var(--bd);border-radius:4px"></div>
+ <div class="row"><button class="warn" onclick="libClearAll()" title="Delete all saved queries">Clear all</button><button onclick="libExport()" title="Download the whole library as a JSON file">Export library</button><button onclick="$('libFile').click()" title="Load a query-library.json from another machine (merges)">Import library</button><input type="file" id="libFile" accept="application/json,.json" style="display:none" onchange="libImportFile(event)"><span style="flex:1"></span><button onclick="hide('mLib')">Close</button></div></div></div>
+
+<div class="modal" id="mDesign"><div class="box" style="max-width:960px"><h3 id="dTitle">Table designer</h3>
+ <div class="row">Schema <input id="dSchema" style="width:180px"> Table <input id="dName" style="width:220px"> <span id="dMode" class="muted"></span></div>
+ <table class="dz"><thead><tr><th>Column</th><th>Type</th><th>Length</th><th>NN</th><th>AI</th><th>PK</th><th>Default</th><th>Comment</th><th></th></tr></thead><tbody id="dCols"></tbody></table>
+ <div class="row"><button onclick="dAddCol()">+ Column</button></div>
+ <div class="row">Generated SQL: <span id="dEditNote" class="muted" style="color:#b26a00"></span></div><textarea id="dSql" oninput="dMark()" style="width:100%;height:120px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace"></textarea>
+ <div class="row"><button title="Rebuild the SQL from the column grid (discards manual edits in the box)" onclick="dGen(true)">Regenerate from columns</button><button class="go write" onclick="dApply()">Apply</button><button onclick="hide('mDesign')">Close</button></div>
+ <div id="dLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
+
+<script>
+const TOKEN="__TOKEN__";
+let curSchema=null, tabs=[], tabSeq=0, activeTab=null;
+/* ============================================================================
+   FRONT-END (runs in the browser)
+   ----------------------------------------------------------------------------
+   This whole app is ONE HTML page. All talking to the database goes through
+   api('/api/...') -> the PowerShell server -> mysql.exe -> back as JSON.
+
+   Big pieces below, in order:
+     - helpers ($ = getElementById, esc = HTML-escape, log = status line)
+     - api() ....... the single function that calls the server
+     - connections . save / pick / primary / read-only handling
+     - schemas + objects sidebar
+     - query tabs .. editor with syntax highlight + autocomplete
+     - results grid  sortable, filterable, editable, resizable columns
+     - overview .... per-database summary + size caching
+     - library ..... saved queries (stored on the server)
+   NOTE: this text lives inside a PowerShell here-string, so keep it valid JS.
+   ============================================================================ */
+const $=id=>document.getElementById(id);window.$=$;
+function esc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function connMeta(){return window._connMeta||{};}
+function connMetaSet(n,m){window._connMeta=window._connMeta||{};if(m){const cur=window._connMeta[n]||{};window._connMeta[n]={accent:cur.accent||'',env:m.env||'',readonly:!!m.readonly};}else{delete window._connMeta[n];}}
+window.readOnly=false;window.curEnv='';
+function applyEnv(name){const m=connMeta()[name]||{};window.readOnly=!!m.readonly;window.curEnv=m.env||'';const el=$('envChip');const acc=window.curAccent||accMap()[name]||'';if(el){if(window.curEnv||window.readOnly){el.style.display='inline-flex';el.textContent=(window.curEnv||'')+(window.readOnly?(window.curEnv?' - ':'')+'READ-ONLY':'');if(acc){el.className='chip';el.style.background=acc;el.style.color='#fff';el.style.borderColor='transparent';}else{el.className='chip '+(window.readOnly?'bad':'ok');el.style.background='';el.style.color='';el.style.borderColor='';}}else{el.style.display='none';}}document.body.classList.toggle('ro',window.readOnly);}
+function roBlock(){if(window.readOnly){alert('This connection is marked READ-ONLY (safe mode). Writes are disabled.\n\nUncheck "Read-only" in the saved connection to allow changes.');return true;}return false;}
+function accMap(){const m=window._connMeta||{};const o={};for(const k in m){if(m[k]&&m[k].accent)o[k]=m[k].accent;}return o;}
+function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._connMeta[n]||{};window._connMeta[n]={accent:c||'',env:cur.env||'',readonly:!!cur.readonly};}
+function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');const v=parseInt(hex,16);if(isNaN(v)||hex.length!==6)return '';return 'rgba('+((v>>16)&255)+','+((v>>8)&255)+','+(v&255)+','+a+')';}
+function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
+window.curAccent='';
+function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value};}
+function log(s){const l=$('log');l.textContent+=s+"\n";l.scrollTop=l.scrollHeight;}
+function toast(msg,isErr){
+  let box=$('toasts');if(!box){box=document.createElement('div');box.id='toasts';document.body.appendChild(box);}
+  const t=document.createElement('div');t.className='toast'+(isErr?' err':'');t.textContent=msg;box.appendChild(t);
+  setTimeout(()=>{t.style.opacity='0';t.style.transition='opacity .3s';setTimeout(()=>t.remove(),300);},isErr?6000:3500);
+}
+function showDead(){const d=$('deadOverlay');if(d)d.style.display='flex';}
+function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
+// --- api(): the ONE way the UI talks to the server. Adds token + connection + read-only flag, returns parsed JSON, and shows the 'server down' overlay on failure.
+async function api(path,p,signal){p=p||{};p.token=TOKEN;
+ if(path==='/api/connect'){p.conn=getConn();p.ro=!!window.readOnly;}
+ else{p.conn=window._activeConn||getConn();p.ro=(window._activeConn?!!window._activeReadOnly:!!window.readOnly);}
+ busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});return await r.json();}catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
+function show(id){const el=$(id);document.body.appendChild(el);el.classList.add('show');} function hide(id){$(id).classList.remove('show');}
+const RESERVED=new Set(['accessible','add','all','alter','analyze','and','as','asc','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','current_date','current_time','current_timestamp','cursor','database','databases','default','delete','desc','describe','distinct','div','double','drop','dual','each','else','exists','explain','false','fetch','float','for','force','foreign','from','fulltext','function','group','having','if','ignore','in','index','inner','insert','int','integer','interval','into','is','join','key','keys','left','like','limit','lock','long','longblob','longtext','match','mediumblob','mediumint','mediumtext','natural','not','null','numeric','offset','on','optimize','option','or','order','outer','primary','procedure','references','rename','repeat','replace','restrict','return','revoke','right','rlike','schema','schemas','select','set','show','smallint','spatial','sql','table','then','tinyblob','tinyint','tinytext','to','trigger','true','union','unique','unlock','unsigned','update','usage','use','using','values','varbinary','varchar','varying','when','where','while','with','write','zerofill']);
+function qid(n){n=String(n);if(n===''||!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)||RESERVED.has(n.toLowerCase()))return '`'+n.replace(/`/g,'``')+'`';return n;}
+function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return "'"+s.replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
+
+async function searchAllSchemas(){
+  const term=($('objFilter').value||'').trim();
+  if(!term){toast('Type something in the filter box first, then click "All DBs".',true);return;}
+  const r=await api('/api/search-all-schemas',{term});
+  if(!r.ok){toast(r.error,true);return;}
+  const box=$('objects');box.innerHTML='';
+  if(!r.items.length){box.innerHTML='<div class="muted" style="padding:8px">No matches for "'+esc(term)+'" in any schema.</div>';return;}
+  const h=document.createElement('div');h.className='ohdr';h.textContent='Matches across all schemas ('+r.items.length+')';box.appendChild(h);
+  r.items.forEach(it=>{
+    const d=document.createElement('div');d.className='item';
+    d.innerHTML='<span class="onm">'+esc(it.name)+'</span><span class="osz">'+esc(it.schema)+' \u00B7 '+esc(it.type)+'</span>';
+    d.onclick=()=>{
+      curSchema=it.schema;
+      $('objdb').textContent=it.schema;
+
+      // Highlight the schema in the schemas list
+      const schemasBox = $('schemas');
+      if (schemasBox) {
+        [...schemasBox.children].forEach(c => {
+          c.classList.remove('sel');
+          if (c.textContent.includes(it.schema)) {
+            c.classList.add('sel');
+          }
+        });
+      }
+
+      loadObjects(it.schema).then(()=>objOpen(it.schema,it.type,it.name));
+    };
+    box.appendChild(d);
+  });
+}
+
+// theme
+function toggleTheme(){document.body.classList.toggle('dark');localStorage.setItem('theme',document.body.classList.contains('dark')?'dark':'light');}
+if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
+
+// context menu
+function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
+async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n• saved connections (host / user / password)\n• the query library\n• caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
+async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';}catch(e){}show('mSettings');refreshToolsStatus();}
+async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src)=>{const ok=path&&path!=='(not found)';return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};el.innerHTML=row('mysql',r.mysql,r.mysql_source)+row('mysqldump',r.mysqldump,r.mysqldump_source);
+ if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
+ if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
+ const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}
+async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
+async function downloadTools(){$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
+let _inpResolve=null;
+function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').textContent=opts.title||'Input';const box=$('inpFields');box.innerHTML='';
+ (opts.fields||[]).forEach(f=>{const w=document.createElement('div');w.style.margin='6px 0';if(f.type==='checkbox'){w.style.display='flex';w.style.alignItems='center';w.style.gap='8px';const cbx=document.createElement('input');cbx.id='inp_'+f.key;cbx.type='checkbox';cbx.checked=!!f.value;const clb=document.createElement('label');clb.textContent=f.label||f.key;clb.style.fontSize='13px';clb.htmlFor=cbx.id;clb.style.cursor='pointer';cbx.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(cbx);w.appendChild(clb);box.appendChild(w);return;}const lb=document.createElement('label');lb.textContent=f.label||f.key;lb.style.display='block';lb.style.fontSize='12px';lb.style.marginBottom='2px';lb.style.color='var(--muted)';
+  const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';}if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;
+  inp.onkeydown=e=>{if(e.key==='Enter'&&!isTa){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(lb);w.appendChild(inp);box.appendChild(w);});
+ $('inpOk').textContent=opts.okText||'OK';show('mInput');setTimeout(()=>{const f0=box.querySelector('input');if(f0){f0.focus();f0.select();}},40);});}
+function inpOk(){const out={};$('inpFields').querySelectorAll('input,textarea').forEach(i=>{out[i.id.slice(4)]=(i.type==='checkbox')?i.checked:i.value;});hide('mInput');const r=_inpResolve;_inpResolve=null;if(r)r(out);}
+function inpCancel(){hide('mInput');const r=_inpResolve;_inpResolve=null;if(r)r(null);}
+async function ask(msg){const d=(window.__TAURI__&&window.__TAURI__.dialog);if(d&&d.confirm){try{return await d.confirm(msg,{title:'Confirm',kind:'warning'});}catch(e){}}return window.confirm(msg);}
+function menu(x,y,items){const m=$('ctx');m.innerHTML='';buildMenuItems(m,items);m.style.display='block';m.style.visibility='hidden';m.style.left='0';m.style.top='0';const w=m.offsetWidth||190,h=m.offsetHeight||0;let nx=Math.min(x,innerWidth-w-6);if(nx<6)nx=6;let ny=y;if(y+h>innerHeight-6)ny=Math.max(6,innerHeight-h-6);m.style.left=nx+'px';m.style.top=ny+'px';m.style.visibility='visible';}
+function buildMenuItems(container,items){items.forEach(it=>{if(it==='-'){const s=document.createElement('div');s.className='sep';container.appendChild(s);return;}const d=document.createElement('div');d.className='item';const isSub=Array.isArray(it[1]);d.textContent=it[0]+(isSub?'  \u25B8':'');const _destr=/^(drop|truncate|delete|rename|create|alter|import|design)/i.test(it[0]||'');if(window.readOnly&&_destr){d.className='item rodis';d.title='Disabled in read-only mode';container.appendChild(d);return;}
+ if(isSub){d.style.position='relative';const fly=document.createElement('div');fly.className='ctxsub';buildMenuItems(fly,it[1]);d.appendChild(fly);let ht=null;const showFly=()=>{if(ht){clearTimeout(ht);ht=null;}fly.style.display='block';fly.style.left='';fly.style.right='';fly.style.top='0';const r=fly.getBoundingClientRect(),dr=d.getBoundingClientRect();if(dr.right+r.width>innerWidth-4){fly.style.right='100%';}else{fly.style.left='100%';}if(dr.top+r.height>innerHeight-4){fly.style.top=(innerHeight-4-(dr.top+r.height))+'px';}};const hideFly=()=>{ht=setTimeout(()=>{fly.style.display='none';},200);};d.onmouseenter=showFly;d.onmouseleave=hideFly;fly.onmouseenter=()=>{if(ht){clearTimeout(ht);ht=null;}};fly.onmouseleave=hideFly;
+ }else{d.onclick=()=>{$('ctx').style.display='none';it[1]();};}
+ container.appendChild(d);});}
+document.addEventListener('click',(e)=>{$('ctx').style.display='none';const cp=$('colPicker');if(cp&&cp.style.display==='block'&&!cp.contains(e.target))cp.style.display='none';});
+
+// syntax highlight (single-pass tokenizer)
+const KW=RESERVED;
+// hl(): lightweight SQL syntax highlighter drawn behind the editor textarea.
+function hl(code){let re=/(\/\*[\s\S]*?\*\/|--[^\n]*)|('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`]|``)*`)|(\b\d+(?:\.\d+)?\b)|([A-Za-z_][A-Za-z0-9_]*)|([\s\S])/g;let out='',m;
+ while((m=re.exec(code))){if(m[1])out+='<span class="c-com">'+esc(m[1])+'</span>';else if(m[2])out+='<span class="c-str">'+esc(m[2])+'</span>';else if(m[3])out+='<span class="c-num">'+esc(m[3])+'</span>';else if(m[4])out+=(KW.has(m[4].toLowerCase())?'<span class="c-kw">'+esc(m[4])+'</span>':esc(m[4]));else out+=esc(m[5]);}
+ return out;}
+function syncHl(id){const ta=$('ed_'+id),pre=$('hl_'+id);if(!ta||!pre)return;pre.innerHTML=hl(ta.value)+'\n';pre.scrollTop=ta.scrollTop;pre.scrollLeft=ta.scrollLeft;}
+
+// connection profiles
+function connTitle(){const s=$('connlist');if(s)s.title=(s.selectedIndex>0?s.options[s.selectedIndex].text:'Saved connections');}
+// --- Connections: dropdown, New/Save/pick, and the 'primary' (auto-open) flag.
+function updatePrimeBtn(){const b=$('primeBtn');if(!b)return;const n=$('connlist').value;const isP=(n&&n===window._primaryConn);b.textContent=(isP?'★':'☆')+' Primary';b.style.color=isP?'#f5c518':'';b.title=isP?'This is the primary connection (opens on startup). Click to unset.':'Set as primary connection (opens automatically on startup)';}
+function connMenu(e){e.stopPropagation();if(!$('connlist').value){toast('Select a saved connection first.',true);return;}const b=e.currentTarget.getBoundingClientRect();const isP=($('connlist').value===window._primaryConn);menu(b.left,b.bottom+2,[['Edit\u2026',()=>editConn()],['Clone\u2026',()=>cloneConn()],[(isP?'Unset primary':'Set as primary'),()=>setPrimary()],['Clear password',()=>forgetPassword()],'-',['Delete\u2026',()=>delConn()]]);}
+async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will type it on next connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,password:''},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if($('connlist').value===n)setPass('');}else alert(r.error||'Failed');}
+async function setPrimary(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}const target=(n===window._primaryConn)?'':n;const r=await api('/api/conn-primary',{name:target});if(!r.ok){toast(r.error||'Failed',true);return;}await refreshConns();$('connlist').value=n;updatePrimeBtn();log(target?('Primary connection set: '+n+' (opens on startup)'):'Primary connection cleared.');}
+async function refreshConns(){const r=await api('/api/conn-list');const sel=$('connlist');sel.innerHTML='<option value="" disabled hidden>Connections</option>';const n=(r.ok&&r.items)?r.items.length:0;window._primaryConn='';window._connMeta={};if(r.ok)r.items.forEach(c=>{if(c.primary)window._primaryConn=c.name;window._connMeta[c.name]={accent:c.accent||'',env:c.env||'',readonly:!!c.readonly};const o=document.createElement('option');o.value=c.name;
+  const tags=[];if(c.env)tags.push(c.env);if(c.readonly)tags.push('READ-ONLY');
+  o.textContent=(c.primary?'★ ':'')+c.name+'  ('+c.user+'@'+c.host+')'+(tags.length?'  ['+tags.join(' \u2013 ')+']':'');
+  sel.appendChild(o);});sel.disabled=(n===0);sel.title=(n===0?'No saved connections yet - fill in the details and Save':'Saved connections');connTitle();updatePrimeBtn();}
+function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
+function setPass(pw){const el=$('pass');if(el)el.value=pw;}
+async function pickConnGuarded(){
+  if (anyPending() && !(await ask('You have unsaved grid edits open. Switching connections will leave them orphaned. Switch anyway?'))) return;
+  return pickConn();
+}
+// pickConn(): loads a saved connection's details into the FORM ONLY when you pick it - this
+// is just a preview/starting point for a future Connect click. It deliberately does NOT touch
+// window.readOnly, the env chip, or the accent border, because those describe the connection
+// you are ACTUALLY connected to and must never change just from browsing the dropdown - doing
+// so previously let a merely-selected (not connected) profile silently redirect live queries
+// and read-only enforcement to the wrong server. All of that is applied atomically in connect()
+// once a connection actually succeeds.
+async function pickConn() {
+    const n = $('connlist').value;
+    if (!n) { return; }
+    const r = await api('/api/conn-get', { name: n });
+    if (r.ok) {
+        $('host').value = r.conn.host;
+        $('port').value = r.conn.port;
+        $('user').value = r.conn.user;
+        $('ssl').value = r.conn.ssl;
+        const _pw = r.conn.password || '';
+        setPass(_pw);
+        window._connMeta = window._connMeta || {};
+        window._connMeta[n] = {accent:r.conn.accent||'', env:r.conn.env||'', readonly:!!r.conn.readonly};
+        log('Loaded connection: ' + n + (_pw ? '' : ' (no saved password - type one and Save)') + ' - click Connect to switch to it.');
+    }
+}
+async function saveConn(){const n0=$('connlist').value;if(n0){const r=await api('/api/conn-save',{name:n0,conn:getConn()});if(r.ok){log('Saved connection: '+n0);await refreshConns();$('connlist').value=n0;window.curAccent=accMap()[n0]||'';applyAccent(window.curAccent);applyEnv(n0);}else toast(r.error,true);return;}const dn=($('user').value+'@'+$('host').value);const res=await inputBox({title:'Save new connection',okText:'Save',fields:[{key:'name',label:'Save connection as',value:dn},{key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:'#3b82f6'},{key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:''},{key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:false},{key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:true}]});if(!res||!res.name.trim())return;const n=res.name.trim();const r=await api('/api/conn-save',{name:n,conn:getConn(),accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(r.ok){window.curAccent=res.color;applyAccent(res.color);log('Saved connection: '+n);await refreshConns();$('connlist').value=n;applyEnv(n);}else alert(r.error);}
+async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a saved connection to edit first.',true);return;}
+ const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('pass').value=g.conn.password;}
+ const m0=connMeta()[n0]||{};
+ const res=await inputBox({title:'Edit connection',okText:'Save',fields:[{key:'name',label:'Name',value:n0},{key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},{key:'env',label:'Environment label (optional)',value:m0.env||''},{key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},{key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}]});
+ if(!res||!res.name.trim())return;const nn=res.name.trim();
+ const r=await api('/api/conn-save',{name:nn,conn:getConn(),accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
+ if(nn!==n0){await api('/api/conn-delete',{name:n0});}
+ window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
+ log('Updated connection: '+nn);await refreshConns();$('connlist').value=nn;}
+async function cloneConn(){const n0=$('connlist').value;
+ if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('pass').value=g.conn.password;}}
+ const base=n0||($('user').value+'@'+$('host').value);
+ const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)'}]});
+ if(!res||!res.name.trim())return;const nn=res.name.trim();
+ const r=await api('/api/conn-save',{name:nn,conn:getConn()});if(!r.ok){toast(r.error,true);return;}
+ if(n0){const c=accMap()[n0];if(c)accSet(nn,c);const m=connMeta()[n0];if(m)connMetaSet(nn,m);}
+ await refreshConns();$('connlist').value=nn;window.curAccent=accMap()[nn]||'';applyAccent(window.curAccent);applyEnv(nn);
+ log('Cloned connection: '+nn);}
+async function delConn(){const n=$('connlist').value;if(!n)return;if(!(await ask('Delete saved connection "'+n+'"?')))return;await api('/api/conn-delete',{name:n});accSet(n,'');window.curAccent='';applyAccent('');refreshConns();}
+
+// connect(): open the connection, then load the schema sidebar.
+async function connect() {
+  if (anyPending()) {
+    if (!(await ask('You have unsaved grid edits open. Connecting will leave them orphaned. Continue?'))) return;
+  }
+  // If a saved connection is selected but no password is typed, load its details first
+  // (so you can just pick a connection and hit Connect). A typed password is respected.
+  try { if ($('connlist').value && !$('pass').value) { await pickConn(); } } catch (e) {}
+  log('Connecting to ' + $('host').value + ' ...');
+  const r = await api('/api/connect');
+  if (!r.ok) {
+    log('  ' + r.error);
+    toast('Connection failed: ' + r.error, true);
+    disconnect();
+    if (tabs.length) { await closeAll(); }
+    return;
+  }
+  log('  Connected: ' + r.version + ' (' + (r.mariadb ? 'MariaDB' : 'MySQL') + ')');
+  window.mariadb = !!r.mariadb;
+  document.body.classList.remove('disconnected');
+  const _cs = $('connStatus'); if (_cs) { const _sel=$('connlist'); _cs.textContent = 'Connected: ' + (_sel && _sel.value ? _sel.options[_sel.selectedIndex].text.replace(/^\u2605 /, '') : ($('user').value + '@' + $('host').value)); _cs.className = 'chip ok'; }
+  applyAccent(window.curAccent || '');
+  applyEnv($('connlist').value);
+  // IMPORTANT: snapshot the active connection BEFORE restoring any tabs below - restoring a
+  // table tab auto-runs its query, and every api() call (other than the connect attempt
+  // itself) uses this snapshot rather than the live form. Setting it after restore meant
+  // restored tabs briefly queried the CONNECTION YOU JUST LEFT instead of the new one.
+  window._activeConn = getConn();
+  window._activeReadOnly = window.readOnly;
+  // Each connection remembers its own open tabs. Switching to a different connection saves
+  // the tabs you're leaving (under its own key) and restores the new connection's own tabs.
+  const _newKey = sessionKeyFor();
+  if (window._sessionKey && window._sessionKey !== _newKey) {
+    saveSession(window._sessionKey);
+    clearAllTabsSilently();
+    clearObjectsPanel();
+    restoreSessionFor(_newKey);
+  } else if (!window._sessionKey) {
+    clearObjectsPanel();
+    restoreSessionFor(_newKey);
+  }
+  window._sessionKey = _newKey;
+  if (activeTab) updateSchemaBadge(activeTab);
+  loadSchemas();
+  if (curSchema) { loadObjects(curSchema); }
+  toggleOverview();
+
+}
+function clearObjectsPanel(){$('objects').innerHTML='';$('objdb').textContent='';if($('objFilter'))$('objFilter').value='';curSchema=null;objData=null;}
+function disconnect(){window.mariadb=false;document.body.classList.add('disconnected');window._activeConn=null;window._activeReadOnly=false;$('schemas').innerHTML='';clearObjectsPanel();applyAccent('');const _cs=$('connStatus');if(_cs){_cs.textContent='Not connected';_cs.className='chip bad';}window.curAccent='';window.readOnly=false;window.curEnv='';const _ec=$('envChip');if(_ec)_ec.style.display='none';const _sb=$('schemaBadge');if(_sb){_sb.style.display='none';_sb.textContent='';}document.body.classList.remove('ro');log('Disconnected.');}
+async function refreshSchemasAndTables(){await loadSchemas();if(typeof curSchema!=='undefined'&&curSchema){await loadObjects(curSchema);}}
+async function loadSchemas() {
+    const r = await api('/api/schemas');
+    const box = $('schemas');
+    box.innerHTML = '';
+    if (!r.ok) { log('  ' + r.error); return; }
+
+    // Store schema names for backward compatibility
+    window.allSchemas = r.schemas.map(s => s.name);
+    log('  Schemas (' + r.schemas.length + '): ' + r.schemas.map(s => s.name).join(', '));
+
+    r.schemas.forEach(sc => {
+        const d = document.createElement('div');
+        d.className = 'item';
+        const sizeStr = sc.size > 0 ? ' (' + fmtBytes(sc.size) + ')' : '';
+        d.textContent = sc.name + sizeStr;
+
+        d.onclick = () => {
+            [...box.children].forEach(c => c.classList.remove('sel'));
+            d.classList.add('sel');
+            curSchema = sc.name;
+            $('objdb').textContent = sc.name;
+            loadObjects(sc.name);
+        };
+
+        d.oncontextmenu = e => {
+            e.preventDefault();
+            menu(e.clientX, e.clientY, [
+                ['New table (designer)...', () => designTable(null, sc.name)],
+                ['Drop schema...', () => dropSchema(sc.name)],
+                '-',
+                ['Refresh', () => loadSchemas()]
+            ]);
+        };
+        box.appendChild(d);
+    });
+}
+function fmtBytes(b){b=+b||0;if(b<1024)return b+" B";const u=["KB","MB","GB","TB"];let i=-1;do{b/=1024;i++;}while(b>=1024&&i<u.length-1);return (b<10?b.toFixed(1):Math.round(b))+" "+u[i];}
+function invalidateTableCache(db,table){
+  if(!db||!table)return;
+  try{
+    const key='tableSizes_'+connKey()+'_'+db;
+    const cached=localStorage.getItem(key);
+    if(cached){
+      const parsed=JSON.parse(cached);
+      if(parsed.sizes) delete parsed.sizes[table];
+      if(parsed.rowCounts) delete parsed.rowCounts[table];
+      localStorage.setItem(key, JSON.stringify(parsed));
+    }
+  }catch(e){}
+  if(objData && objData.db===db){
+    if(objData.sizes) delete objData.sizes[table];
+    if(objData.rowCounts) delete objData.rowCounts[table];
+  }
+}
+
+function pinnedTables(db){try{return JSON.parse(localStorage.getItem('pinned_'+connKey()+'_'+db)||'[]');}catch(e){return [];}}
+function setPinnedTables(db,arr){try{localStorage.setItem('pinned_'+connKey()+'_'+db,JSON.stringify(arr));}catch(e){}}
+function togglePin(db,name){const p=pinnedTables(db);const i=p.indexOf(name);if(i>=0)p.splice(i,1);else p.push(name);setPinnedTables(db,p);renderObjects();}
+
+function fmtCount(n){n=Math.round(+n||0);return String(n).replace(/\B(?=(\d{3})+(?!\d))/g,"'");}
+function fmtMs(ms){ms=+ms||0;if(ms>=10000)return Math.round(ms/1000)+'s';if(ms>=1000)return (ms/1000).toFixed(1)+'s';return Math.round(ms)+'ms';}
+function viewRangeLabel(id){const t=T(id);if(!t)return '';const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total)return '0 shown';const ps=t.limit||1000;const off=Math.min(t.offset||0,Math.max(0,total-1));const shown=Math.min(ps,Math.max(0,total-off));return (off+1)+'-'+(off+shown);}
+function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st_'+id);if(!st)return;
+  const rowLabel=(t.table&&t.estRows!=null)?(t.rows.length+' row(s) of '+fmtCount(t.estRows)+' rows.'):(t.rows.length+' row(s).');
+  const viewLabel=(t.rows.length>0)?(' View shows '+viewRangeLabel(id)+'.'):'';
+  const ms=(t.lastElapsedMs!=null)?(' '+t.lastElapsedMs+' ms'):'';
+  st.className='status';
+  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'');
+}
+let objData=null;
+async function loadObjects(db) {
+    const r = await api('/api/objects', { db });
+    if (!r.ok) { log('  ' + r.error); return; }
+
+    // Try to load cached sizes from localStorage
+    let cachedSizes = {};
+    let cachedRowCounts = {};
+    let cacheValid = false;
+    try {
+        const cacheKey = 'tableSizes_' + connKey() + '_' + db;
+        const cached = localStorage.getItem(cacheKey);
+        if (cached) {
+            const parsedCache = JSON.parse(cached);
+            if (parsedCache.timestamp && (Date.now() - parsedCache.timestamp) < 300000) { // Cache valid for 5 minutes
+                cachedSizes = parsedCache.sizes;
+                cachedRowCounts = parsedCache.rowCounts || {};
+                cacheValid = true;
+            }
+        }
+    } catch (e) { /* ignore cache read errors */ }
+
+    objData = { db, r, sizes: cachedSizes, rowCounts: cachedRowCounts };
+    $('objFilter').value = '';
+    renderObjects();
+    buildColHints(db);
+
+    // Fetch fresh sizes if not cached or cache expired
+    if (!cacheValid) {
+        try {
+            const sz = await api('/api/query', { sql: "SELECT TABLE_NAME, DATA_LENGTH+INDEX_LENGTH, TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA=" + lit(db) });
+            if (!sz.ok) { /* size query failed; leave sizes as-is */ }
+            else {
+                const m = {}, rc = {};
+                sz.rows.forEach(r2 => { m[String(r2[0])] = r2[1]; rc[String(r2[0])] = r2[2]; });
+                objData.sizes = m;
+                objData.rowCounts = rc;
+                // Cache the sizes in localStorage with a timestamp
+                try {
+                    localStorage.setItem(
+                        'tableSizes_' + connKey() + '_' + db,
+                        JSON.stringify({
+                            timestamp: Date.now(),
+                            sizes: m,
+                            rowCounts: rc
+                        })
+                    );
+                } catch (e) { /* ignore cache write errors */ }
+                renderObjects();
+            }
+        } catch (e) { /* ignore size errors */ }
+    }
+}
+
+let _busyDepth=0;
+function busyStart(){_busyDepth++;let bar=$('_globalBusy');if(!bar){bar=document.createElement('div');bar.id='_globalBusy';bar.style.cssText='position:fixed;top:0;left:0;height:3px;width:100%;background:var(--accent);z-index:99998;animation:expmove 1s ease-in-out infinite;display:none';document.body.appendChild(bar);}bar.style.display='block';}
+function busyStop(){_busyDepth=Math.max(0,_busyDepth-1);if(_busyDepth===0){const bar=$('_globalBusy');if(bar)bar.style.display='none';}}
+
+let _progTimers={},_progJobIds={};
+function progStart(prefix,totalLabel,jobId){
+  const box=$(prefix+'Progress'),lbl=$(prefix+'ProgLabel'),btn=$(prefix+'GoBtn'),cbtn=$(prefix+'CancelBtn');
+  if(box)box.style.display='block'; if(btn)btn.disabled=true; if(cbtn)cbtn.style.display='';
+  _progJobIds[prefix]=jobId;
+  const t0=Date.now();
+  _progTimers[prefix]=setInterval(()=>{const secs=((Date.now()-t0)/1000).toFixed(0);if(lbl)lbl.textContent=(totalLabel?totalLabel+' \u2014 ':'')+'running for '+secs+'s...';},250);
+}
+function progStop(prefix){
+  const box=$(prefix+'Progress'),btn=$(prefix+'GoBtn'),cbtn=$(prefix+'CancelBtn');
+  if(_progTimers[prefix]){clearInterval(_progTimers[prefix]);delete _progTimers[prefix];}
+  if(box)box.style.display='none'; if(btn)btn.disabled=false; if(cbtn)cbtn.style.display='none';
+  delete _progJobIds[prefix];
+}
+async function cancelJob(prefix){
+  const jobId=_progJobIds[prefix]; if(!jobId)return;
+  const lbl=$(prefix+'ProgLabel'); if(lbl)lbl.textContent='Cancelling...';
+  try{await fetch('/api/cancel-job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,jobId})});}catch(e){}
+  log('Cancel requested for '+prefix+' job.');
+}
+function renderObjects(){const box=$('objects');box.innerHTML='';if(!objData)return;const db=objData.db,r=objData.r;const f=($('objFilter').value||'').toLowerCase();
+ const pinned=pinnedTables(db);
+ if(pinned.length){
+   const fil=pinned.filter(n=>r.tables.includes(n)&&(!f||n.toLowerCase().includes(f)));
+   if(fil.length){const h=document.createElement('div');h.className='ohdr';h.textContent='\u2605 Pinned ('+fil.length+')';box.appendChild(h);
+     fil.forEach(n=>{const d=document.createElement('div');d.className='item';if(objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
+      d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,'table',n);};
+      d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,'table',n);};box.appendChild(d);});}
+ }
+ const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
+ groups.forEach(([label,items,type])=>{const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;const h=document.createElement('div');h.className='ohdr';h.textContent=label+' ('+fil.length+(f?'/'+items.length:'')+')';box.appendChild(h);
+  fil.forEach(n=>{const d=document.createElement('div');d.className='item';if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
+   d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,type,n);};
+   d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});});}
+async function buildColHints(db){try{const r=await api('/api/query',{sql:"SELECT DISTINCT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)});window.acColumns=(r.ok?r.rows.map(x=>x[0]):[]);}catch(e){window.acColumns=[];}}
+// Cache keys are scoped to the active connection so a different server can't show stale schemas.
+// --- Caching: sizes/overview are cached in the browser, keyed per connection (host:port:user).
+function connKey(){try{return ($('host').value||'')+':'+($('port').value||'')+':'+($('user').value||'');}catch(e){return 'default';}}
+function overviewCacheKey(){return 'overviewCache:'+connKey();}
+
+async function showOverview() {
+    const ov = $('overview');
+    if (!ov) return;
+
+    if (document.body.classList.contains('disconnected')) {
+        ov.innerHTML = '<div class="muted" style="padding:8px">Connect to a database to view the overview.</div>';
+        ov.style.display = 'block';
+        return;
+    }
+
+    // Try to load cached data from localStorage
+    try {
+        const cachedData = localStorage.getItem(overviewCacheKey());
+        if (cachedData) {
+            const parsedCache = JSON.parse(cachedData);
+            if (parsedCache.timestamp && (Date.now() - parsedCache.timestamp) < 300000) { // Cache valid for 5 minutes
+                renderOverview(parsedCache.data);
+                return;
+            }
+        }
+    } catch (e) {
+        /* ignore cache read errors */
+    }
+
+    // No valid cache, fetch fresh data
+    ov.innerHTML = '<div class="muted" style="padding:8px">Loading database overview...</div>';
+    ov.style.display = 'block';
+
+    const sql = `SELECT s.SCHEMA_NAME, COALESCE(t.tbls,0), COALESCE(t.sz,0), COALESCE(v.vw,0), COALESCE(r.pr,0), COALESCE(r.fn,0), COALESCE(tr.trg,0), COALESCE(ev.evt,0)
+        FROM information_schema.SCHEMATA s
+        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) tbls, SUM(DATA_LENGTH+INDEX_LENGTH) sz FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' GROUP BY TABLE_SCHEMA) t ON t.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT TABLE_SCHEMA sc, COUNT(*) vw FROM information_schema.TABLES WHERE TABLE_TYPE='VIEW' GROUP BY TABLE_SCHEMA) v ON v.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT ROUTINE_SCHEMA sc, SUM(ROUTINE_TYPE='PROCEDURE') pr, SUM(ROUTINE_TYPE='FUNCTION') fn FROM information_schema.ROUTINES GROUP BY ROUTINE_SCHEMA) r ON r.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT TRIGGER_SCHEMA sc, COUNT(*) trg FROM information_schema.TRIGGERS GROUP BY TRIGGER_SCHEMA) tr ON tr.sc=s.SCHEMA_NAME
+        LEFT JOIN (SELECT EVENT_SCHEMA sc, COUNT(*) evt FROM information_schema.EVENTS GROUP BY EVENT_SCHEMA) ev ON ev.sc=s.SCHEMA_NAME
+        ORDER BY s.SCHEMA_NAME`;
+
+    try {
+        const r = await api('/api/query', { sql });
+        if (!r.ok) {
+            ov.innerHTML = '<div class="muted" style="padding:8px">Overview unavailable: ' + esc(r.error) + '</div>';
+            return;
+        }
+
+        // Cache the data in localStorage with a timestamp
+        try {
+            localStorage.setItem(
+                overviewCacheKey(),
+                JSON.stringify({
+                    timestamp: Date.now(),
+                    data: r
+                })
+            );
+        } catch (e) {
+            /* ignore cache write errors */
+        }
+
+        renderOverview(r);
+    } catch (e) {
+        ov.innerHTML = '<div class="muted" style="padding:8px">Overview error: ' + esc(e.message) + '</div>';
+    }
+}
+
+function renderOverview(r) {
+    const ov = $('overview');
+    if (!ov) return;
+
+    const H = ['Database', 'Tables', 'Size', 'Views', 'Procedures', 'Functions', 'Triggers', 'Events'];
+    let h = '<h2>Databases (' + r.rows.length + ')</h2><table class="ovgrid"><thead><tr>' + H.map((x, i) => '<th' + (i >= 1 ? ' class=num' : '') + '>' + x + '</th>').join('') + '</tr></thead><tbody>';
+    r.rows.forEach(row => {
+        if (row[0] == null || row[0] === '') return;
+        h += '<tr data-db="' + esc(String(row[0])) + '"><td>' + esc(String(row[0])) + '</td>'
+            + '<td class=num>' + (+row[1] || 0) + '</td><td class=num>' + fmtBytes(row[2]) + '</td>'
+            + '<td class=num>' + (+row[3] || 0) + '</td><td class=num>' + (+row[4] || 0) + '</td><td class=num>' + (+row[5] || 0) + '</td>'
+            + '<td class=num>' + (+row[6] || 0) + '</td><td class=num>' + (+row[7] || 0) + '</td></tr>';
+    });
+    h += '</tbody></table><div class="muted" style="margin-top:10px;font-size:11px">Click a row to browse that database.</div>';
+    ov.innerHTML = h;
+
+    [...ov.querySelectorAll('tr[data-db]')].forEach(tr => {
+        tr.onclick = () => {
+            const db = tr.getAttribute('data-db');
+            const box = $('schemas');
+            [...box.children].forEach(c => {
+                if (c.textContent.includes(db)) c.classList.add('sel');
+                else c.classList.remove('sel');
+            });
+            curSchema = db;
+            $('objdb').textContent = db;
+            loadObjects(db);
+        };
+    });
+}
+
+// Function to clear the Overview cache
+function clearOverviewCache() {
+    // Clear ALL cached overview + table-size data (every connection), then reload the current view.
+    const n = _clearKeys(false);
+    if (!document.body.classList.contains('disconnected')) {
+        loadSchemas(); // refresh the sidebar schema sizes (KB numbers)
+        if (typeof curSchema !== 'undefined' && curSchema) {
+            loadObjects(curSchema); // refresh the objects list + its table sizes
+        }
+    }
+    if (tabs.length === 0 && !document.body.classList.contains('disconnected')) {
+        showOverview(); // reload the overview panel if it is what is visible
+    }
+    log('Cache refreshed (' + n + ' cached entr' + (n === 1 ? 'y' : 'ies') + ' cleared).');
+}
+function toggleOverview() {
+    const ov = $('overview');
+    if (!ov) return;
+
+    // Skip if disconnected (Option 3)
+    if (document.body.classList.contains('disconnected')) {
+        ov.style.display = 'none';
+        return;
+    }
+
+    if (tabs.length === 0) {
+        ov.innerHTML = `
+            <div style="padding: 14px; text-align: center;">
+                <div class="muted" style="margin-bottom: 10px;">Database Overview</div>
+                <button class="primary" onclick="showOverview()">Load Overview</button>
+            </div>
+        `;
+        ov.style.display = 'block';
+    } else {
+        ov.style.display = 'none';
+    }
+}
+function objOpen(db,type,name){if(type==='table'){const _id=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_id);}else if(type==='view'){openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null);}else{openDdl(db,type,name);}}
+function objMenu(e,db,type,name){const b=[];
+ if(type==='table'){const isPinned=pinnedTables(db).includes(name);b.push([isPinned?'\u2605 Unpin':'\u2606 Pin to top',()=>togglePin(db,name)]);b.push(['SELECT *',()=>{const _i=openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,false,name);openRun(_i);}]);b.push(['SELECT COUNT(*)',()=>openTab('count '+name,'SELECT COUNT(*) FROM '+qid(db)+'.'+qid(name)+';',db,true,null)]);b.push(['Generate SELECT/INSERT/UPDATE...',()=>genTemplate(db,name)]);
+  b.push(['Design / Alter...',()=>designTable(name,db)]);b.push(['Show CREATE',()=>openDdl(db,type,name)]);b.push(['Inspect...',()=>inspect(db,name)]);b.push(['Import CSV into table...',()=>importCsv(db,name)]);b.push(['Export table to CSV (all rows)...',()=>exportFull(db,name,'csv')]);b.push(['Export table INSERTs (all rows)...',()=>exportFull(db,name,'inserts')]);b.push('-');
+  b.push(['Rename...',()=>renameTable(db,name)]);b.push(['Truncate...',()=>truncateTable(db,name)]);b.push(['Drop table...',()=>dropObject(db,type,name)]);b.push('-');
+  b.push(['Optimize',()=>maint(db,name,'OPTIMIZE')]);b.push(['Analyze',()=>maint(db,name,'ANALYZE')]);b.push(['Check',()=>maint(db,name,'CHECK')]);b.push(['Repair',()=>maint(db,name,'REPAIR')]);}
+ else if(type==='view'){b.push(['Open',()=>openTab(name,'SELECT * FROM '+qid(db)+'.'+qid(name)+' LIMIT 1000;',db,true,null)]);b.push(['Show CREATE / edit',()=>openDdl(db,type,name)]);b.push(['Drop view...',()=>dropObject(db,type,name)]);}
+ else {b.push(['Show CREATE / edit',()=>openDdl(db,type,name)]);b.push(['Drop '+type+'...',()=>dropObject(db,type,name)]);}
+ menu(e.clientX,e.clientY,b);}
+
+async function exec(sql,note,btn){if(roBlock())return false;
+ let orig=null;if(btn){orig=btn.textContent;btn.disabled=true;btn.textContent='Working...';}
+ const r=await api('/api/exec',{sql});
+ if(btn){btn.disabled=false;btn.textContent=orig;}
+ if(r.ok){log((note||'OK')+': '+sql);}else{log('ERROR: '+r.error);alert(r.error);}return r.ok;}
+async function newSchema(){const res=await inputBox({title:'New schema',okText:'Create',fields:[{key:'name',label:'Schema name'}]});if(!res||!res.name.trim())return;if(await exec('CREATE DATABASE '+qid(res.name.trim()),'Created schema'))loadSchemas();}
+async function dropSchema(db){if(!(await ask('DROP DATABASE '+db+' ? Deletes ALL its data.')))return;if(await exec('DROP DATABASE '+qid(db),'Dropped schema')){loadSchemas();$('objects').innerHTML='';}}
+async function dropObject(db,type,name){const kw={table:'TABLE',view:'VIEW',procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER',event:'EVENT'}[type];if(!(await ask('DROP '+kw+' '+db+'.'+name+'?\n\nThis permanently removes the '+type+' and cannot be undone.')))return;if(await exec('DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name),'Dropped '+type+' '+db+'.'+name)){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
+async function truncateTable(db,name){if(!(await ask('TRUNCATE TABLE '+db+'.'+name+'?\n\nThis permanently deletes ALL rows and cannot be undone.')))return;if(await exec('TRUNCATE TABLE '+qid(db)+'.'+qid(name),'Truncated '+db+'.'+name)){invalidateTableCache(db,name);[...tabs].forEach(t=>{if(t.table===name&&t.db===db)openRun(t.id);});}}
+async function renameTable(db,name){const res=await inputBox({title:'Rename table',okText:'Rename',fields:[{key:'name',label:'New table name',value:name}]});if(!res||!res.name.trim()||res.name.trim()===name)return;if(await exec('RENAME TABLE '+qid(db)+'.'+qid(name)+' TO '+qid(db)+'.'+qid(res.name.trim()),'Renamed'))loadObjects(db);}
+async function maint(db,name,op){const kw=op==='OPTIMIZE'?'OPTIMIZE TABLE':op==='ANALYZE'?'ANALYZE TABLE':op==='CHECK'?'CHECK TABLE':'REPAIR TABLE';const r=await api('/api/query',{sql:kw+' '+qid(db)+'.'+qid(name)});if(r.ok&&r.rows&&r.rows.length){log(op+': '+r.rows.map(x=>x.join(' | ')).join(' ; '));}else if(r.ok){log(op+' OK');}else{log(op+' error: '+r.error);}}
+async function genTemplate(db,name){const r=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});if(!r.ok||!r.rows.length){toast('Could not read columns.',true);return;}const cols=r.rows.map(x=>x[0]);const tbl=qid(db)+'.'+qid(name);const cl=cols.map(qid).join(', ');const vals=cols.map(()=>'?').join(', ');const sets=cols.map(c=>qid(c)+' = ?').join(',\n  ');const sql='-- SELECT\nSELECT '+cl+'\nFROM '+tbl+'\nWHERE 1=1\nLIMIT 100;\n\n-- INSERT\nINSERT INTO '+tbl+' ('+cl+')\nVALUES ('+vals+');\n\n-- UPDATE\nUPDATE '+tbl+' SET\n  '+sets+'\nWHERE /* key */ ;';openTab(name+' templates',sql,db,false,null);}
+async function inspect(db,name){const q=await api('/api/query',{sql:"SELECT ENGINE,TABLE_ROWS,DATA_LENGTH,INDEX_LENGTH,TABLE_COLLATION,CREATE_TIME,UPDATE_TIME FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
+ let t='';if(q.ok&&q.rows.length){const r=q.rows[0];t='Engine: '+r[0]+'\nApprox rows: '+r[1]+'\nData size: '+fmtB(r[2])+'\nIndex size: '+fmtB(r[3])+'\nCollation: '+r[4]+'\nCreated: '+r[5]+'\nUpdated: '+r[6];}
+ const idx=await api('/api/query',{sql:'SHOW INDEX FROM '+qid(db)+'.'+qid(name)});if(idx.ok&&idx.rows.length){t+='\n\nIndexes:\n'+idx.rows.map(r=>' '+r[2]+' ('+r[4]+')'+(r[1]=='0'?' UNIQUE':'')).join('\n');}
+ const fks=await api('/api/query',{sql:"SELECT CONSTRAINT_NAME,COLUMN_NAME,REFERENCED_TABLE_NAME,REFERENCED_COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME"});if(fks.ok&&fks.rows.length){t+='\n\nForeign keys:\n'+fks.rows.map(r=>' '+r[1]+' -> '+r[2]+'.'+r[3]).join('\n');}
+ const ref=await api('/api/query',{sql:"SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_SCHEMA="+lit(db)+" AND REFERENCED_TABLE_NAME="+lit(name)+" ORDER BY TABLE_NAME"});if(ref.ok&&ref.rows.length){t+='\n\nReferenced by:\n'+ref.rows.map(r=>' '+r[0]+'.'+r[1]).join('\n');}
+ viewText('Table '+db+'.'+name,t,{readonly:true});}
+function fmtB(n){n=+n||0;return n>1048576?(n/1048576).toFixed(1)+' MB':n>1024?(n/1024).toFixed(1)+' KB':n+' B';}
+
+// ---- DDL ----
+async function openDdl(db,type,name){const r=await api('/api/ddl',{db,type,name});if(!r.ok){log('DDL error: '+r.error);toast(r.error,true);return;}
+ let body=r.ddl;
+ if(type==='procedure'||type==='function'||type==='trigger'){const kw={procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER'}[type];
+  if(window.mariadb){
+   // MariaDB: CREATE OR REPLACE is atomic - no window where the routine is missing, and no separate DROP.
+   body='-- Edit then "Apply (recreate)". (MariaDB CREATE OR REPLACE - atomic)\nDELIMITER $$\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+'$$\nDELIMITER ;\n';
+  } else {
+   // MySQL has no CREATE OR REPLACE for routines/triggers, so drop then create.
+   body='-- Edit then "Apply (recreate)".\nDROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'$$\nDELIMITER ;\n';
+  }}
+ else if(type==='view'){body='-- Edit then "Apply (recreate)".\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+';\n';}
+ openTab(type+': '+name,body,db,false,null,{type,db,name});}
+
+// ---- tabs & editor ----
+// --- Query tabs: each tab has its own editor + result grid + pending edits.
+function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqueTabTitle(title||'Query');const tab={id,title,db:db||null,table:table||null,ddl:ddl||null,pk:null,cols:null,rows:null,limit:1000,offset:0,pending:null,filter:null,hiddenCols:new Set()};
+ tabs.push(tab);
+ const tb=document.createElement('div');tb.className='tab';tb.id='tabbtn_'+id;tb.draggable=true;tb.innerHTML='<span class="tablabel">'+esc(tab.title)+'</span><span class="x">&times;</span>';
+ tb.onclick=()=>activate(id);tb.querySelector('.x').onclick=e=>{e.stopPropagation();closeTabAsk(id);};tb.oncontextmenu=e=>{e.preventDefault();menu(e.clientX,e.clientY,[['Close',()=>closeTabAsk(id)],['Close others',()=>closeOthers(id)],['Close all',()=>closeAll()]]);};
+ tb.addEventListener('dragstart',e=>{e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',id);tb.classList.add('dragging');});
+ tb.addEventListener('dragend',()=>{tb.classList.remove('dragging');});
+ tb.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='move';tb.classList.add('dragover');});
+ tb.addEventListener('dragleave',()=>{tb.classList.remove('dragover');});
+ tb.addEventListener('drop',e=>{e.preventDefault();tb.classList.remove('dragover');const srcId=e.dataTransfer.getData('text/plain');if(!srcId||srcId===id)return;reorderTab(srcId,id);});
+ $('tabsbar').appendChild(tb);saveSession();
+ const pane=document.createElement('div');pane.className='tabpane';pane.id='pane_'+id;
+ const applyBtn=tab.ddl?'<button class="go write" onclick="applyDdl(\''+id+'\')">Apply (recreate)</button>':'';const lastBtn=tab.ddl?'':'<button title="Toggle between the current query and the last one you ran" onclick="toggleLast(\''+id+'\')">\u21C4 Last query</button>';const selBtn=tab.table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">\u21C4 Show all</button>':'';
+ const pager='<span class="tbsep"></span><span id="pager_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>';
+ pane.innerHTML='<div class="edwrap" id="ew_'+id+'"><pre class="hl" id="hl_'+id+'"></pre><textarea class="editor" id="ed_'+id+'" spellcheck="false"></textarea></div>'+
+  '<div class="edsplit" id="es_'+id+'" title="Drag to resize the editor"></div>'+
+  '<div class="toolbar"><button class="primary" id="runbtn_'+id+'" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button title="Run only the selected text (Ctrl+Enter)" onclick="runSel(\''+id+'\')">Run Query Selection</button><button class="warn" id="cancelbtn_'+id+'" style="display:none" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button>'+lastBtn+selBtn+applyBtn+
+  '<span class="tbsep"></span>'+
+  '<span id="resultActions_'+id+'" style="display:none;gap:9px;align-items:center" class="tbgroup">'+
+  '<button title="Copy all rows to the clipboard as CSV (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="copyCsv(\''+id+'\')">Copy CSV</button><button title="Copy the selected (checked) rows as CSV (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="copySelCsv(\''+id+'\')">Copy selected CSV</button><button title="Copy all rows as a Markdown table (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="copyMd(\''+id+'\')">Copy Markdown</button><button title="Copy the selected (checked) rows as a Markdown table (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="copyMdSel(\''+id+'\')">Copy selected Markdown</button>'+'<button id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')">Wrap: Off</button>'+'<button id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();openColPicker(\''+id+'\',this)">Columns</button>'+
+  '<span class="tbsep"></span></span>'+
+  '<span style="flex:1 1 auto"></span>'+
+  '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
+  '<div class="result" id="res_'+id+'"></div><div class="status" id="st_'+id+'">Ready.</div>';
+ $('panes').appendChild(pane);const ta=$('ed_'+id);ta.value=sql||'';
+ const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';
+ (function(){const es=$('es_'+id),ew=$('ew_'+id);es.addEventListener('mousedown',e=>{e.preventDefault();const sy=e.clientY,sh=ew.offsetHeight,maxH=ew.parentElement.clientHeight-120;
+  const mv=ev=>{let h=sh+(ev.clientY-sy);h=Math.max(44,Math.min(h,Math.max(80,maxH)));ew.style.height=h+'px';syncHl(id);};
+  const up=()=>{document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.style.userSelect='';};
+  document.body.style.userSelect='none';document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);});})();
+ ta.addEventListener('input',()=>{syncHl(id);acUpdate(id);});ta.addEventListener('scroll',()=>{syncHl(id);acHide();});
+ ta.addEventListener('blur',()=>{setTimeout(acHide,150);saveSession();});
+ ta.addEventListener('keydown',e=>{
+  if(acVisible()){
+   if(e.key==='ArrowDown'){e.preventDefault();acMove(1);return;}
+   if(e.key==='ArrowUp'){e.preventDefault();acMove(-1);return;}
+   if(e.key==='Enter'||e.key==='Tab'){e.preventDefault();acAccept(id);return;}
+   if(e.key==='Escape'){e.preventDefault();acHide();return;}
+  }
+  if(e.key==='F5'){e.preventDefault();runTab(id);}
+  else if(e.ctrlKey&&e.key==='Enter'){e.preventDefault();runSel(id);}
+  else if(e.ctrlKey&&e.code==='Space'){e.preventDefault();acUpdate(id,true);}
+  else if(e.key==='Tab'){e.preventDefault();const st=ta.selectionStart;ta.value=ta.value.slice(0,st)+'  '+ta.value.slice(ta.selectionEnd);ta.selectionStart=ta.selectionEnd=st+2;syncHl(id);}
+ });
+ syncHl(id);activate(id);if(run)runTab(id);return id;}
+function activate(id){activeTab=id;const _ov=$('overview');if(_ov)_ov.style.display='none';tabs.forEach(t=>{$('tabbtn_'+t.id).classList.toggle('active',t.id===id);$('pane_'+t.id).classList.toggle('active',t.id===id);});const ta=$('ed_'+id);if(ta)setTimeout(()=>ta.focus(),0);updateSchemaBadge(id);const _t=T(id);if(_t&&_t.cols&&_t.cols.length&&!_t.colsFitted){requestAnimationFrame(()=>autofitAll(id));}}
+function updateSchemaBadge(id){const el=$('schemaBadge');if(!el)return;if(document.body.classList.contains('disconnected')){el.style.display='none';el.textContent='';return;}const t=T(id);const db=t?dbOf(t):null;el.textContent=db?('Schema: '+db):'';el.style.display=db?'inline-flex':'none';}
+function pendingCount(t){if(!t||!t.pending)return 0;return Object.keys(t.pending.upd||{}).length+((t.pending.del&&t.pending.del.size)||0)+((t.pending.ins&&t.pending.ins.length)||0);}
+function uniqueTabTitle(base){
+  let title=base, n=2;
+  while(tabs.some(t=>t.title===title)){ title=base+' ('+n+')'; n++; }
+  return title;
+}
+function refreshTabDirty(id){const t=T(id);const tb=$('tabbtn_'+id);if(!tb)return;const lbl=tb.querySelector('.tablabel');if(!lbl)return;
+ const n=pendingCount(t);lbl.textContent=(n>0?'\u25CF ':'')+(t?t.title:'');lbl.title=n>0?(n+' unsaved change'+(n===1?'':'s')):'';}
+async function closeTabAsk(id){const t=T(id);const n=pendingCount(t);if(n>0){if(!(await ask('This tab has '+n+' unsaved change'+(n===1?'':'s')+'. Close and discard?')))return;}closeTab(id);}
+function reorderTab(srcId,targetId){
+  const srcIdx=tabs.findIndex(t=>t.id===srcId),tgtIdx=tabs.findIndex(t=>t.id===targetId);
+  if(srcIdx<0||tgtIdx<0)return;
+  const [moved]=tabs.splice(srcIdx,1);
+  tabs.splice(tgtIdx,0,moved);
+  const srcEl=$('tabbtn_'+srcId),tgtEl=$('tabbtn_'+targetId);
+  if(srcEl&&tgtEl){
+    if(srcIdx<tgtIdx) tgtEl.after(srcEl);
+    else tgtEl.before(srcEl);
+  }
+  saveSession();
+}
+function anyPending(){return tabs.some(t=>pendingCount(t)>0);}
+document.addEventListener('keydown',e=>{const mod=e.ctrlKey||e.metaKey;if(!mod)return;const k=e.key.toLowerCase();
+ if(k==='t'){e.preventDefault();if(!document.body.classList.contains('disconnected'))newTab();}
+ else if(k==='w'){e.preventDefault();if(activeTab)closeTabAsk(activeTab);}
+ else if(k==='l'){e.preventDefault();const ta=activeTab&&$('ed_'+activeTab);if(ta){ta.focus();ta.select&&ta.select();}}
+ else if(k==='s'){e.preventDefault();if(activeTab){const t=T(activeTab);if(pendingCount(t)>0)applyChanges(activeTab);}}});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){const open=[...document.querySelectorAll('.modal.show')];if(open.length){open[open.length-1].classList.remove('show');}}});
+function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
+// Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
+// connections are keyed by host+user+port so different credentials don't collide).
+function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
+function saveSession(key){try{const k=key||sessionKeyFor();const arr=tabs.map(t=>({title:t.title,sql:($('ed_'+t.id)?$('ed_'+t.id).value:''),db:t.db,table:t.table}));localStorage.setItem('session:'+k,JSON.stringify(arr));}catch(e){}}
+function restoreSessionFor(key){if(tabs.length)return;let arr=[];try{const raw=localStorage.getItem('session:'+key);if(raw!=null){arr=JSON.parse(raw);}else if(!localStorage.getItem('_sessionMigrated')){const old=localStorage.getItem('session');if(old)arr=JSON.parse(old);localStorage.setItem('_sessionMigrated','1');}}catch(e){}if(Array.isArray(arr)&&arr.length){arr.forEach(t=>{
+  // Table tabs are always bounded (LIMIT 1000), so it's safe to auto-run them on restore -
+  // otherwise the tab looks silently empty even though the table has data (never actually queried).
+  // Plain query tabs could be arbitrary/heavy, so those restore WITHOUT auto-running; a clear
+  // status message replaces what would otherwise look like a blank, broken result.
+  const id=openTab(t.title,t.sql,t.db,!!t.table,t.table);
+  if(!t.table){const st=$('st_'+id);if(st)st.textContent='Restored - not yet run. Click Run Query.';}
+});}}
+// Closes every tab without the "unsaved changes" prompt - only called right after the user has
+// already confirmed switching connections (connect() asks that separately, once, up front).
+function clearAllTabsSilently(){[...tabs].forEach(t=>{const b=$('tabbtn_'+t.id);if(b)b.remove();const p=$('pane_'+t.id);if(p)p.remove();});tabs=[];activeTab=null;toggleOverview();const _sb=$('schemaBadge');if(_sb){_sb.style.display='none';_sb.textContent='';}}
+function newTab(){openTab('Query',curSchema?('USE '+qid(curSchema)+';\n'):'',curSchema,false,null);}
+const T=id=>tabs.find(t=>t.id===id);
+
+function splitStmts(sql){let out=[],cur='',i=0,q=null,delim=';';sql=sql.replace(/\r\n/g,'\n');
+ while(i<sql.length){const c=sql[i];
+  if(q){cur+=c;if(c==='\\'&&q!=='`'){cur+=sql[i+1]||'';i+=2;continue;}if(c===q)q=null;i++;continue;}
+  if(c==='-'&&sql[i+1]==='-'){const e=sql.indexOf('\n',i);const seg=sql.slice(i,e<0?sql.length:e);cur+=seg;i+=seg.length;continue;}
+  if(c==='/'&&sql[i+1]==='*'){const e=sql.indexOf('*/',i);const seg=sql.slice(i,e<0?sql.length:e+2);cur+=seg;i+=seg.length;continue;}
+  if(c==="'"||c==='"'||c==='`'){q=c;cur+=c;i++;continue;}
+  if(sql.slice(i).match(/^delimiter[ \t]+(\S+)/i)){const mm=sql.slice(i).match(/^delimiter[ \t]+(\S+)[^\n]*\n?/i);delim=mm[1];i+=mm[0].length;continue;}
+  if(sql.slice(i,i+delim.length)===delim){if(cur.trim())out.push(cur.trim());cur='';i+=delim.length;continue;}
+  cur+=c;i++;}
+ if(cur.trim())out.push(cur.trim());return out;}
+
+async function runTab(id){await runSql(id,$('ed_'+id).value);}
+async function runSel(id){const ta=$('ed_'+id);const sel=ta.value.substring(ta.selectionStart,ta.selectionEnd).trim();await runSql(id,sel||ta.value);}
+function dbOf(t){ if(t&&(t.table||t.ddl))return t.db||curSchema||null; /* table-view + DDL tabs keep their own schema */ return curSchema||(t&&t.db)||null; /* plain query tabs follow the selected sidebar schema */ }
+// runSql(): send the editor SQL to the server and show the rows (or the error).
+async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
+ addHistory(sql);
+ const stmts=splitStmts(sql);const single=stmts.length<=1;
+ const isSelect=single&&/^(select|show|describe|desc|explain|with|table|values)\b/i.test((stmts[0]||sql).trim());
+ const reqId=(crypto.randomUUID?crypto.randomUUID():('r'+Date.now()+Math.random()));
+ t.abortCtrl=new AbortController();t.runningReqId=reqId;setRunning(id,true);
+ try{
+  if(isSelect){const _q=(stmts[0]||sql).trim().replace(/;+\s*$/,'');if(!paging)t.offset=0;
+    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId},t.abortCtrl.signal);
+    if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
+    if(!T(id))return;
+    if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log('ERROR: '+r.error);return;}
+    t.cols=r.columns;t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();$('edit_'+id).innerHTML='';
+    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
+    const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
+    if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
+      const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok)t.fk=fk.fk||[];
+      if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
+        t.estRows=+objData.rowCounts[t.table];
+      } else {
+        try{const cq=await api('/api/query',{sql:"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(t.db)+" AND TABLE_NAME="+lit(t.table)});t.estRows=(cq.ok&&cq.rows.length&&cq.rows[0][0]!=null)?+cq.rows[0][0]:null;}catch(e){t.estRows=null;}
+      }
+    } else { t.estRows=null; }
+    if(!T(id))return;
+    t.lastElapsedMs=r.elapsedMs;
+    if(r.fetchMs!=null&&r.jsonMs!=null&&r.elapsedMs>=300){log(fmtCount(t.rows.length)+' row(s) fetched in '+fmtMs(r.elapsedMs)+' (parse '+fmtMs(r.fetchMs)+', JSON '+fmtMs(r.jsonMs)+').');}
+    renderGrid(id);updatePager(id);
+    updateStatusLine(id);
+    updateSchemaBadge(id);
+  } else {
+    if(roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
+    const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId},t.abortCtrl.signal);
+    if(r.aborted){if(T(id)){st.className='status';st.textContent='Cancelled.';}return;}
+    if(!T(id))return;
+    if(r.ok){st.textContent='OK. '+stmts.length+' statement(s) executed.';log('SCRIPT OK ('+stmts.length+' statements)');if(t.db)loadObjects(t.db);}
+    else{st.className='status err';st.textContent=r.error;log('SCRIPT ERROR: '+r.error);}
+  }
+ } finally {
+  if(T(id)){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+ }
+}
+
+function setRunning(id,running){const rb=$('runbtn_'+id),cb=$('cancelbtn_'+id);if(!rb||!cb)return;rb.style.display=running?'none':'';cb.style.display=running?'':'none';
+ const tb=$('tabbtn_'+id);if(tb){let dot=tb.querySelector('.runningdot');if(running){if(!dot){dot=document.createElement('span');dot.className='runningdot';dot.title='Query running';tb.insertBefore(dot,tb.firstChild);}}else if(dot){dot.remove();}}}
+async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.abortCtrl.abort();}catch(e){}}
+ const rid=t.runningReqId;
+ if(rid){
+   if(window.__TAURI__&&window.__TAURI__.core){try{await window.__TAURI__.core.invoke('cancel_query',{req:{requestId:rid}});}catch(e){}}
+   else{try{await fetch('/api/cancel-query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,requestId:rid})});}catch(e){}}
+ }
+ log('Cancel requested.');}
+
+function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total){p.innerHTML='';return;}
+ const ps=t.limit||1000;const off=t.offset||0;const shown=Math.min(ps,Math.max(0,total-off));const prevDis=off<=0?' disabled':'';const nextDis=(off+ps>=total)?' disabled':'';
+ const label=(total===0)?'0 rows':((off+1)+'-'+(off+shown)+' of '+total);
+ p.innerHTML='<span>Limit</span><input id="lim_'+id+'" type="number" min="1" value="'+t.limit+'" title="Rows per page (Enter to apply)" onchange="setLimit(\''+id+'\')" onkeydown="if(event.key===\'Enter\')setLimit(\''+id+'\')" style="width:70px"><button'+prevDis+' onclick="pg(\''+id+'\',-1)">Previous</button><button'+nextDis+' onclick="pg(\''+id+'\',1)">Next</button><span class="muted">'+label+'</span>';}
+function setLimit(id){const t=T(id);const v=Math.max(1,parseInt($('lim_'+id).value)||1000);if(v===t.limit)return;t.limit=v;t.offset=0;pageShow(id);}
+function pg(id,dir){const t=T(id);t.limit=Math.max(1,parseInt($('lim_'+id).value)||1000);const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));let no=(t.offset||0)+dir*t.limit;if(no<0)no=0;if(no>=total)no=Math.max(0,(t.offset||0));t.offset=no;pageShow(id);}
+function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}ta.value=t.prevRun;if(typeof syncHl==='function')syncHl(id);runSql(id,t.prevRun);}
+function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+' LIMIT '+(t.limit||1000)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
+async function openRun(id){const t=T(id);const wh=t.filter?(' WHERE '+t.filter):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+' LIMIT 1000;';$('ed_'+id).value=sql;syncHl(id);t.offset=0;await runSql(id,sql);updateFilterBar(id);}
+function pageShow(id){renderBody(id);updatePager(id);updateStatusLine(id);}
+
+// ---- editable grid with pending changes ----
+function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
+// Decodes a "0x.." hex-encoded cell value (our OWN display encoding for text containing real
+// control characters) back into readable text, marking ONLY the actual control-character byte
+// positions with a small inline badge - like MySQL Workbench does - instead of hex-dumping the
+// whole value. Splits at control-byte positions (always unambiguous single ASCII bytes that can
+// never occur inside a multi-byte UTF-8 sequence) and decodes each segment properly as UTF-8, so
+// accented/non-ASCII text around the control character stays readable, not garbled.
+// IMPORTANT: this is a DISPLAY-ONLY transform. The underlying value (t.rows[ri][ci]) is left as
+// the "0x.." string exactly as before - editing, Apply, and SQL generation are untouched, since
+// that hex form is what makes round-tripping a value with a real embedded NUL byte safe (a raw
+// NUL in the actual SQL text risks truncation when passed as a command-line argument).
+const CTRL_NAMES={0:'NUL',1:'SOH',2:'STX',3:'ETX',4:'EOT',5:'ENQ',6:'ACK',7:'BEL',8:'BS',11:'VT',12:'FF',14:'SO',15:'SI',16:'DLE',17:'DC1',18:'DC2',19:'DC3',20:'DC4',21:'NAK',22:'SYN',23:'ETB',24:'CAN',25:'EM',26:'SUB',27:'ESC',28:'FS',29:'GS',30:'RS',31:'US'};
+function decodeCtrlCharCell(hexStr,maxChars){
+ const hex=hexStr.slice(2);const bytes=[];for(let i=0;i<hex.length;i+=2){bytes.push(parseInt(hex.substr(i,2),16));}
+ const decoder=new TextDecoder('utf-8',{fatal:false});
+ let html='',shown=0,segStart=0,truncated=false;
+ for(let i=0;i<=bytes.length;i++){
+  const isCtrl=i<bytes.length&&CTRL_NAMES.hasOwnProperty(bytes[i]);
+  if(isCtrl||i===bytes.length){
+   if(i>segStart){
+    const segText=decoder.decode(new Uint8Array(bytes.slice(segStart,i)));
+    if(shown+segText.length>maxChars){html+=esc(segText.slice(0,Math.max(0,maxChars-shown)));shown=maxChars;truncated=true;}
+    else{html+=esc(segText);shown+=segText.length;}
+   }
+   if(isCtrl&&!truncated){html+='<span style="background:#4a3a1f;color:#e8c589;border-radius:3px;padding:0 3px;font-size:10px;font-weight:600;margin:0 1px" title="Control character (0x'+bytes[i].toString(16).padStart(2,'0').toUpperCase()+') - not printable text">'+CTRL_NAMES[bytes[i]]+'</span>';shown++;}
+   segStart=i+1;
+  }
+  if(truncated)break;
+ }
+ if(truncated)html+='\u2026';
+ return html;
+}
+function cellHtml(v){if(v===null)return '<span style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return decodeCtrlCharCell(v,300);return esc(clip(v,300));}
+function colgroupHtml(id){const t=T(id);const ed=!!t.pk;const hidden=t.hiddenCols||new Set();let h='<colgroup><col style="width:30px">'+(ed?'<col style="width:34px">':'');t.cols.forEach((c,ci)=>{h+='<col style="width:150px'+(hidden.has(ci)?';display:none':'')+'">';});return h+'<col></colgroup>';}
+// wireColResize(): drag a column edge to resize, double-click to auto-fit (widths saved per table).
+function wireColResize(id){const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const t=T(id);const off=(!!t.pk)?2:1;
+ wrap.querySelectorAll('thead .rz').forEach(rz=>{const ci=+rz.getAttribute('data-ci');const col=cg.children[ci+off];if(!col)return;let sx=0,sw=0,drag=false;
+  rz.addEventListener('pointerdown',e=>{e.stopPropagation();e.preventDefault();drag=true;sx=e.clientX;sw=col.getBoundingClientRect().width;try{rz.setPointerCapture(e.pointerId);}catch(_){}rz.classList.add('drag');});
+  rz.addEventListener('pointermove',e=>{if(!drag)return;const w=Math.max(40,Math.round(sw+(e.clientX-sx)));col.style.width=w+'px';});
+  const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}};
+  rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);
+  rz.addEventListener('click',e=>e.stopPropagation());
+  rz.addEventListener('dblclick',e=>{e.stopPropagation();autofitCol(id,ci);});
+ });}
+function autofitAll(id,retries){const t=T(id);if(!t.cols||!t.cols.length)return;const off=(!!t.pk)?2:1;const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;
+ if(wrap.clientWidth<150){if((retries||0)<5){requestAnimationFrame(()=>autofitAll(id,(retries||0)+1));}return;}
+ t.colsFitted=true;
+ const hidden=t.hiddenCols||new Set();const n=t.cols.length;const w=[];const heads=table.querySelectorAll('thead tr:first-child th');for(let ci=0;ci<n;ci++){if(hidden.has(ci)){w[ci]=0;continue;}let mx=heads[ci+off]?heads[ci+off].scrollWidth:60;const cells=table.querySelectorAll('tbody td:nth-child('+(ci+off+1)+')');for(let i=0;i<cells.length;i++){mx=Math.max(mx,cells[i].scrollWidth);}w[ci]=Math.min(Math.max(60,mx+18),400);}const visCount=n-hidden.size;const fixed=30+(off===2?34:0);let sum=fixed;for(let i=0;i<n;i++)sum+=w[i];const avail=wrap.clientWidth-2;if(avail>sum&&visCount>0){const extra=Math.floor((avail-sum)/visCount);for(let i=0;i<n;i++){if(!hidden.has(i))w[i]+=extra;}}for(let ci=0;ci<n;ci++){const col=cg.children[ci+off];if(col&&!hidden.has(ci))col.style.width=w[ci]+'px';}}
+function applyColVis(id){const t=T(id);const ed=!!t.pk;const off=ed?2:1;const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const hidden=t.hiddenCols||new Set();t.cols.forEach((c,ci)=>{const col=cg.children[ci+off];if(col)col.style.display=hidden.has(ci)?'none':'';});autofitAll(id);}
+function setColVis(id,ci,visible){const t=T(id);if(!t.hiddenCols)t.hiddenCols=new Set();if(visible)t.hiddenCols.delete(ci);else t.hiddenCols.add(ci);applyColVis(id);}
+function showAllCols(id){const t=T(id);t.hiddenCols=new Set();applyColVis(id);const btn=$('colsbtn_'+id);if(btn)openColPicker(id,btn);}
+function openColPicker(id,btn){const t=T(id);if(!t||!t.cols)return;if(!t.hiddenCols)t.hiddenCols=new Set();
+ const p=$('colPicker');
+ let h='<div class="cphdr"><span>Show/hide columns</span><span class="cplink" onclick="showAllCols(\''+id+'\')">Show all</span></div>';
+ t.cols.forEach((c,ci)=>{h+='<label class="cpitem"><input type="checkbox" '+(t.hiddenCols.has(ci)?'':'checked')+' onchange="setColVis(\''+id+'\','+ci+',this.checked)"> '+esc(c)+'</label>';});
+ p.innerHTML=h;
+ p.style.display='block';p.style.visibility='hidden';p.style.left='0';p.style.top='0';
+ const r=btn.getBoundingClientRect();const w=p.offsetWidth||200,hgt=p.offsetHeight||0;
+ let nx=Math.min(r.left,innerWidth-w-6);if(nx<6)nx=6;
+ let ny=r.bottom+2;if(ny+hgt>innerHeight-6)ny=Math.max(6,r.top-hgt-2);
+ p.style.left=nx+'px';p.style.top=ny+'px';p.style.visibility='visible';}
+function autofitCol(id,ci){const t=T(id);const off=(!!t.pk)?2:1;const wrap=$('res_'+id);const table=wrap.querySelector('table.grid');const cg=table.querySelector('colgroup');const col=cg.children[ci+off];if(!col)return;let max=0;
+ const th=table.querySelectorAll('thead tr:first-child th')[ci+off];if(th)max=Math.max(max,th.scrollWidth);
+ table.querySelectorAll('tbody td:nth-child('+(ci+off+1)+')').forEach(td=>{max=Math.max(max,td.scrollWidth);});
+ const w=Math.min(Math.max(60,max+16),600);col.style.width=w+'px';}
+// renderGrid(): build the results table (header, filters, colgroup) then fill the body.
+function renderGrid(id){const t=T(id);const ed=!!t.pk;if(!t.filters)t.filters={};if(t.sortCol===undefined){t.sortCol=-1;t.sortDir=1;}
+ let h='<table class="grid">'+colgroupHtml(id)+'<thead><tr id="sortrow_'+id+'">'+sortHeader(id,ed)+'</tr><tr>';
+ h+='<th style="top:24px"></th>';if(ed)h+='<th style="top:24px"></th>';
+ t.cols.forEach((c,ci)=>{h+='<th style="top:24px;padding:1px"><input data-ci="'+ci+'" oninput="setFilter(\''+id+'\','+ci+',this.value)" value="'+esc(t.filters[ci]||'')+'" placeholder="filter" style="width:100%;font-weight:400;font-size:11px"></th>';});
+ h+='<th style="top:24px"></th>';
+ h+='</tr></thead><tbody id="tbody_'+id+'"></tbody></table>';
+ $('res_'+id).innerHTML=h;renderBody(id);requestAnimationFrame(()=>autofitAll(id));wireColResize(id);updateStatusLine(id);refreshTabDirty(id);
+ const wrap=$('res_'+id);if(wrap&&!wrap.dataset.kbWired){wrap.tabIndex=-1;wrap.addEventListener('keydown',e=>gridKeyNav(id,e));wrap.addEventListener('mousedown',e=>{const td=e.target.closest('td.editable');if(td){const tr=td.closest('tr[data-r]');if(tr){const ri=+tr.getAttribute('data-r');const t2=T(id);const off=(!!t2.pk)?2:1;const ci=[...tr.children].indexOf(td)-off;if(ci>=0)gridSetFocus(id,ri,ci,false);}}});
+  let _vraf=null;wrap.addEventListener('scroll',()=>{if(_vraf)return;_vraf=requestAnimationFrame(()=>{_vraf=null;renderBody(id);});});
+  wrap.dataset.kbWired='1';}}
+function toggleWrap(id){const t=T(id);t.wrap=!t.wrap;const wrap=$('res_'+id);if(wrap)wrap.classList.toggle('wraptext',t.wrap);const btn=$('wrapbtn_'+id);if(btn)btn.textContent='Wrap: '+(t.wrap?'On':'Off');}
+function sortHeader(id,ed){const t=T(id);let h='<th style="width:22px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;color:#5dcaa5" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;color:#7aa8d8" title="Foreign key">FK</span>':'');h+='<th style="cursor:pointer" title="Click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')">'+esc(c)+kb+ar+'<span class="rz" data-ci="'+ci+'"></span></th>';});return h+'<th></th>';}
+function setFilter(id,ci,v){const t=T(id);t.filters[ci]=v;renderBody(id);updatePager(id);updateStatusLine(id);}
+function sortBy(id,ci){const t=T(id);if(t.sortCol===ci){if(t.sortDir>0){t.sortDir=-1;}else{t.sortCol=-1;t.sortDir=1;}}else{t.sortCol=ci;t.sortDir=1;}$('sortrow_'+id).innerHTML=sortHeader(id,!!t.pk);renderBody(id);wireColResize(id);updatePager(id);updateStatusLine(id);}
+function viewIndices(id){const t=T(id);let view=t.rows.map((r,ri)=>ri);
+ const fk=Object.keys(t.filters).filter(k=>t.filters[k]!=='' && t.filters[k]!=null);
+ if(fk.length)view=view.filter(ri=>fk.every(ci=>{const v=t.rows[ri][ci];return v!=null&&String(v).toLowerCase().includes(String(t.filters[ci]).toLowerCase());}));
+ if(t.sortCol>=0){const sc=t.sortCol;view=view.slice().sort((a,b)=>{let va=t.rows[a][sc],vb=t.rows[b][sc];
+   if(va==null&&vb==null)return 0;if(va==null)return 1;if(vb==null)return -1;
+   const na=parseFloat(va),nb=parseFloat(vb);
+   if(!isNaN(na)&&!isNaN(nb)&&String(na)===String(va).trim()&&String(nb)===String(vb).trim())return na-nb;
+   return String(va).localeCompare(String(vb));});if(t.sortDir<0)view.reverse();}
+ return view;}
+function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=new Set();const _full=viewIndices(id);t._total=_full.length;const _ps=t.limit||1000;const _off=Math.min(t.offset||0,Math.max(0,_full.length-1));const view=_full.slice(_off,_off+_ps);
+ const wrap=$('res_'+id);const rowH=t._rowH||23;const VIRT_THRESHOLD=300;const BUFFER=15;
+ let startIdx=0,endIdx=view.length,topH=0,botH=0;
+ if(view.length>VIRT_THRESHOLD&&wrap){
+  const scrollTop=wrap.scrollTop,viewportH=wrap.clientHeight||600;
+  startIdx=Math.max(0,Math.floor(scrollTop/rowH)-BUFFER);
+  endIdx=Math.min(view.length,Math.ceil((scrollTop+viewportH)/rowH)+BUFFER);
+  if(startIdx>=view.length)startIdx=Math.max(0,view.length-1);
+  if(endIdx<startIdx)endIdx=startIdx;
+  topH=startIdx*rowH;botH=(view.length-endIdx)*rowH;
+ }
+ const slice=view.slice(startIdx,endIdx);
+ const nCols=1+(ed?1:0)+t.cols.length;
+ let h='';
+ if(topH>0)h+='<tr class="vpad" style="height:'+topH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
+ slice.forEach(ri=>{const row=t.rows[ri];const del=ed&&t.pending.del.has(ri);h+='<tr data-r="'+ri+'" class="'+(del?'del':'')+'">';
+  h+='<td style="text-align:center;width:22px"><input type="checkbox" class="rowsel" '+(t.selected.has(ri)?'checked':'')+' onclick="toggleSel(\''+id+'\','+ri+',this.checked)"></td>';
+  if(ed)h+='<td class="delcell" onclick="toggleDel(\''+id+'\','+ri+')">'+(del?'\u21A9':'\u00D7')+'</td>';
+  row.forEach((v,ci)=>{const key=ri+':'+ci;const pend=t.pending&&(key in t.pending.upd);const val=pend?t.pending.upd[key]:v;
+   const attr=ed?'class="editable'+(pend?' dirty':'')+'" onclick="cellClick(this,\''+id+'\','+ri+','+ci+')" ondblclick="editCell(this,\''+id+'\','+ri+','+ci+')" oncontextmenu="cellMenu(event,\''+id+'\','+ri+','+ci+')"':'';
+   h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val)+'</td>';});h+='</tr>';});
+ if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
+ if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
+   t.cols.forEach((c,ci)=>{const v=row[c];h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
+ $('tbody_'+id).innerHTML=h;
+ if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
+ updateEditBar(id);}
+function updateEditBar(id){const t=T(id);if(!t.pk){$('edit_'+id).innerHTML='';return;}
+ const n=Object.keys(t.pending.upd).length+t.pending.del.size+t.pending.ins.length;
+ const hasSel=t.selected&&t.selected.size>0;
+ $('edit_'+id).innerHTML='<span class="pill">'+n+' pending</span><button class="write" onclick="addRow(\''+id+'\')">+ Row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')">Revert</button>';}
+function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;const ta=$('vText');ta.value=(text==null?'':text);ta.readOnly=!!opts.readonly;
+ const a=$('vActions');a.innerHTML='';const add=(label,cls,fn)=>{const b=document.createElement('button');b.textContent=label;if(cls)b.className=cls;b.onclick=fn;a.appendChild(b);};
+ add('Copy','',()=>{navigator.clipboard.writeText(ta.value);log('Copied to clipboard.');});
+ if(opts.onNull)add('Set NULL','',()=>{opts.onNull();hide('mView');});
+ if(opts.onSave)add('Save','go',()=>{opts.onSave(ta.value);hide('mView');});
+ add('Close','',()=>hide('mView'));
+ show('mView');setTimeout(()=>{if(!opts.readonly){ta.focus();}},60);}
+function editCell(td,id,ri,ci){clearTimeout(clickTimer);const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
+ viewText('Cell - '+t.cols[ci]+(cur===null?'  (currently NULL)':''),cur,{onSave:v=>setUpd(id,ri,ci,v),onNull:()=>setUpd(id,ri,ci,null)});}
+function setUpd(id,ri,ci,v){const t=T(id);if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){toast('Column "'+t.cols[ci]+'" is part of the primary key and cannot be set to NULL.',true);return;}const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;renderGrid(id);}
+let clickTimer=null;
+let gridFocus={}; // per-tab: {ri, ci} of the currently keyboard-focused cell
+function gridCellEl(id,ri,ci){const t=T(id);const wrap=$('res_'+id);if(!wrap||!t)return null;const off=(!!t.pk)?2:1;
+ let tr=wrap.querySelector('tr[data-r="'+ri+'"]');
+ if(!tr){
+  const view=viewIndices(id);const pos=view.indexOf(ri);
+  if(pos>=0){const rowH=t._rowH||23;wrap.scrollTop=Math.max(0,pos*rowH-rowH*4);renderBody(id);tr=wrap.querySelector('tr[data-r="'+ri+'"]');}
+ }
+ if(!tr)return null;return tr.children[ci+off]||null;}
+function gridSetFocus(id,ri,ci,scroll){const t=T(id);if(!t)return;const view=viewIndices(id);if(view.indexOf(ri)<0)return;
+ const old=gridFocus[id];if(old){const oe=gridCellEl(id,old.ri,old.ci);if(oe)oe.classList.remove('kbfocus');}
+ gridFocus[id]={ri,ci};const el=gridCellEl(id,ri,ci);if(el){el.classList.add('kbfocus');if(scroll!==false)el.scrollIntoView({block:'nearest',inline:'nearest'});el.focus({preventScroll:true});}}
+function gridClearFocus(id){const old=gridFocus[id];if(old){const oe=gridCellEl(id,old.ri,old.ci);if(oe)oe.classList.remove('kbfocus');}delete gridFocus[id];}
+function gridKeyNav(id,e){const t=T(id);if(!t||!t.pk)return;const f=gridFocus[id];
+ const view=viewIndices(id);const _ps=t.limit||1000;const _off=Math.min(t.offset||0,Math.max(0,view.length-1));const pageView=view.slice(_off,_off+_ps);
+ if(!f){ if(['ArrowDown','ArrowUp','ArrowLeft','ArrowRight','Tab'].includes(e.key) && pageView.length){e.preventDefault();gridSetFocus(id,pageView[0],0);} return; }
+ let {ri,ci}=f; const rowPos=pageView.indexOf(ri); if(rowPos<0)return;
+ const nCols=t.cols.length;
+ if(e.key==='ArrowDown'){e.preventDefault();if(rowPos<pageView.length-1)gridSetFocus(id,pageView[rowPos+1],ci);}
+ else if(e.key==='ArrowUp'){e.preventDefault();if(rowPos>0)gridSetFocus(id,pageView[rowPos-1],ci);}
+ else if(e.key==='ArrowLeft'){e.preventDefault();if(ci>0)gridSetFocus(id,ri,ci-1);}
+ else if(e.key==='ArrowRight'){e.preventDefault();if(ci<nCols-1)gridSetFocus(id,ri,ci+1);}
+ else if(e.key==='Tab'){e.preventDefault();if(e.shiftKey){if(ci>0)gridSetFocus(id,ri,ci-1);else if(rowPos>0)gridSetFocus(id,pageView[rowPos-1],nCols-1);}
+   else{if(ci<nCols-1)gridSetFocus(id,ri,ci+1);else if(rowPos<pageView.length-1)gridSetFocus(id,pageView[rowPos+1],0);}}
+ else if(e.key==='Enter'||e.key==='F2'){e.preventDefault();const el=gridCellEl(id,ri,ci);if(el)inlineEdit(el,id,ri,ci);}
+ else if(e.key==='Escape'){gridClearFocus(id);}
+}
+function cellClick(td,id,ri,ci){if(td.querySelector('input'))return;clearTimeout(clickTimer);clickTimer=setTimeout(()=>inlineEdit(td,id,ri,ci),200);}
+function insClick(td,id,ii,col){if(td.querySelector('input'))return;clearTimeout(clickTimer);clickTimer=setTimeout(()=>inlineEditIns(td,id,ii,col),200);}
+function inlineEdit(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
+ if(cur!=null&&/[\r\n]/.test(String(cur))){editCell(td,id,ri,ci);return;}
+ td.innerHTML='<input><button tabindex="-1" title="Set NULL" style="padding:0 4px">&empty;</button>';const inp=td.querySelector('input');const nb=td.querySelector('button');inp.value=(cur===null?'':cur);inp.focus();inp.select();let done=false,dirty=false;
+ const set=v=>{done=true;setUpd(id,ri,ci,v);};
+ inp.addEventListener('input',()=>dirty=true);
+ nb.addEventListener('mousedown',e=>{e.preventDefault();set(null);});
+ inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(dirty)set(inp.value);else{done=true;renderGrid(id);}}else if(e.key==='Escape'){done=true;renderGrid(id);}});
+ inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else renderGrid(id);}},120));}
+function inlineEditIns(td,id,ii,col){const t=T(id);const cur=t.pending.ins[ii][col];
+ if(cur!=null&&/[\r\n]/.test(String(cur))){editIns(td,id,ii,col);return;}
+ td.innerHTML='<input><button tabindex="-1" style="padding:0 4px" title="Set NULL">&empty;</button>';const inp=td.querySelector('input');const nb=td.querySelector('button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
+ const set=v=>{done=true;t.pending.ins[ii][col]=v;renderGrid(id);};
+ inp.addEventListener('input',()=>dirty=true);
+ nb.addEventListener('mousedown',e=>{e.preventDefault();set(null);});
+ inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(dirty)set(inp.value);else{done=true;renderGrid(id);}}else if(e.key==='Escape'){done=true;renderGrid(id);}});
+ inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else renderGrid(id);}},120));}
+function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=ri+':'+ci;const cur=(t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];const items=[['Copy value',()=>{navigator.clipboard.writeText(cur===null?'':String(cur));log('Copied cell value.');}],['Copy row',()=>copyRow(id,ri)],['Paste row here (overwrite)',()=>pasteRowInto(id,ri)],['Copy column: '+t.cols[ci],()=>copyColumn(id,ci)],['Edit full row (form)...',()=>rowForm(id,ri)],'-'];if(t.table){const col=t.cols[ci];items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filter)items.push(['Clear filter',()=>setFilterWhere(id,null)]);items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],['Export to CSV (selected rows)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],['Export to INSERTs (selected rows)...',()=>insSel(id)],'-',['Set NULL',()=>setUpd(id,ri,ci,null)],['Set empty',()=>setUpd(id,ri,ci,'')]);menu(e.clientX,e.clientY,items);}
+function copyRow(id,ri){const t=T(id);const vals=t.cols.map((c,ci)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];});window._rowClipboard=vals;navigator.clipboard.writeText(vals.map(v=>v===null?'':v).join('\t')).then(()=>log('Copied 1 row (TSV, '+t.cols.length+' column(s)).'));}
+function pasteRowInto(id,ri){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const vals=window._rowClipboard;if(!vals||!vals.length){toast('Copy a row first, then right-click a target row to paste it.',true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
+ t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0)return;const v=vals[ci];const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;});
+ renderGrid(id);log('Pasted copied row into row '+(ri+1)+' (primary key column(s) left unchanged). Review and click Apply to commit.');}
+function copyColumn(id,ci){const t=T(id);const vals=t.rows.map((row,ri)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:row[ci];});navigator.clipboard.writeText(vals.map(v=>v===null?'':v).join('\n')).then(()=>log('Copied '+vals.length+' value(s) from column "'+t.cols[ci]+'".'));}
+function qfSub(id,col,val){const q=qid(col);const lv=lit(val);const esc=s=>String(s).replace(/([%_\\])/g,'\\$1').replace(/'/g,"''");const sub=[];
+ if(val===null){sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
+ const sv=String(val).trim();const isNum=/^-?\d+(\.\d+)?$/.test(sv);const isDate=/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(sv);
+ const like=String(val);const ld=(like.length>16?like.slice(0,16)+'\u2026':like);
+ // display value for =/!= labels: truncated for readability; the actual filter still uses the full value (lv)
+ const lvd="'"+(sv.length>16?sv.slice(0,16)+'\u2026':sv)+"'";const dv=isNum?lv:lvd;
+ sub.push([q+' = '+dv,()=>setFilterWhere(id,q+' = '+lv)]);sub.push([q+' != '+dv,()=>setFilterWhere(id,q+' <> '+lv)]);
+ if(isNum||isDate){sub.push('-');sub.push([q+' > '+dv,()=>setFilterWhere(id,q+' > '+lv)]);sub.push([q+' >= '+dv,()=>setFilterWhere(id,q+' >= '+lv)]);sub.push([q+' < '+dv,()=>setFilterWhere(id,q+' < '+lv)]);sub.push([q+' <= '+dv,()=>setFilterWhere(id,q+' <= '+lv)]);}
+ if(!isNum){sub.push('-');sub.push([q+" LIKE '%"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"%'")]);sub.push([q+" LIKE '"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '"+esc(like)+"%'")]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"'")]);}
+ sub.push('-');sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
+async function setFilterWhere(id,where){const t=T(id);t.filter=where;t.offset=0;await openRun(id);if(where)log('Filter: '+where);else log('Filter cleared.');}
+function updateFilterBar(id){const t=T(id);const st=$('st_'+id);if(!st)return;st.title=t.filter?('WHERE '+t.filter):'';}
+let _rf=null;
+function rowForm(id,ri){const t=T(id);_rf={id:id,ri:ri};$('rfTitle').textContent='Edit row'+(t.table?(' - '+t.table):'');const box=$('rfFields');box.innerHTML='';
+ t.cols.forEach((c,ci)=>{const key=ri+':'+ci;const cur=(t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];
+  const w=document.createElement('div');w.style.display='flex';w.style.alignItems='flex-start';w.style.gap='8px';w.style.margin='4px 0';
+  const lb=document.createElement('label');lb.textContent=c+(t.pk&&t.pk.indexOf(c)>=0?' (PK)':'');lb.style.width='170px';lb.style.flex='0 0 170px';lb.style.fontSize='12px';lb.style.textAlign='right';lb.style.paddingTop='5px';lb.style.color='var(--muted)';lb.style.overflow='hidden';lb.style.textOverflow='ellipsis';
+  const ta=document.createElement('textarea');ta.id='rf_'+ci;ta.value=(cur===null?'':cur);ta.rows=(cur!=null&&String(cur).length>60)?3:1;ta.style.flex='1';ta.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';ta.style.fontSize='12px';ta.dataset.null=(cur===null)?'1':'';
+  ta.oninput=()=>{ta.dataset.null='';};
+  const nb=document.createElement('button');nb.className='sm';nb.textContent='NULL';nb.title='Set this field to NULL';nb.onclick=()=>{ta.value='';ta.dataset.null='1';};
+  w.appendChild(lb);w.appendChild(ta);w.appendChild(nb);box.appendChild(w);});
+ show('mRowForm');}
+function rfSave(){if(!_rf)return;const t=T(_rf.id),ri=_rf.ri;t.cols.forEach((c,ci)=>{const ta=$('rf_'+ci);if(!ta)return;const v=(ta.dataset.null==='1')?null:ta.value;const orig=t.rows[ri][ci];const key=ri+':'+ci;if(v===orig){if(t.pending&&key in t.pending.upd)delete t.pending.upd[key];}else{if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){/* skip PK->null */}else if(t.pending){t.pending.upd[key]=v;}}});hide('mRowForm');renderGrid(_rf.id);_rf=null;}
+function toggleDel(id,ri){const t=T(id);if(t.pending.del.has(ri))t.pending.del.delete(ri);else t.pending.del.add(ri);renderGrid(id);}
+function deleteSel(id){const t=T(id);if(!t.pk){alert('This result is not editable (no primary key).');return;}const ids=[...(t.selected||[])];if(!ids.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}ids.forEach(ri=>t.pending.del.add(ri));renderGrid(id);log(ids.length+' row(s) marked for deletion - click Apply to commit.');}
+function addRow(id){const t=T(id);t.pending.ins.push({});renderGrid(id);}
+function delIns(id,ii){const t=T(id);t.pending.ins.splice(ii,1);renderGrid(id);}
+function editIns(td,id,ii,col){clearTimeout(clickTimer);const t=T(id);const cur=t.pending.ins[ii][col];
+ viewText('New row - '+col,(cur==null?'':cur),{onSave:v=>{t.pending.ins[ii][col]=v;renderGrid(id);},onNull:()=>{t.pending.ins[ii][col]=null;renderGrid(id);}});}
+function insCellMenu(e,id,ii,col){e.preventDefault();const t=T(id);const cur=t.pending.ins[ii][col];
+ const items=[['Copy value',()=>{navigator.clipboard.writeText(cur==null?'':String(cur));log('Copied value.');}],
+  ['Paste row into this new row',()=>pasteRowIntoIns(id,ii)],
+  ['Edit value...',()=>editIns(null,id,ii,col)],'-',
+  ['Set NULL',()=>{t.pending.ins[ii][col]=null;renderGrid(id);}],
+  ['Set empty',()=>{t.pending.ins[ii][col]='';renderGrid(id);}],'-',
+  ['Delete this new row',()=>delIns(id,ii)]];
+ menu(e.clientX,e.clientY,items);}
+function pasteRowIntoIns(id,ii){const t=T(id);const vals=window._rowClipboard;if(!vals||!vals.length){toast('Copy a row first, then right-click a new row to paste it.',true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
+ t.cols.forEach((c,ci)=>{t.pending.ins[ii][c]=vals[ci];});
+ renderGrid(id);log('Pasted copied row into new row. Review and click Apply to commit.');}
+function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]};renderGrid(id);}
+async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
+ // updates grouped by row
+ const byRow={};Object.keys(t.pending.upd).forEach(k=>{const[ri,ci]=k.split(':').map(Number);(byRow[ri]=byRow[ri]||{})[ci]=t.pending.upd[k];});
+ Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+lit(byRow[ri][ci]));
+   const wh=t.pk.map(p=>qid(p)+'='+lit(t.rows[ri][t.cols.indexOf(p)]));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
+ t.pending.del.forEach(ri=>{const wh=t.pk.map(p=>qid(p)+'='+lit(t.rows[ri][t.cols.indexOf(p)]));S.push('DELETE FROM '+tbl+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
+ t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>lit(row[c])).join(',')+');');});
+ if(!S.length)return;log('APPLY:\n'+S.join('\n'));
+ const r=await api('/api/script',{sql:'SET FOREIGN_KEY_CHECKS=0;\n'+S.join('\n')});
+ if(r.ok){log('Applied '+S.length+' change(s).');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);alert('Apply failed:\n\n'+r.error);}}
+
+async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const r=await api('/api/script',{sql:$('ed_'+id).value,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl)loadObjects(t.ddl.db);}else{st.className='status err';st.textContent=r.error;log('APPLY ERROR: '+r.error);}}
+
+function bTSV(cols,rows){return cols.join('\t')+'\n'+rows.map(r=>r.map(v=>v===null?'NULL':v).join('\t')).join('\n');}
+function bCSV(cols,rows){const q=s=>s===null?'':/[",\n]/.test(s)?'"'+String(s).replace(/"/g,'""')+'"':s;return cols.map(q).join(',')+'\n'+rows.map(r=>r.map(q).join(',')).join('\n');}
+function bMD(cols,rows){
+  const esc=s=>s===null?'':String(s).replace(/\|/g,'\\|').replace(/\n/g,' ');
+  let h='| '+cols.map(esc).join(' | ')+' |\n';
+  h+='| '+cols.map(()=>'---').join(' | ')+' |\n';
+  rows.forEach(r=>{h+='| '+r.map(esc).join(' | ')+' |\n';});
+  return h;
+}
+function selRows(id){const t=T(id);return viewIndices(id).filter(ri=>t.selected&&t.selected.has(ri)).map(ri=>t.rows[ri]);}
+function copyGrid(id){const t=T(id);if(!t.cols)return;navigator.clipboard.writeText(bTSV(t.cols,t.rows)).then(()=>log('Copied '+t.rows.length+' rows (TSV).'));}
+function tsvGrid(id){const t=T(id);if(!t.cols)return;dl(bTSV(t.cols,t.rows),'result.tsv');}
+async function copyCsv(id){const t=T(id);if(!t.cols)return;let cols=t.cols,rows=t.rows;
+ navigator.clipboard.writeText(bCSV(cols,rows)).then(()=>log('Copied '+rows.length+' rows (CSV).'));}
+function copyMd(id){const t=T(id);if(!t.cols)return;navigator.clipboard.writeText(bMD(t.cols,t.rows)).then(()=>log('Copied '+t.rows.length+' rows (Markdown).'));}
+function copyMdSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bMD(t.cols,rows)).then(()=>log('Copied '+rows.length+' selected row(s) (Markdown).'));}
+function toggleSel(id,ri,ch){const t=T(id);if(!t.selected)t.selected=new Set();if(ch)t.selected.add(ri);else t.selected.delete(ri);updateEditBar(id);}
+function selAll(id,ch){const t=T(id);if(!t.selected)t.selected=new Set();const view=viewIndices(id);view.forEach(ri=>{if(ch)t.selected.add(ri);else t.selected.delete(ri);});renderBody(id);updateEditBar(id);}
+function copySel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bTSV(t.cols,rows)).then(()=>log('Copied '+rows.length+' selected row(s) (TSV).'));}
+function copySelCsv(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bCSV(t.cols,rows)).then(()=>log('Copied '+rows.length+' selected row(s) (CSV).'));}
+function csvGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'csv');return;}dl(bCSV(t.cols,t.rows),'result.csv');}
+function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const s=t.rows.map(r=>'INSERT IGNORE INTO `table` ('+t.cols.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
+function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
+function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
+async function dl(text,name){
+ const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
+ // Tauri: native Save As + backend write
+ try{if(window.__TAURI__&&window.__TAURI__.dialog&&window.__TAURI__.dialog.save){const p=await window.__TAURI__.dialog.save({defaultPath:name,filters});if(!p)return;const r=await window.__TAURI__.core.invoke('save_text',{req:{path:p,content:text}});if(r&&r.ok===false){alert('Save failed: '+r.error);}else{log('Saved: '+p);}return;}}catch(e){toast('Save failed: '+e,true);return;}
+ // Chromium browsers (Edge/Chrome): File System Access "Save As"
+ try{if(window.showSaveFilePicker){const opts={suggestedName:name};if(ext)opts.types=[{description:ext.toUpperCase()+' file',accept:{'text/plain':['.'+ext]}}];const h=await window.showSaveFilePicker(opts);const w=await h.createWritable();await w.write(text);await w.close();log('Saved: '+name);return;}}catch(e){if(e&&e.name==='AbortError')return;}
+ // Fallback: classic download to the default folder
+ const b=new Blob([text],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();}
+
+// ---- history ----
+function hist(){try{return JSON.parse(localStorage.getItem('history')||'[]');}catch(e){return[];}}
+function addHistory(sql){sql=sql.trim();if(!sql)return;let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}
+function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="muted">No history yet.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='item';d.style.borderBottom='1px solid var(--bd2)';d.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';d.style.whiteSpace='pre-wrap';d.textContent=sql.slice(0,300);d.onclick=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};box.appendChild(d);});show('mHist');}
+async function clearHistory(){if(await ask('Clear query history?')){localStorage.removeItem('history');openHistory();}}
+let _libCache=[];
+function libAll(){return _libCache.slice();}
+// --- Query library: saved queries, kept on the server so they survive restarts.
+async function libLoad(){try{const r=await api('/api/lib-list');_libCache=(r.ok&&r.items)?r.items:[];}catch(e){_libCache=[];}}
+function libExport(){const a=libAll();if(!a.length){toast('The library is empty - nothing to export.',true);return;}dl(JSON.stringify(a,null,2),'query-library.json');log('Exported '+a.length+' quer'+(a.length===1?'y':'ies')+' from the library.');}
+function libImportFile(e){const f=e.target.files&&e.target.files[0];if(!f)return;const r=new FileReader();
+ r.onload=()=>{try{const arr=JSON.parse(r.result);if(!Array.isArray(arr))throw 0;const map={};libAll().forEach(x=>map[x.name]=x);let n=0;
+  arr.forEach(x=>{if(x&&x.name&&typeof x.sql==='string'){map[x.name]={name:x.name,sql:x.sql,schema:x.schema||'',ts:x.ts||Date.now()};n++;}});
+  const merged=Object.keys(map).map(k=>map[k]).sort((a,b)=>(b.ts||0)-(a.ts||0));api('/api/lib-replace',{items:merged}).then(()=>libLoad()).then(()=>libRender());
+  log('Imported '+n+' quer'+(n===1?'y':'ies')+' into the library.');}
+  catch(err){alert('That file is not a valid query-library JSON export.');}
+  e.target.value='';};
+ r.readAsText(f);}
+async function openLibrary(){$('libName').value='';$('libSearch').value='';show('mLib');await libLoad();libRender();}
+async function libEdit(name){const cur=libAll().find(x=>x.name===name);if(!cur)return;const res=await inputBox({title:'Edit saved query',okText:'Save',fields:[{key:'name',label:'Name',value:cur.name},{key:'sql',label:'SQL',type:'textarea',value:cur.sql}]});if(!res||!res.name.trim())return;const nn=res.name.trim();if(nn!==name){await api('/api/lib-delete',{name:name});}await api('/api/lib-save',{name:nn,sql:res.sql,schema:cur.schema||'',ts:Date.now()});await libLoad();libRender();log('Updated saved query "'+nn+'".');}
+async function libClearAll(){const a=libAll();if(!a.length){toast('The library is already empty.',true);return;}if(await ask('Delete ALL '+a.length+' saved quer'+(a.length===1?'y':'ies')+'? This cannot be undone.')){await api('/api/lib-clear');await libLoad();libRender();log('Cleared the query library.');}}
+async function libSaveCurrent(){const name=$('libName').value.trim();if(!name){toast('Enter a name for the query.',true);return;}
+ const t=activeTab?T(activeTab):null;const sql=t?$('ed_'+t.id).value:'';if(!sql.trim()){toast('The current query is empty.',true);return;}
+ const r=await api('/api/lib-save',{name:name,sql:sql,schema:(t&&t.db)||curSchema||'',ts:Date.now()});if(!r.ok){toast(r.error||'Save failed',true);return;}await libLoad();$('libName').value='';libRender();log('Saved query "'+name+'" to library.');}
+function libRender(){const box=$('libList');const q=($('libSearch').value||'').toLowerCase();
+ const a=libAll().filter(x=>!q||x.name.toLowerCase().includes(q)||(x.sql||'').toLowerCase().includes(q));
+ box.innerHTML='';if(!a.length){const e=document.createElement('div');e.className='muted';e.style.padding='10px';e.textContent=q?'No saved queries match.':'No saved queries yet. Type a name above and click Save current query.';box.appendChild(e);return;}
+ a.forEach(x=>{const d=document.createElement('div');d.style.borderBottom='1px solid var(--bd2)';d.style.padding='6px 10px';
+  const head=document.createElement('div');head.style.display='flex';head.style.justifyContent='space-between';head.style.alignItems='center';head.style.gap='8px';
+  const nm=document.createElement('div');const b=document.createElement('b');b.textContent=x.name;nm.appendChild(b);if(x.schema){const sp=document.createElement('span');sp.className='muted';sp.textContent=' ('+x.schema+')';nm.appendChild(sp);}
+  const btns=document.createElement('div');
+  const op=document.createElement('button');op.className='sm';op.textContent='Open';op.onclick=()=>{hide('mLib');openTab(x.name,x.sql,x.schema||curSchema,false,null);};
+  const ed=document.createElement('button');ed.className='sm';ed.textContent='Edit';ed.style.marginLeft='6px';ed.onclick=()=>libEdit(x.name);
+  const dl=document.createElement('button');dl.className='sm warn';dl.textContent='Delete';dl.style.marginLeft='6px';dl.onclick=async()=>{if(await ask('Delete saved query "'+x.name+'"?')){await api('/api/lib-delete',{name:x.name});await libLoad();libRender();}};
+  btns.appendChild(op);btns.appendChild(ed);btns.appendChild(dl);head.appendChild(nm);head.appendChild(btns);
+  const pre=document.createElement('div');pre.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';pre.style.fontSize='11px';pre.style.color='var(--muted)';pre.style.whiteSpace='pre-wrap';pre.style.marginTop='3px';pre.textContent=(x.sql||'').slice(0,200);
+  d.appendChild(head);d.appendChild(pre);box.appendChild(d);});}
+
+// ---- users ----
+async function openUsers(){const r=await api('/api/query',{sql:"SELECT User,Host FROM mysql.user ORDER BY User,Host"});const sel=$('userSel');sel.innerHTML='';$('grantsBox').textContent='';window._selUser='';
+ if(!r.ok){toast(r.error,true);return;}r.rows.forEach(u=>{const d=document.createElement('div');d.className='uitem';d.textContent=u[0]+'@'+u[1];d.dataset.v=u[0]+'\x01'+u[1];d.onclick=()=>{[...sel.children].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');window._selUser=d.dataset.v;showGrants();};sel.appendChild(d);});show('mUsers');}
+async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+lit(u)+"@"+lit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
+async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+lit(res.pw),'Created user'))openUsers();}
+async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Revoke privileges',okText:'Revoke',fields:[{key:'g',label:'Privileges to revoke (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
+async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+lit(u)+"@"+lit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
+async function changePassword(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const parts=v.split('\x01');const u=parts[0],h=parts[1];
+ const res=await inputBox({title:'Change password for '+u+'@'+h,okText:'Change',fields:[{key:'pw',label:'New password',type:'password',value:''},{key:'pw2',label:'Confirm new password',type:'password',value:''}]});
+ if(!res)return;if(!res.pw){toast('Password cannot be empty.',true);return;}if(res.pw!==res.pw2){toast('Passwords do not match.',true);return;}
+ const uu=u.replace(/'/g,"''"),hh=h.replace(/'/g,"''"),pp=res.pw.replace(/'/g,"''");
+ const sql="ALTER USER '"+uu+"'@'"+hh+"' IDENTIFIED BY '"+pp+"';";
+ const r=await api('/api/exec',{sql:sql});
+ if(r.ok){log('Password changed for '+u+'@'+h+'.');}else{alert('Failed: '+(r.error||'unknown'));}}
+async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+lit(u)+"@"+lit(h),'Dropped user'))openUsers();}
+async function grantUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Grant privileges',okText:'Grant',fields:[{key:'g',label:'Privileges (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("GRANT "+res.g.trim()+" TO "+lit(u)+"@"+lit(h),'Granted')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
+
+// ---- table designer ----
+const DTYPES=['INT','BIGINT','TINYINT','SMALLINT','MEDIUMINT','DECIMAL','FLOAT','DOUBLE','BIT','BOOLEAN','CHAR','VARCHAR','TEXT','MEDIUMTEXT','LONGTEXT','DATE','DATETIME','TIMESTAMP','TIME','YEAR','JSON','BLOB','LONGBLOB','ENUM','BINARY','VARBINARY'];
+let dOrig=null,dEdited=false;
+async function designTable(name,db){dEdited=false;db=db||curSchema||'';$('dSchema').value=db;$('dName').value=name||'';$('dCols').innerHTML='';$('dLog').textContent='';dOrig=null;
+ if(name){$('dTitle').textContent='Alter table';$('dMode').textContent='(existing - generates ALTER)';
+   const r=await api('/api/query',{sql:"SELECT COLUMN_NAME,DATA_TYPE,CHARACTER_MAXIMUM_LENGTH,NUMERIC_PRECISION,NUMERIC_SCALE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,COLUMN_KEY,COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});
+   dOrig=[];if(r.ok)r.rows.forEach(c=>{const col={name:c[0],type:c[1].toUpperCase(),len:(c[2]||c[3]||''),nn:c[5]==='NO',def:c[6],ai:/auto_increment/i.test(c[7]||''),pk:c[8]==='PRI',comment:c[9]||''};dOrig.push(JSON.parse(JSON.stringify(col)));dAddCol(col);});
+ } else {$('dTitle').textContent='Create table';$('dMode').textContent='(new - generates CREATE)';dAddCol({name:'id',type:'INT',len:'',nn:true,ai:true,pk:true,def:null,comment:''});dAddCol({name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''});}
+ dGen();show('mDesign');}
+function dAddCol(c){c=c||{name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''};const tr=document.createElement('tr');
+ tr.innerHTML='<td><input class="dn" value="'+esc(c.name)+'"></td><td><select class="dt">'+DTYPES.map(t=>'<option'+(t===c.type?' selected':'')+'>'+t+'</option>').join('')+'</select></td>'+
+  '<td><input class="dl" value="'+esc(c.len==null?'':c.len)+'" style="width:70px"></td><td><input type="checkbox" class="dnn"'+(c.nn?' checked':'')+'></td>'+
+  '<td><input type="checkbox" class="dai"'+(c.ai?' checked':'')+'></td><td><input type="checkbox" class="dpk"'+(c.pk?' checked':'')+'></td>'+
+  '<td><input class="dd" value="'+esc(c.def==null?'':c.def)+'" style="width:90px"></td><td><input class="dc" value="'+esc(c.comment||'')+'"></td>'+
+  '<td><button class="sm" onclick="this.closest(\'tr\').remove();dGen()">x</button></td>';
+ $('dCols').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
+function dMark(){dEdited=true;$('dEditNote').textContent='\u270E manually edited - auto-update paused; use Regenerate to rebuild';}
+function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.trim(),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value.trim()})).filter(c=>c.name);}
+function colDef(c){let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
+ if(c.def!==''&&c.def!=null){s+=' DEFAULT '+(/^(CURRENT_TIMESTAMP|NULL|TRUE|FALSE|\d+(\.\d+)?)$/i.test(c.def)?c.def:lit(c.def));}
+ if(c.comment)s+=' COMMENT '+lit(c.comment);return s;}
+function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.trim(),name=$('dName').value.trim();const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
+ if(!name){$('dSql').value='-- enter a table name';return;}const tbl=qid(db)+'.'+qid(name);
+ if(!dOrig){let s='CREATE TABLE '+tbl+' (\n  '+cols.map(colDef).join(',\n  ');if(pk.length)s+=',\n  PRIMARY KEY ('+pk.join(',')+')';s+='\n);';$('dSql').value=s;dEdited=false;$('dEditNote').textContent='';return;}
+ // ALTER diff by name
+ const oNames=dOrig.map(c=>c.name);const nNames=cols.map(c=>c.name);const alt=[];
+ cols.forEach(c=>{const o=dOrig.find(x=>x.name===c.name);if(!o){alt.push('ADD COLUMN '+colDef(c));}else if(JSON.stringify({t:o.type,l:''+o.len,nn:o.nn,ai:o.ai,d:o.def,cm:o.comment})!==JSON.stringify({t:c.type,l:''+c.len,nn:c.nn,ai:c.ai,d:(c.def===''?null:c.def),cm:c.comment})){alt.push('MODIFY COLUMN '+colDef(c));}});
+ oNames.filter(n=>!nNames.includes(n)).forEach(n=>alt.push('DROP COLUMN '+qid(n)));
+ const oldPk=dOrig.filter(c=>c.pk).map(c=>c.name).join(','),newPk=cols.filter(c=>c.pk).map(c=>c.name).join(',');
+ if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');if(newPk)alt.push('ADD PRIMARY KEY ('+pk.join(',')+')');}
+ $('dSql').value=alt.length?('ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';'):'-- no changes detected';dEdited=false;$('dEditNote').textContent='';}
+async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});if(r.ok){$('dLog').textContent='Applied OK.';log('DESIGN OK');if(curSchema)loadObjects(curSchema);}else{$('dLog').textContent=r.error;log('DESIGN error: '+r.error);}}
+
+// ---- export/import ----
+const EXPOPTS=[
+ ['hexblob','hex-blob',1,'Dump binary/BLOB columns as hexadecimal (e.g. abc becomes 0x616263).','Content'],
+ ['tzutc','tz-utc (UTC times)',1,'Add SET TIME_ZONE=UTC so TIMESTAMP values restore the same in any timezone.','Content'],
+ ['routines','routines (procs & funcs)',1,'Include stored procedures and functions in the dump.','Content'],
+ ['triggers','triggers',1,'Include table triggers in the dump.','Content'],
+ ['events','events (scheduler)',1,'Include scheduled events in the dump.','Content'],
+ ['singletx','single-transaction',1,'Take a consistent snapshot without locking tables (recommended for InnoDB).','Performance'],
+ ['adddropdb','add-drop-database',1,'Write DROP DATABASE before CREATE so a re-import replaces it cleanly.','Content'],
+ ['adddroptb','add-drop-table',1,'Write DROP TABLE before each CREATE so a re-import replaces it cleanly.','Content'],
+ ['createdb','include CREATE DATABASE',1,'Include CREATE DATABASE and USE so the dump can rebuild the schema anywhere.','Content'],
+ ['extinsert','extended-insert (compact)',1,'Pack many rows into each INSERT: smaller files, much faster import.','Performance'],
+ ['complete','complete-insert',0,'Write column names in every INSERT: safer if column order differs, but larger files.','Compatibility'],
+ ['diskeys','disable-keys',1,'Disable indexes during load and rebuild them after: faster import.','Performance'],
+ ['notablespaces','no-tablespaces',1,'Skip TABLESPACE clauses: avoids errors when the target server lacks them.','Compatibility'],
+ ['quick','quick',1,'Stream rows instead of buffering the whole table: needed for very large tables.','Performance'],
+ ['compress','compress',0,'Compress the client/server connection during the dump (more CPU, less network).','Performance'],
+ ['gtid','set-gtid-purged=OFF',0,'Do not write GTID replication info: avoids import errors on non-GTID servers.','Compatibility'],
+ ['colstats','column-statistics=0',0,'Disable column statistics: fixes an error when a MySQL 8 client dumps MariaDB.','Compatibility']
+];
+async function openExport(preselect){const r=await api('/api/schemas');const box=$('expDbs');box.innerHTML='';if(r.ok)r.schemas.forEach(s=>{const safe=s.name.replace(/[^A-Za-z0-9]/g,'_');const dbAttr=esc(s.name).replace(/\x27/g,'\\x27');box.innerHTML+='<div class="expdbrow"><span class="exptoggle" id="expx_'+safe+'" onclick="expTables(\''+dbAttr+'\',\''+safe+'\')" title="Show tables to exclude">\u25B8</span><label class="ck" style="display:inline-flex"><input type="checkbox" class="expdb" value="'+esc(s.name)+'" onchange="expDbToggle(\''+safe+'\',this.checked)"> '+esc(s.name)+'</label><div class="exptbls" id="expt_'+safe+'" style="display:none"></div></div>';});const ob=$('expOpts');ob.innerHTML='';
+const grouped={};EXPOPTS.forEach(o=>{const g=o[4]||'Other';(grouped[g]=grouped[g]||[]).push(o);});
+['Content','Performance','Compatibility'].forEach(g=>{
+  if(!grouped[g])return;
+  ob.innerHTML+='<div style="grid-column:1/-1;font-weight:600;font-size:11px;color:var(--muted);margin-top:6px">'+g+'</div>';
+  grouped[g].forEach(([k,l,d,t])=>{ob.innerHTML+='<label class="ck" title="'+esc(t||'')+'"><input type="checkbox" id="eo_'+k+'" '+(d?'checked':'')+'> '+l+'</label>';});
+});
+if(preselect&&preselect.db){
+  document.querySelectorAll('.expdb').forEach(cb=>{cb.checked=(cb.value===preselect.db);});
+  if(preselect.table){
+    const safe=preselect.db.replace(/[^A-Za-z0-9]/g,'_');
+    await expTables(preselect.db,safe);
+    document.querySelectorAll('#expt_'+safe+' .exptbl').forEach(cb=>{cb.checked=(cb.value===preselect.table);});
+    if($('eo_routines'))$('eo_routines').checked=false;
+    if($('eo_events'))$('eo_events').checked=false;
+  }
+}
+show('mExport');}
+function expAll(v){[...document.querySelectorAll('.expdb')].forEach(c=>c.checked=v);}
+async function expTables(db,safe){const c=$('expt_'+safe);if(!c)return;const cx=$('expx_'+safe);if(c.style.display==='none'){c.style.display='block';if(cx)cx.textContent='\u25BE';if(!c.dataset.loaded){c.innerHTML='<span class="muted" style="font-size:11px">Loading\u2026</span>';const q=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit(db)+' ORDER BY TABLE_NAME'});if(!q.ok){c.innerHTML='<span class="muted" style="font-size:11px">'+esc(q.error||'Could not list tables')+'</span>';return;}if(!q.rows.length){c.innerHTML='<span class="muted" style="font-size:11px">(no tables)</span>';c.dataset.loaded='1';return;}const dbCk=document.querySelector('.expdb[value="'+db.replace(/"/g,'&quot;')+'"]');const on=dbCk?dbCk.checked:true;let h='<div class="muted" style="font-size:11px;margin:1px 0 3px">Untick a table to exclude it from the export:</div>';q.rows.forEach(r=>{const tn=r[0];h+='<label class="ck" style="font-size:12px"><input type="checkbox" class="exptbl" data-db="'+esc(db)+'" value="'+esc(tn)+'" '+(on?'checked':'')+'> '+esc(tn)+'</label>';});c.innerHTML=h;c.dataset.loaded='1';}}else{c.style.display='none';if(cx)cx.textContent='\u25B8';}}
+function expDbToggle(safe,on){document.querySelectorAll('#expt_'+safe+' .exptbl').forEach(c=>{c.checked=on;});}
+async function runExport(){const dbs=[...document.querySelectorAll('.expdb:checked')].map(c=>c.value);
+const tables=[...document.querySelectorAll('.exptbl:checked')].map(c=>c.dataset.db+'.'+c.value);
+
+// Allow either databases OR tables to be selected
+if(!dbs.length && !tables.length){
+    toast('Select at least one database or table.',true);
+    return;
+}
+
+// If no databases selected but tables are selected, extract the unique databases from tables
+if(!dbs.length && tables.length){
+    // Extract unique database names from the selected tables
+    const tableDbs = [...new Set(tables.map(t => t.split('.')[0]))];
+    dbs.push(...tableDbs);
+}const o={charset:$('expCharset').value};EXPOPTS.forEach(([k])=>o[k]=$('eo_'+k).checked);o.maxpacket=$('expMaxPacket').value.trim();let mode='table';if($('expPer').checked)mode='db';else if($('expSingle').checked)mode='single';const excludes=[...document.querySelectorAll('.exptbl:not(:checked)')].filter(c=>dbs.includes(c.dataset.db)).map(c=>c.dataset.db+'.'+c.value);
+ if(!$('expStamp').checked){
+   const chk=await api('/api/browse',{path:$('expFolder').value,filter:'*.sql',dirsOnly:false});
+   if(chk.ok && chk.files && chk.files.length>0){
+     if(!(await ask('The export folder already contains '+chk.files.length+' .sql file(s), and "timestamp" is unchecked. Matching filenames will be overwritten. Continue?')))return;
+   }
+ }
+ $('expLog').textContent='';
+ let label='Exporting '+dbs.length+' database'+(dbs.length===1?'':'s');
+ if(mode==='table'){try{const cq=await api('/api/query',{sql:"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA IN ("+dbs.map(lit).join(',')+")"});if(cq.ok&&cq.rows.length){label+=' (~'+fmtCount(cq.rows[0][0])+' tables)';}}catch(e){}}
+ const jobId=(crypto.randomUUID?crypto.randomUUID():('j'+Date.now()+Math.random()));
+ progStart('exp',label,jobId);
+ const r=await api('/api/export',{dbs,options:o,folder:$('expFolder').value,mode:mode,stamp:$('expStamp').checked,excludes:excludes,jobId:jobId});
+ progStop('exp');
+ if(r.cancelled){log('Export cancelled.');}
+ if(!r.ok){$('expLog').textContent=r.error;log('Export error: '+r.error);return;}
+ $('expLog').textContent=r.log.join('\n');r.log.forEach(l=>log('EXPORT: '+l));}
+let _cmpTables=null;
+async function cmpFillConnSelect(sel){sel.innerHTML='';const r=await api('/api/conn-list');if(r.ok)r.items.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name;sel.appendChild(o);});}
+function cmpResetTablePicker(){const box=$('cmpTablesBox');if(box){box.innerHTML='';box.style.display='none';}}
+function cmpSrcDbChanged(){cmpResetTablePicker();const srcVal=$('cmpSrcDb').value;const tgtSel=$('cmpTgtDb');if(srcVal&&tgtSel){const has=[...tgtSel.options].some(o=>o.value===srcVal);if(has)tgtSel.value=srcVal;}}
+async function cmpToggleTablePicker(){const box=$('cmpTablesBox');
+ if(box.style.display==='none'){
+   const sc=$('cmpSrcConn').value,tc=$('cmpTgtConn').value,sd=$('cmpSrcDb').value,td=$('cmpTgtDb').value;
+   if(!sc||!tc||!sd||!td){toast('Pick a connection and database on both sides first.',true);return;}
+   box.style.display='block';box.innerHTML='<div class="muted">Loading tables\u2026</div>';
+   const r=await api('/api/compare-tables',{sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td});
+   if(!r.ok){box.innerHTML='';toast(r.error||'Could not list tables',true);return;}
+   if(!r.tables.length){box.innerHTML='<div class="muted">No tables found on either side.</div>';return;}
+   let h='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><a href="#" onclick="cmpSetAllTables(true);return false" style="font-size:11px;color:var(--accent)">All</a> / <a href="#" onclick="cmpSetAllTables(false);return false" style="font-size:11px;color:var(--accent)">None</a><input id="cmpTableSearch" type="text" placeholder="filter tables\u2026" oninput="cmpFilterTablePicker()" style="flex:1;font-size:11px;margin-left:6px"></div>';
+   h+='<div id="cmpTableList">';
+   r.tables.forEach(tn=>{h+='<label class="ck cmptblrow" data-name="'+esc(tn.toLowerCase())+'" style="font-size:12px;display:block"><input type="checkbox" class="cmptbl" value="'+esc(tn)+'" checked> '+esc(tn)+'</label>';});
+   h+='</div>';
+   box.innerHTML=h;
+ } else { box.style.display='none'; }}
+function cmpSetAllTables(on){document.querySelectorAll('.cmptbl').forEach(c=>c.checked=on);}
+function cmpFilterTablePicker(){const q=($('cmpTableSearch').value||'').toLowerCase();document.querySelectorAll('.cmptblrow').forEach(el=>{el.style.display=(!q||el.dataset.name.includes(q))?'block':'none';});}
+async function cmpLoadDbs(side){const connSel=$(side==='src'?'cmpSrcConn':'cmpTgtConn');const dbSel=$(side==='src'?'cmpSrcDb':'cmpTgtDb');dbSel.innerHTML='<option value="">(loading\u2026)</option>';cmpResetTablePicker();
+ if(!connSel.value){dbSel.innerHTML='';return;}
+ const r=await api('/api/compare-dbs',{connName:connSel.value});
+ if(!r.ok){dbSel.innerHTML='<option value="">(could not load)</option>';toast(r.error||'Could not list databases',true);return;}
+ dbSel.innerHTML='';
+ r.databases.forEach(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;dbSel.appendChild(o);});
+ // When switching the TARGET connection to a different instance, if the SOURCE database is
+ // already picked and a database with that same name exists here too, preselect it - saves
+ // having to manually re-pick the obvious match every time you compare against a new instance.
+ if(side==='tgt'){
+   const srcDbVal=$('cmpSrcDb')?$('cmpSrcDb').value:'';
+   if(srcDbVal&&r.databases.includes(srcDbVal))dbSel.value=srcDbVal;
+   $('cmpRoNote').style.display=r.readonly?'inline':'none';
+ }}
+async function openCompare(){$('cmpResults').innerHTML='';$('cmpLog').textContent='';$('cmpSummary').textContent='';_cmpTables=null;cmpResetTablePicker();
+ await cmpFillConnSelect($('cmpSrcConn'));await cmpFillConnSelect($('cmpTgtConn'));
+ if(window._primaryConn){$('cmpSrcConn').value=window._primaryConn;}
+ await cmpLoadDbs('src');await cmpLoadDbs('tgt');
+ show('mCompare');}
+function cmpBadge(status){const map={missing_target:['missing on target','#4a2626','#f0997b'],missing_source:['missing on source','#4a2626','#f0997b'],diff:['differs','#4a4526','#facb75'],same:['structure identical','#1d3a2a','#5dcaa5']};const m=map[status]||['?','#333','#ccc'];return '<span style="background:'+m[1]+';color:'+m[2]+';border-radius:10px;padding:2px 8px;font-size:11px;white-space:nowrap">'+m[0]+'</span>';}
+function cmpRenderResults(){const box=$('cmpResults');const sr=$('cmpResultsSearchRow');if(!_cmpTables||!_cmpTables.length){box.innerHTML='<div class="muted">No tables found on either side.</div>';if(sr)sr.style.display='none';return;}
+ if(sr)sr.style.display=_cmpTables.length>8?'block':'none';
+ let h='<table style="width:100%;border-collapse:collapse;font-size:12px"><tr class="muted" style="text-align:left;font-size:11px"><th style="padding:4px 6px"></th><th style="padding:4px 6px">Table</th><th style="padding:4px 6px">Status</th></tr>';
+ _cmpTables.forEach((t,ti)=>{const hasSql=t.sql&&t.sql.length;
+  h+='<tr class="cmpresultrow" data-name="'+esc(t.name.toLowerCase())+'" style="border-top:1px solid var(--bd2)"><td style="padding:6px">'+(hasSql?('<input type="checkbox" '+(t.sql.some(s=>s.checked)?'checked':'')+' onclick="cmpToggleAllForTable('+ti+',this.checked)">'):'')+'</td><td style="padding:6px">'+esc(t.name)+(hasSql?' <a href="#" onclick="cmpToggleDetail('+ti+');return false" style="font-size:11px;color:var(--accent);margin-left:6px">details</a>':'')+' <a href="#" onclick="cmpCompareRows('+ti+');return false" style="font-size:11px;color:var(--accent);margin-left:6px">rows\u2026</a></td><td style="padding:6px">'+cmpBadge(t.status)+'</td></tr>';
+  h+='<tr id="cmpDetail_'+ti+'" class="cmpresultrow" data-name="'+esc(t.name.toLowerCase())+'" style="display:none"><td colspan="3" style="padding:0 6px 8px 20px">';
+  t.sql.forEach((st,si)=>{h+='<div style="font-family:\'Cascadia Code\',Consolas,monospace;font-size:11px;margin:2px 0"><label><input type="checkbox" '+(st.checked?'checked':'')+' onclick="_cmpTables['+ti+'].sql['+si+'].checked=this.checked;cmpUpdateSummary()"> '+esc(st.stmt)+'</label></div>';});
+  h+='</td></tr>';});
+ h+='</table>';box.innerHTML=h;cmpUpdateSummary();cmpFilterResults();}
+function cmpFilterResults(){const q=($('cmpResultSearch').value||'').toLowerCase();
+ document.querySelectorAll('#cmpResults tr.cmpresultrow').forEach(el=>{
+   const match=!q||el.dataset.name.includes(q);
+   // a detail row (id starts with cmpDetail_) stays hidden unless the user has it expanded AND it matches
+   if(el.id&&el.id.indexOf('cmpDetail_')===0){ el.style.display=(match&&el.dataset.expanded==='1')?'table-row':'none'; }
+   else { el.style.display=match?'table-row':'none'; }
+ });}
+function cmpToggleDetail(ti){const el=$('cmpDetail_'+ti);if(el){const show=el.style.display==='none';el.style.display=show?'table-row':'none';el.dataset.expanded=show?'1':'0';}}
+function cmpToggleAllForTable(ti,on){_cmpTables[ti].sql.forEach(s=>s.checked=on);cmpRenderResults();const el=$('cmpDetail_'+ti);if(el){el.style.display='table-row';el.dataset.expanded='1';}}
+function cmpUpdateSummary(){if(!_cmpTables){$('cmpSummary').textContent='';return;}let n=0;_cmpTables.forEach(t=>t.sql.forEach(s=>{if(s.checked)n++;}));$('cmpSummary').textContent=n+' change(s) selected \u2022 SQL preview shown before apply';}
+let _cmpRequestId=null;
+let _cmpAbortCtrl=null;
+function _cmpNewRequestId(){return 'cmp'+Date.now()+Math.random().toString(36).slice(2);}
+async function cmpCancelCurrent(){
+ // Mirrors cancelQuery(): abort the CLIENT-side fetch immediately (this is what actually clears
+ // the loading indicator right away, regardless of server timing), and separately ask the
+ // server to kill whatever's actually running under this id.
+ if(_cmpAbortCtrl){try{_cmpAbortCtrl.abort();}catch(e){}}
+ if(!_cmpRequestId)return;
+ try{await api('/api/compare-cancel',{requestId:_cmpRequestId});}catch(e){}
+}
+async function cmpCloseAndCancel(){await cmpCancelCurrent();hide('mCompare');}
+async function runCompare(){
+ if(_cmpRequestId){toast('A comparison is already running - wait for it to finish or click Cancel first.',true);return;}
+ const sc=$('cmpSrcConn').value,tc=$('cmpTgtConn').value,sd=$('cmpSrcDb').value,td=$('cmpTgtDb').value;
+ if(!sc||!tc||!sd||!td){toast('Pick a connection and database on both sides.',true);return;}
+ if(sc===tc&&sd===td){if(!(await ask('Source and target are the SAME connection and database ('+sc+' / '+sd+').\n\nComparing them will always show no differences. Continue anyway?')))return;}
+ const rid=_cmpNewRequestId();_cmpRequestId=rid;_cmpAbortCtrl=new AbortController();
+ $('cmpResults').innerHTML='<div class="muted">Comparing\u2026 <a href="#" onclick="cmpCancelCurrent();return false" style="color:var(--accent)">Cancel</a></div>';$('cmpLog').textContent='';
+ const payload={sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,requestId:rid};
+ const tblEls=document.querySelectorAll('.cmptbl');
+ if(tblEls.length){payload.tables=[...tblEls].filter(c=>c.checked).map(c=>c.value);}
+ const r=await api('/api/compare-schemas',payload,_cmpAbortCtrl.signal);
+ _cmpRequestId=null;_cmpAbortCtrl=null;
+ if(r.aborted){$('cmpResults').innerHTML='<div class="muted">Comparison cancelled. <a href="#" onclick="runCompare();return false" style="color:var(--accent)">Retry</a></div>';return;}
+ if(!r.ok){$('cmpResults').innerHTML='<div class="muted">'+esc(r.error||'Compare failed')+' <a href="#" onclick="runCompare();return false" style="color:var(--accent)">Retry</a></div>';toast(r.error||'Compare failed',true);return;}
+ _cmpTables=r.tables;$('cmpRoNote').style.display=r.targetReadonly?'inline':'none';const _sb=$('cmpResultSearch');if(_sb)_sb.value='';cmpRenderResults();
+ if(r.cancelled)toast('Comparison cancelled - showing '+_cmpTables.length+' table(s) checked before you stopped it.',true);}
+function cmpSelectedStatements(){const out=[];if(_cmpTables)_cmpTables.forEach(t=>t.sql.forEach(s=>{if(s.checked)out.push(s.stmt);}));return out;}
+function previewCompareSql(){const stmts=cmpSelectedStatements();if(!stmts.length){toast('No changes selected.',true);return;}viewText('Preview - '+stmts.length+' statement(s)',stmts.join('\n\n'),{readonly:true});}
+async function applyCompare(){const stmts=cmpSelectedStatements();if(!stmts.length){toast('No changes selected.',true);return;}
+ if(!(await ask('Run '+stmts.length+' statement(s) against the TARGET database ('+$('cmpTgtDb').value+')?\n\nThis cannot be undone. Use Preview SQL first if you have not already.')))return;
+ $('cmpLog').textContent='Applying\u2026';
+ const r=await api('/api/compare-apply',{targetConnName:$('cmpTgtConn').value,targetDb:$('cmpTgtDb').value,statements:stmts});
+ if(!r.ok){$('cmpLog').textContent='';toast(r.error||'Apply failed',true);return;}
+ $('cmpLog').textContent=r.log.join('\n');
+ log('Compare: applied '+stmts.length+' statement(s) to '+$('cmpTgtConn').value+'.');
+ await runCompare();}
+let _cmprState=null;
+let _cmprDiffState=null;
+let _cmprRequestId=null;
+let _cmprAbortCtrl=null;
+function _cmpFindTableIndex(name){return _cmpTables?_cmpTables.findIndex(t=>t.name===name):-1;}
+async function cmprCancelCurrent(){
+ // Mirrors cancelQuery(): abort the CLIENT-side fetch immediately (clears the loading indicator
+ // right away, regardless of server timing), and separately ask the server to kill whatever's
+ // actually running under this id.
+ if(_cmprAbortCtrl){try{_cmprAbortCtrl.abort();}catch(e){}}
+ if(!_cmprRequestId)return;
+ try{await api('/api/compare-cancel',{requestId:_cmprRequestId});}catch(e){}
+}
+async function cmprCloseAndCancel(){await cmprCancelCurrent();hide('mCompareRows');}
+async function cmpCompareRows(ti){
+ if(_cmprRequestId){toast('A row comparison is already running - wait for it to finish or click Cancel first.',true);return;}
+ const t=_cmpTables[ti];
+ const sc=$('cmpSrcConn').value,tc=$('cmpTgtConn').value,sd=$('cmpSrcDb').value,td=$('cmpTgtDb').value;
+ if(sc===tc&&sd===td){if(!(await ask('Source and target are the SAME connection and database ('+sc+' / '+sd+').\n\nComparing them will always show no differences. Continue anyway?')))return;}
+ $('cmprTitle').textContent='Row comparison - '+t.name;
+ $('cmprNote').innerHTML='Comparing\u2026 <a href="#" onclick="cmprCancelCurrent();return false" style="color:var(--accent)">Cancel</a>';$('cmprGrid').innerHTML='';$('cmprSummary').textContent='';$('cmprDiffNote').textContent='';$('cmprDiffGrid').innerHTML='';$('cmprDiffSummary').textContent='';$('cmprLog').textContent='';$('cmprRoNote').style.display='none';$('cmprDiffRoNote').style.display='none';
+ _cmprState=null;_cmprDiffState=null;
+ show('mCompareRows');
+ const rid1=_cmpNewRequestId();_cmprRequestId=rid1;_cmprAbortCtrl=new AbortController();
+ const r=await api('/api/compare-rows',{sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,table:t.name,requestId:rid1},_cmprAbortCtrl.signal);
+ _cmprRequestId=null;_cmprAbortCtrl=null;
+ if(r.aborted){$('cmprNote').innerHTML='Cancelled. <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a>';return;}
+ if(!r.ok){$('cmprNote').textContent='';$('cmprGrid').innerHTML='<div class="muted" style="padding:8px">'+esc(r.error||'Could not compare rows.')+' <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a></div>';return;}
+ _cmprState={table:t.name,pkCols:r.pkCols,columns:r.columns,rows:r.rows.map(row=>({data:row,checked:true})),sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,missingTotal:r.missingTotal,truncated:r.truncated,allMissingPks:r.allMissingPks||[]};
+ var _cmprCancelNote1=r.cancelled?' (cancelled - only some tables/rows were checked before you stopped it)':'';
+ $('cmprNote').innerHTML=r.missingTotal+' row(s) missing on target'+(r.truncated?(' (showing first '+r.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+r.missingTotal+' without reviewing them</a>)'):'')+_cmprCancelNote1+'. Rows are inserted with the SAME '+r.pkCols.join('/')+ ' value(s) as the source (insert-only - existing target rows are never changed).';
+ $('cmprRoNote').style.display=r.targetReadonly?'inline':'none';
+ cmprRender();
+
+ $('cmprDiffNote').innerHTML='Comparing content\u2026 <a href="#" onclick="cmprCancelCurrent();return false" style="color:var(--accent)">Cancel</a>';
+ const rid2=_cmpNewRequestId();_cmprRequestId=rid2;_cmprAbortCtrl=new AbortController();
+ const rd=await api('/api/compare-rows-diff',{sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,table:t.name,requestId:rid2},_cmprAbortCtrl.signal);
+ _cmprRequestId=null;_cmprAbortCtrl=null;
+ if(rd.aborted){$('cmprDiffNote').innerHTML='Cancelled. <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a>';return;}
+ if(!rd.ok){$('cmprDiffNote').innerHTML=esc(rd.error||'Could not compare row content.')+' <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a>';return;}
+ _cmprDiffState={table:t.name,pkCols:rd.pkCols,fkCols:rd.fkCols||[],targetConnName:tc,targetDb:td,rows:rd.diffs.map(d=>({pk:d.pk,colDiffs:d.colDiffs,checked:true}))};
+ $('cmprDiffRoNote').style.display=rd.targetReadonly?'inline':'none';
+ var _cmprTruncMsg = rd.truncated
+  ? ('. IMPORTANT: only the first '+rd.comparedCount+' matching rows were checked - there are more, and real differences outside this batch will NOT show here. Narrow down to fewer tables/rows for a complete check.')
+  : '.';
+ var _cmprCancelNote2=rd.cancelled?' (cancelled early - not all matching rows were checked)':'';
+ $('cmprDiffNote').textContent=rd.diffs.length+' row(s) differ, out of '+rd.comparedCount+' row(s) with a matching id that were checked'+_cmprCancelNote2+_cmprTruncMsg+' Updating OVERWRITES the target row with the source values shown below.';
+ cmprDiffRender();
+}
+function cmprDiffRender(){
+ const box=$('cmprDiffGrid');
+ if(!_cmprDiffState||!_cmprDiffState.rows.length){box.innerHTML='<div class="muted" style="padding:8px">No column differences - every row that shares an id on both sides currently has matching content.</div>';$('cmprDiffSummary').textContent='';return;}
+ // Rows are matched purely by having the SAME id (primary key) on both sides; for each matched
+ // pair, every column is compared and only the columns that actually differ are outlined below -
+ // as real Column/Source/Target rows, not a single run-on line of text.
+ let h='';
+ _cmprDiffState.rows.forEach((r,ri)=>{
+  h+='<div style="border-top:1px solid var(--bd2);padding:6px">';
+  h+='<label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprDiffState.rows['+ri+'].checked=this.checked;cmprDiffUpdateSummary()"> id = '+esc(r.pk.join(', '))+' <span class="muted" style="font-weight:400">('+r.colDiffs.length+' column'+(r.colDiffs.length===1?'':'s')+' differ)</span></label>';
+  h+='<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px"><tr class="muted" style="text-align:left"><th style="padding:2px 6px;width:25%">Column</th><th style="padding:2px 6px;width:37%">Source</th><th style="padding:2px 6px;width:37%">Target (current)</th></tr>';
+  r.colDiffs.forEach(cd=>{
+   const isPk=(_cmprDiffState.pkCols||[]).indexOf(cd.col)>=0;const isFk=(_cmprDiffState.fkCols||[]).indexOf(cd.col)>=0;
+   const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;color:#5dcaa5" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;color:#7aa8d8" title="Foreign key">FK</span>':'');
+   h+='<tr><td style="padding:2px 6px;font-weight:600">'+esc(cd.col)+kb+'</td><td style="padding:2px 6px;color:#5dcaa5">'+(cd.src===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.src),80)))+'</td><td style="padding:2px 6px;color:#f0997b">'+(cd.tgt===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.tgt),80)))+'</td></tr>';
+  });
+  h+='</table></div>';
+ });
+ box.innerHTML=h;cmprDiffUpdateSummary();
+}
+function cmprDiffUpdateSummary(){if(!_cmprDiffState){$('cmprDiffSummary').textContent='';return;}const n=_cmprDiffState.rows.filter(r=>r.checked).length;$('cmprDiffSummary').textContent=n+' of '+_cmprDiffState.rows.length+' selected';}
+function cmprDiffSetAll(on){if(!_cmprDiffState)return;_cmprDiffState.rows.forEach(r=>r.checked=on);cmprDiffRender();}
+async function cmprDiffApply(){
+ if(!_cmprDiffState)return;
+ const updates=_cmprDiffState.rows.filter(r=>r.checked).map(r=>({pk:r.pk,colDiffs:r.colDiffs}));
+ if(!updates.length){toast('No rows selected.',true);return;}
+ if(!(await ask('Update '+updates.length+' row(s) in '+_cmprDiffState.table+' on the TARGET database to match the source?\n\nThis OVERWRITES the differing columns on those target rows and cannot be undone.')))return;
+ $('cmprLog').textContent='Updating\u2026';
+ const r=await api('/api/compare-rows-apply-diff',{targetConnName:_cmprDiffState.targetConnName,targetDb:_cmprDiffState.targetDb,table:_cmprDiffState.table,pkCols:_cmprDiffState.pkCols,updates:updates});
+ if(!r.ok){$('cmprLog').textContent='';toast(r.error||'Update failed',true);return;}
+ log('Compare: updated rows in '+_cmprDiffState.table+' on '+_cmprDiffState.targetConnName+'.');
+ const tableName=_cmprDiffState.table,ti=_cmpFindTableIndex(tableName);
+ if(ti>=0){await cmpCompareRows(ti);}
+ toast('Updated '+updates.length+' row(s) in '+tableName+'. Results refreshed.');
+}
+function cmprRender(){
+ const box=$('cmprGrid');
+ if(!_cmprState||!_cmprState.rows.length){box.innerHTML='<div class="muted" style="padding:8px">No missing rows - target already has everything the source has.</div>';$('cmprSummary').textContent='';return;}
+ let h='<table style="width:100%;border-collapse:collapse;font-size:11px"><tr class="muted" style="text-align:left"><th style="padding:3px 6px"></th>';
+ _cmprState.columns.forEach(c=>{h+='<th style="padding:3px 6px">'+esc(c)+'</th>';});
+ h+='</tr>';
+ _cmprState.rows.forEach((r,ri)=>{
+  h+='<tr style="border-top:1px solid var(--bd2)"><td style="padding:3px 6px"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprState.rows['+ri+'].checked=this.checked;cmprUpdateSummary()"></td>';
+  r.data.forEach(v=>{h+='<td style="padding:3px 6px;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+esc(v===null?'NULL':v)+'">'+(v===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(v,120)))+'</td>';});
+  h+='</tr>';
+ });
+ h+='</table>';box.innerHTML=h;cmprUpdateSummary();
+}
+function cmprUpdateSummary(){if(!_cmprState){$('cmprSummary').textContent='';return;}const n=_cmprState.rows.filter(r=>r.checked).length;$('cmprSummary').textContent=n+' of '+_cmprState.rows.length+' selected';}
+function cmprSetAll(on){if(!_cmprState)return;_cmprState.rows.forEach(r=>r.checked=on);cmprRender();}
+async function cmprInsertAll(){
+ if(!_cmprState)return;
+ if(_cmprRequestId){toast('An operation is already running - wait for it to finish or click Cancel first.',true);return;}
+ const total=_cmprState.missingTotal||0;
+ if(!(await ask('Insert ALL '+total+' missing row(s) into '+_cmprState.table+' on the TARGET database, WITHOUT reviewing them individually first?\n\nThis uses the SAME '+_cmprState.pkCols.join('/')+' value(s) as the source (insert-only) and cannot be undone.')))return;
+ const rid=_cmpNewRequestId();_cmprRequestId=rid;_cmprAbortCtrl=new AbortController();
+ $('cmprLog').innerHTML='Inserting all '+total+' row(s)\u2026 <a href="#" onclick="cmprCancelCurrent();return false" style="color:var(--accent)">Cancel</a>';
+ const r=await api('/api/compare-rows-insert-all',{sourceConnName:_cmprState.sourceConnName,sourceDb:_cmprState.sourceDb,targetConnName:_cmprState.targetConnName,targetDb:_cmprState.targetDb,table:_cmprState.table,requestId:rid},_cmprAbortCtrl.signal);
+ _cmprRequestId=null;_cmprAbortCtrl=null;
+ if(r.aborted){$('cmprLog').innerHTML='Cancelled (rows inserted before the cancel are already in the target). <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">Retry</a>';return;}
+ if(!r.ok){$('cmprLog').innerHTML=esc(r.error||'Insert failed')+' <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">Retry</a>';toast(r.error||'Insert failed',true);return;}
+ const tableName=_cmprState.table,ti=_cmpFindTableIndex(tableName);
+ // Deliberately NOT auto-refreshing here: for a large table this just re-runs the same
+ // expensive full-table scan (fetching every id from both sides) that a moment ago needed
+ // Cancel in the first place. Offer it as a link instead of doing it automatically.
+ $('cmprLog').innerHTML=(r.cancelled?'Cancelled - ':'')+'Inserted '+r.inserted+' of '+r.missingTotal+' row(s).\n'+esc(r.log.join('\n'))+(ti>=0?'\n<a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Refresh comparison</a>':'');
+ log('Compare: bulk-inserted '+r.inserted+' row(s) into '+_cmprState.table+' on '+_cmprState.targetConnName+' (no preview).');
+}
+function _cmprPkKey(pkArr){return pkArr.map(v=>String(v)).join('\u0001');}
+async function cmprApply(){
+ if(!_cmprState)return;
+ const insertedRows=_cmprState.rows.filter(r=>r.checked);
+ const rows=insertedRows.map(r=>r.data);
+ if(!rows.length){toast('No rows selected.',true);return;}
+ if(!(await ask('Insert '+rows.length+' row(s) into '+_cmprState.table+' on the TARGET database, using the same '+_cmprState.pkCols.join('/')+' value(s) as the source?\n\nThis cannot be undone.')))return;
+ $('cmprLog').textContent='Inserting\u2026';
+ const r=await api('/api/compare-rows-apply',{targetConnName:_cmprState.targetConnName,targetDb:_cmprState.targetDb,table:_cmprState.table,columns:_cmprState.columns,rows:rows});
+ if(!r.ok){$('cmprLog').textContent='';toast(r.error||'Insert failed',true);return;}
+ log('Compare: inserted rows into '+_cmprState.table+' on '+_cmprState.targetConnName+'.');
+ await cmprTopUpAfterInsert(insertedRows);
+ toast('Inserted '+rows.length+' row(s) into '+_cmprState.table+'.');
+}
+// After an insert, we already know EXACTLY which rows are no longer missing (the ones we just
+// inserted) and we already know the FULL list of ids that were missing before (allMissingPks) -
+// so instead of re-running the whole comparison (re-scanning the entire table again), we just
+// remove the inserted ids from that known list and fetch full data for the next batch. No
+// full-table rescan needed until the user explicitly asks for one.
+async function cmprTopUpAfterInsert(insertedRows){
+ if(!_cmprState||!_cmprState.allMissingPks)return;
+ const pkIdx=_cmprState.pkCols.map(c=>_cmprState.columns.indexOf(c));
+ const insertedKeys=new Set(insertedRows.map(r=>_cmprPkKey(pkIdx.map(i=>r.data[i]))));
+ _cmprState.allMissingPks=_cmprState.allMissingPks.filter(pk=>!insertedKeys.has(_cmprPkKey(pk)));
+ _cmprState.missingTotal=Math.max(0,(_cmprState.missingTotal||0)-insertedRows.length);
+ const cap=2000;
+ const nextBatch=_cmprState.allMissingPks.slice(0,cap);
+ if(nextBatch.length){
+   $('cmprLog').textContent='Loading next '+nextBatch.length+' row(s) to review\u2026';
+   const rr=await api('/api/compare-rows-fetch-by-pk',{sourceConnName:_cmprState.sourceConnName,sourceDb:_cmprState.sourceDb,table:_cmprState.table,pkCols:_cmprState.pkCols,pks:nextBatch});
+   if(!rr.ok){$('cmprLog').textContent='';toast(rr.error||'Could not load the next batch - try Refresh.',true);_cmprState.rows=[];cmprRender();return;}
+   _cmprState.rows=rr.rows.map(row=>({data:row,checked:true}));
+   $('cmprLog').textContent='';
+ } else {
+   _cmprState.rows=[];
+ }
+ const stillTruncated=_cmprState.allMissingPks.length>_cmprState.rows.length;
+ $('cmprNote').innerHTML=_cmprState.missingTotal+' row(s) missing on target'+(stillTruncated?(' (showing next '+_cmprState.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+_cmprState.missingTotal+' without reviewing them</a>)'):'')+'. Rows are inserted with the SAME '+_cmprState.pkCols.join('/')+' value(s) as the source (insert-only - existing target rows are never changed).';
+ cmprRender();
+}
+async function openImport(){$('impLog').textContent='';const dl=$('impDbList');dl.innerHTML='';const inp=$('impDb');inp.value=(typeof curSchema!=='undefined'&&curSchema)?curSchema:'';try{const r=await api('/api/schemas');if(r.ok)r.schemas.forEach(s=>{const o=document.createElement('option');o.value=s.name;dl.appendChild(o);});}catch(e){}show('mImport');}
+async function runImport(){const files=$('impFiles').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);if(!files.length){toast('Add at least one file path.',true);return;}
+ $('impLog').textContent='';
+ const jobId=(crypto.randomUUID?crypto.randomUUID():('j'+Date.now()+Math.random()));
+ progStart('imp','Importing '+files.length+' file'+(files.length===1?'':'s'),jobId);
+ const r=await api('/api/import',{files,targetDb:$('impDb').value.trim(),createDb:$('impCreate').checked,fkOff:$('impFk').checked,force:$('impForce').checked,binaryMode:$('impBinary').checked,jobId:jobId});
+ progStop('imp');
+ if(r.cancelled){log('Import cancelled.');}
+ if(!r.ok){$('impLog').textContent=r.error;log('Import error: '+r.error);return;}
+ $('impLog').textContent=r.log.join('\n');r.log.forEach(l=>log('IMPORT: '+l));}
+async function quit(){
+ const activeJobs=Object.keys(_progJobIds||{}).filter(k=>_progJobIds[k]);
+ const runningQueryTabs=tabs.filter(t=>t.runningReqId);
+ if(activeJobs.length || runningQueryTabs.length){
+   const what=[];if(activeJobs.length)what.push(activeJobs.length+' export/import job(s)');if(runningQueryTabs.length)what.push(runningQueryTabs.length+' running quer'+(runningQueryTabs.length===1?'y':'ies'));
+   if(!(await ask(what.join(' and ')+' still running. Quitting now will stop them abruptly and any partial files may be incomplete. Quit anyway?')))return;
+ }
+ disconnect();
+ try{await api('/api/quit');}catch(e){}
+ try{window.open('','_self');window.close();}catch(e){}
+ setTimeout(()=>{document.body.innerHTML='<div style="padding:40px;font-size:16px">Server stopped. You can close this tab.<br><span style="color:#888;font-size:13px">(Your browser blocks pages from auto-closing tabs it didn\'t open.)</span></div>';},150);}
+
+// ---- server-side file/folder picker ----
+let brState={filter:'',mode:'file',cb:null,cur:'',parent:'ROOT'};
+function browse(opts){const open=[...document.querySelectorAll('.modal.show')].map(m=>m.id).filter(x=>x!=='mBrowse');brState={filter:opts.filter||'',mode:opts.mode||'file',cb:opts.onPick,cur:'',parent:'ROOT',hidden:open};open.forEach(id=>hide(id));$('brTitle').textContent=opts.title||'Browse';show('mBrowse');brNav(opts.start||'ROOT');}
+async function brNav(path){const r=await api('/api/browse',{path,filter:brState.filter,dirsOnly:brState.mode==='folder'});
+ if(!r.ok){if(path!=='ROOT'){brNav('ROOT');}else{alert(r.error);}return;}
+ brState.cur=r.path;brState.parent=r.parent;$('brPath').textContent=r.path||'(drives)';
+ const list=$('brList');list.innerHTML='';
+ r.dirs.forEach(d=>{const el=document.createElement('div');el.className='item';el.innerHTML='&#128193; '+esc(d.name);el.onclick=()=>brNav(d.path);list.appendChild(el);});
+ if(brState.mode!=='folder')r.files.forEach(f=>{const el=document.createElement('div');el.className='item';
+   if(brState.mode==='files'){el.innerHTML='<label><input type="checkbox" class="brf" value="'+esc(f.path)+'"> &#128196; '+esc(f.name)+'</label>';}
+   else{el.innerHTML='&#128196; '+esc(f.name);el.onclick=()=>{const c=brState.cb,pth=f.path;brClose();c(pth);};}
+   list.appendChild(el);});
+ const a=$('brActions');
+ if(brState.mode==='folder')a.innerHTML='<button class="go" onclick="brPickFolder()">Select this folder</button>';
+ else if(brState.mode==='files')a.innerHTML='<button class="go" onclick="brPickFiles()">Add selected</button>';
+else a.innerHTML='<span class="muted">click a folder to open, click a file to choose</span>';}
+function brUp(){brNav(brState.parent||'ROOT');}
+function brClose(){hide('mBrowse');(brState.hidden||[]).forEach(id=>show(id));}
+function brPickFolder(){const c=brState.cb,v=brState.cur;brClose();c(v);}
+function brPickFiles(){const sel=[...document.querySelectorAll('.brf:checked')].map(c=>c.value);const c=brState.cb;brClose();c(sel);}
+function impAppend(paths){const cur=$('impFiles').value.trim();const add=paths.filter(Boolean).join('\n');$('impFiles').value=(cur?cur+'\n':'')+add;}
+function impAddFiles(){browse({title:'Select SQL files',filter:'*.sql',mode:'files',onPick:ps=>{impAppend(ps);log('Added '+ps.length+' file(s).');}});}
+function impAddFolder(){browse({title:'Select a folder (imports all .sql inside)',mode:'folder',onPick:async folder=>{const r=await api('/api/browse',{path:folder,filter:'*.sql',dirsOnly:false});if(r.ok){const ps=r.files.map(f=>f.path);impAppend(ps);log('Added '+ps.length+' .sql file(s) from '+folder);}else alert(r.error);}});}
+// ---- close tabs ----
+async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
+ [...tabs].forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=[];activeTab=null;saveSession();toggleOverview();const _sb=$('schemaBadge');if(_sb){_sb.style.display='none';_sb.textContent='';}}
+async function closeOthers(id){const dirty=tabs.filter(t=>t.id!==id&&pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' other tab(s) have unsaved changes. Close them and discard the changes?')))return;}
+ tabs.filter(t=>t.id!==id).forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
+
+// ---- keyboard navigation for side lists ----
+function focusList(box){box.focus();const items=[...box.querySelectorAll('.item')];if(items.length){items.forEach(x=>x.classList.remove('kbsel'));items[0].classList.add('kbsel');items[0].scrollIntoView({block:'nearest'});}}
+function listNav(box,e){const items=[...box.querySelectorAll('.item')];if(!items.length)return;let i=items.findIndex(x=>x.classList.contains('kbsel'));
+ if(e.key==='ArrowDown'){e.preventDefault();i=Math.min(items.length-1,i+1);}
+ else if(e.key==='ArrowUp'){e.preventDefault();i=Math.max(0,i-1);}
+ else if(e.key==='Enter'){e.preventDefault();if(i>=0)items[i].click();return;}
+ else return;
+ items.forEach(x=>x.classList.remove('kbsel'));if(i<0)i=0;items[i].classList.add('kbsel');items[i].scrollIntoView({block:'nearest'});}
+document.addEventListener('DOMContentLoaded',()=>{});
+$('schemas').addEventListener('keydown',e=>listNav($('schemas'),e));
+$('objects').addEventListener('keydown',e=>listNav($('objects'),e));
+
+// ---- lightweight SQL autocomplete ----
+const AC_KW=['SELECT','FROM','WHERE','INSERT INTO','UPDATE','DELETE FROM','SET','VALUES','JOIN','LEFT JOIN','RIGHT JOIN','INNER JOIN','OUTER JOIN','ON','GROUP BY','ORDER BY','HAVING','LIMIT','OFFSET','DISTINCT','AS','AND','OR','NOT','NULL','IS NULL','IS NOT NULL','LIKE','IN','BETWEEN','EXISTS','COUNT','SUM','AVG','MIN','MAX','CREATE TABLE','ALTER TABLE','DROP TABLE','TRUNCATE TABLE','CREATE INDEX','PRIMARY KEY','FOREIGN KEY','REFERENCES','DEFAULT','AUTO_INCREMENT','UNIQUE','ASC','DESC','USE','SHOW','DESCRIBE','EXPLAIN','UNION','UNION ALL','CASE','WHEN','THEN','ELSE','END'];
+let acItems=[],acIdx=0,acTa=null;
+function acVisible(){return $('acx').style.display==='block';}
+function acHide(){$('acx').style.display='none';acItems=[];}
+function caretXY(ta){const div=document.createElement('div');const cs=getComputedStyle(ta);
+ ['fontFamily','fontSize','fontWeight','lineHeight','paddingTop','paddingLeft','paddingRight','paddingBottom','letterSpacing','tabSize'].forEach(k=>div.style[k]=cs[k]);
+ div.style.position='absolute';div.style.visibility='hidden';div.style.whiteSpace='pre';div.style.border='1px solid transparent';
+ const before=ta.value.slice(0,ta.selectionStart);div.textContent=before;const span=document.createElement('span');span.textContent='\u200b';div.appendChild(span);
+ document.body.appendChild(div);const r=ta.getBoundingClientRect();const x=r.left+span.offsetLeft-ta.scrollLeft;const y=r.top+span.offsetTop-ta.scrollTop;const lh=parseFloat(cs.lineHeight)||16;document.body.removeChild(div);return {x,y,lh};}
+function acSuggest(word){const w=word.toLowerCase();const out=[],seen=new Set();
+ const push=arr=>{(arr||[]).forEach(v=>{if(!v)return;const lv=String(v).toLowerCase();if(!seen.has(lv)&&lv.startsWith(w)){seen.add(lv);out.push(String(v));}});};
+ if(objData){push(objData.r.tables);push(objData.r.views);push(objData.r.procedures);push(objData.r.functions);}
+ push(window.acColumns||[]);push(window.allSchemas||[]);push(AC_KW);
+ return out.slice(0,12);}
+// --- Autocomplete: suggest table/column/keyword names as you type in the editor.
+function acUpdate(id,force){const ta=$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const m=before.match(/[A-Za-z_][A-Za-z0-9_]*$/);
+ if(!m||(!force&&m[0].length<2)){acHide();return;}
+ const sug=acSuggest(m[0]);if(!sug.length){acHide();return;}
+ acItems=sug;acIdx=0;acTa=ta;acRender();const c=caretXY(ta);const box=$('acx');box.style.left=Math.min(c.x,innerWidth-180)+'px';box.style.top=(c.y+c.lh+2)+'px';box.style.display='block';}
+function acRender(){const box=$('acx');box.innerHTML='';acItems.forEach((v,i)=>{const d=document.createElement('div');d.className='ai'+(i===acIdx?' on':'');d.textContent=v;d.addEventListener('mousedown',e=>{e.preventDefault();acIdx=i;acAccept(activeTab);});box.appendChild(d);});}
+function acMove(dir){acIdx=(acIdx+dir+acItems.length)%acItems.length;acRender();const on=$('acx').querySelector('.ai.on');if(on)on.scrollIntoView({block:'nearest'});}
+function acAccept(id){const ta=acTa||$('ed_'+id);const pos=ta.selectionStart;const before=ta.value.slice(0,pos);const after=ta.value.slice(pos);const m=before.match(/[A-Za-z_][A-Za-z0-9_]*$/);const start=pos-(m?m[0].length:0);const val=acItems[acIdx]||'';
+ ta.value=ta.value.slice(0,start)+val+after;const np=start+val.length;ta.selectionStart=ta.selectionEnd=np;acHide();syncHl(id);ta.focus();}
+
+let csvTarget={db:null,table:null};
+async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts')?'sql':'csv';const defName=name+(fmt==='inserts'?'_inserts.sql':'.csv');
+ if(window.__TAURI__&&window.__TAURI__.core){let path;try{path=await window.__TAURI__.dialog.save({defaultPath:defName,filters:[{name:ext.toUpperCase()+' file',extensions:[ext]}]});}catch(e){toast('Save dialog failed: '+e,true);return;}if(!path)return;log('Exporting all rows of '+db+'.'+name+'...');const r=await window.__TAURI__.core.invoke('export_table',{req:{conn:getConn(),db:db,table:name,file:path,format:fmt}});if(r&&r.ok)log(r.message);else alert('Export failed: '+(r?r.error:'unknown'));return;}
+ try{
+   const cq=await api('/api/query',{sql:"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
+   const est=(cq.ok&&cq.rows.length&&cq.rows[0][0]!=null)?+cq.rows[0][0]:null;
+   if(est!=null&&est>10000){
+     if(await ask(db+'.'+name+' has approximately '+fmtCount(est)+' rows.\n\nThe dedicated Export tool (top toolbar) streams straight to disk and will be much faster for a table this size, instead of loading everything into memory first.\n\nOpen the Export tool instead?')){
+       openExport({db,table:name});return;
+     }
+     if(!(await ask('Continue exporting '+db+'.'+name+' via the query engine anyway? This may take a while for a table this size.'))){return;}
+   }
+ }catch(e){}
+ const q=await api('/api/query',{sql:'SELECT * FROM '+qid(db)+'.'+qid(name),db:db});if(!q.ok){toast(q.error,true);return;}
+ if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const s=q.rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+q.columns.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,defName);}
+ else{dl(bCSV(q.columns,q.rows),defName);}}
+function importCsv(db,table){csvTarget={db,table};$('csvTitle').textContent='Import CSV into '+db+'.'+table;$('csvFile').value='';$('csvLog').textContent='';show('mCsv');}
+async function runCsvImport(){const f=$('csvFile').value.trim();if(!f){toast('Choose a CSV file.',true);return;}
+ const doTrunc=$('csvReplace').checked;
+ if(doTrunc && !(await ask('REPLACE mode: truncate '+csvTarget.db+'.'+csvTarget.table+' before import? All existing rows will be permanently deleted.')))return;
+ $('csvLog').textContent='Importing...';
+ const r=await api('/api/importcsv',{db:csvTarget.db,table:csvTarget.table,file:f,hasHeader:$('csvHeader').checked,truncate:doTrunc});
+ if(!r.ok){$('csvLog').textContent=r.error;log('CSV import error: '+r.error);return;}
+ $('csvLog').textContent=r.message;log('CSV import: '+r.message);invalidateTableCache(csvTarget.db,csvTarget.table);if(curSchema)loadObjects(curSchema);}
+
+// Auto-reconnect on page load (Option 1)
+refreshConns().then(async () => {
+  const sel = $('connlist');
+  // Pre-select the PRIMARY connection (if one is set) and load its details into the
+  // form, but DO NOT auto-connect - the user clicks Connect when ready.
+  if (sel && window._primaryConn) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === window._primaryConn) { sel.selectedIndex = i; break; }
+    }
+    if (sel.value === window._primaryConn) {
+      await pickConn(); // loads host, port, user, password, ssl into the form
+      connTitle();
+    }
+  }
+});
+
+toggleOverview();
+libLoad();
+let _pingFails = 0;
+function _ping(){ return fetch('/api/ping', { method:'POST', keepalive:true }).then(()=>{_pingFails=0;}).catch(()=>{_pingFails++; if(_pingFails>=2) showDead();}); }
+setInterval(_ping, 5000);
+document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) _ping(); });
+document.body.classList.add('disconnected');
+window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.preventDefault();e.returnValue='';return '';}});
+(function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=180)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(200,window.innerWidth-320);w=Math.max(180,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
+</script></body></html>
+'@
+$Html = $Html.Replace('__TOKEN__', $Token)
+
+Resolve-Tools
+# Use a STABLE port so the app origin stays constant across restarts.
+# (Browser localStorage - favorites, accent colors, env labels, query library,
+#  session tabs - is scoped per origin; a random port would wipe it every launch.)
+$listener = $null; $port = 0
+foreach ($try in @(17673,17674,17675,17676,17677,17678,17679,17680)) {
+    try { $l = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, $try); $l.Start(); $listener = $l; $port = $try; break }
+    catch { $listener = $null }
+}
+if (-not $listener) {
+    $listener = New-Object System.Net.Sockets.TcpListener ([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start(); $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    Write-Host "  (Fixed ports busy - using random port $port; saved UI settings may not persist this run.)" -ForegroundColor Yellow
+}
+$url = "http://127.0.0.1:$port/"
+Write-Host ""
+Write-Host "  NOBS SQL Editor is running." -ForegroundColor Green
+Write-Host "  Open:  $url"
+if ($script:MysqlPath){ Write-Host "  mysql:     $script:MysqlPath" } else { Write-Host "  mysql.exe NOT found - put it next to this script." -ForegroundColor Yellow }
+if ($script:MysqldumpPath){ Write-Host "  mysqldump: $script:MysqldumpPath" }
+Write-Host "  Close this window to stop the server." -ForegroundColor DarkGray
+Write-Host ""
+function Start-AppWindow {
+    param([string]$Url)
+    $cands = @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    )
+    $exe = $cands | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ($exe) {
+        $profile = Join-Path $env:LOCALAPPDATA 'NOBSSQL\browser'
+        if (-not (Test-Path $profile)) { New-Item -ItemType Directory -Path $profile -Force | Out-Null }
+        $w=1280; $h=860
+        try { Add-Type -AssemblyName System.Windows.Forms; $wa=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; $w=$wa.Width; $h=$wa.Height } catch {}
+        Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--start-maximized","--window-position=0,0","--window-size=$w,$h") | Out-Null
+        return $true
+    }
+    return $false
+}
+if (-not $NoBrowser){ if (-not (Start-AppWindow $url)) { Start-Process $url | Out-Null } }
+
+# ============================================================================
+#  RUNSPACE POOL SETUP
+#  Lets multiple requests (e.g. a slow query in one tab + ping from another)
+#  run concurrently instead of one blocking the whole server.
+# ============================================================================
+$CustomFunctionNames = (Get-ChildItem function:).Name | Where-Object { $BuiltinFunctionNames -notcontains $_ }
+
+$iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+foreach ($fn in $CustomFunctionNames) {
+    $fsb = (Get-Item "function:$fn").ScriptBlock
+    $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
+}
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
+    $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
+    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
+}
+$iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('Token',$Token,'')))
+$iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('Html',$Html,'')))
+
+# Shared, thread-safe heartbeat timestamp (regular $script: vars don't cross runspaces)
+$SharedState = [hashtable]::Synchronized(@{ LastPing = Get-Date })
+$iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('SharedState',$SharedState,'')))
+
+$Pool = [runspacefactory]::CreateRunspacePool(1, 8, $iss, $Host)   # max 8 concurrent requests - tune if needed
+$Pool.Open()
+$InFlight = New-Object System.Collections.Generic.List[object]
+
+# The actual per-request work, run inside a pooled runspace so it doesn't block the accept loop.
+$RequestHandler = {
+    param($client, $Token, $Html)
+    try {
+        $req = Read-Request $client
+        if ($req.path -eq '/api/ping') { $SharedState.LastPing = Get-Date; Send-Json $client '{"ok":true}'; return }
+        if ($req.path -eq '/' -or $req.path -eq '/index.html') { Send-Http $client '200 OK' 'text/html; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes($Html)); return }
+        if ($req.path -eq '/api/quit') { Send-Json $client '{"ok":true}'; $SharedState.Quit = $true; return }
+        if ($req.path -like '/api/*') {
+            $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
+            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            $conn=$data.conn
+            $roBlocked = $false
+            if ([bool]$data.ro) {
+                switch -Regex ($req.path) {
+                    '/api/(rowop|import|importcsv)$' { $roBlocked = $true }
+                    '/api/(exec|script|query)$' { if (-not (Test-SqlReadOnly ([string]$data.sql))) { $roBlocked = $true } }
+                }
+            }
+            if ($roBlocked) { Send-Json $client '{"ok":false,"error":"This connection is READ-ONLY (safe mode). The server blocked a write operation."}'; return }
+            switch ($req.path) {
+                '/api/connect' { Send-Json $client (Api-Connect $conn) }
+                '/api/schemas' { Send-Json $client (Api-Schemas $conn) }
+                '/api/objects' { Send-Json $client (Api-Objects $conn $data.db) }
+                '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
+                '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
+                '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
+                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId) }
+                '/api/cancel-query' { Send-Json $client (Api-CancelQuery $data) }
+                '/api/cancel-job'   { Send-Json $client (Api-CancelJob $data) }
+                '/api/exec'    { Send-Json $client (Api-Exec $conn $data) }
+                '/api/script'  { Send-Json $client (Api-Script $conn $data) }
+                '/api/rowop'   { Send-Json $client (Api-RowOp $conn $data) }
+                '/api/export'  { Send-Json $client (Api-Export $conn $data) }
+                '/api/import'  { Send-Json $client (Api-Import $conn $data) }
+                '/api/importcsv'   { Send-Json $client (Api-ImportCsv $conn $data) }
+				'/api/search-all-schemas' { Send-Json $client (Api-SearchAllSchemas $conn $data.term) }
+                '/api/browse'      { Send-Json $client (Api-Browse $data) }
+                '/api/tools-status'   { Send-Json $client (Api-ToolsStatus) }
+                '/api/get-config'     { Send-Json $client (Api-GetConfig) }
+                '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
+                '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
+                '/api/conn-list'   { Send-Json $client (Api-ConnList) }
+                '/api/conn-get'    { Send-Json $client (Api-ConnGet $data) }
+                '/api/conn-save'   { Send-Json $client (Api-ConnSave $data) }
+                '/api/conn-delete' { Send-Json $client (Api-ConnDelete $data) }
+                '/api/conn-clear'  { Send-Json $client (Api-ConnClear) }
+                '/api/conn-primary'{ Send-Json $client (Api-ConnSetPrimary $data) }
+                '/api/compare-dbs'     { Send-Json $client (Api-CompareDbs $data) }
+                '/api/compare-tables'  { Send-Json $client (Api-CompareTables $data) }
+                '/api/compare-cancel'  { Send-Json $client (Api-CompareCancel $data) }
+                '/api/compare-rows'       { Send-Json $client (Api-CompareRows $data) }
+                '/api/compare-rows-apply' { Send-Json $client (Api-CompareRowsApply $data) }
+                '/api/compare-rows-fetch-by-pk' { Send-Json $client (Api-CompareRowsFetchByPk $data) }
+                '/api/compare-rows-insert-all' { Send-Json $client (Api-CompareRowsInsertAll $data) }
+                '/api/compare-rows-diff'        { Send-Json $client (Api-CompareRowsDiff $data) }
+                '/api/compare-rows-apply-diff'  { Send-Json $client (Api-CompareRowsApplyDiff $data) }
+                '/api/compare-schemas' { Send-Json $client (Api-CompareSchemas $data) }
+                '/api/compare-apply'   { Send-Json $client (Api-CompareApply $data) }
+                '/api/lib-list'    { Send-Json $client (Api-LibList) }
+                '/api/lib-save'    { Send-Json $client (Api-LibSave $data) }
+                '/api/lib-delete'  { Send-Json $client (Api-LibDelete $data) }
+                '/api/lib-clear'   { Send-Json $client (Api-LibClear) }
+                '/api/lib-replace' { Send-Json $client (Api-LibReplace $data) }
+                default        { Send-Json $client '{"ok":false,"error":"unknown"}' }
+            }
+        } else {
+            Send-Http $client '404 Not Found' 'text/plain' ([Text.Encoding]::UTF8.GetBytes('not found'))
+        }
+    } catch {
+        try { Send-Http $client '500 Error' 'application/json' ([Text.Encoding]::UTF8.GetBytes('{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}')) } catch { }
+    } finally {
+        try { $client.Close() } catch {}
+    }
+}
+
+# ============================================================================
+#  MAIN SERVER LOOP
+#  Accept one browser request at a time, handle it, respond, repeat.
+#  The browser pings /api/ping every few seconds; if pings stop for 6 hours
+#  the server assumes the app was closed and shuts itself down.
+# ============================================================================
+$run=$true
+while ($run) {
+    $pending = $false
+    try { $pending = $listener.Server.Poll(200000, [System.Net.Sockets.SelectMode]::SelectRead) }
+    catch { Start-Sleep -Milliseconds 50 }
+
+    if ($pending) {
+        $client=$null
+        try { $client=$listener.AcceptTcpClient() }
+        catch { $client=$null }
+        if ($null -ne $client) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $Pool
+            [void]$ps.AddScript($RequestHandler).AddArgument($client).AddArgument($Token).AddArgument($Html)
+            $handle = $ps.BeginInvoke()
+            $InFlight.Add([pscustomobject]@{ ps=$ps; handle=$handle })
+        }
+    }
+
+    # Reap completed requests; surface any unexpected errors to the console log instead of losing them.
+    $stillRunning = New-Object System.Collections.Generic.List[object]
+    foreach ($item in $InFlight) {
+        if ($item.handle.IsCompleted) {
+            try { $item.ps.EndInvoke($item.handle) } catch { Write-Host ("Request error: " + $_.Exception.Message) -ForegroundColor Yellow }
+            $item.ps.Dispose()
+        } else { $stillRunning.Add($item) }
+    }
+    $InFlight = $stillRunning
+
+    if ($SharedState.Quit) { $run = $false }
+    elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
+}
+
+# Drain any in-flight requests before shutting down.
+foreach ($item in $InFlight) {
+    try { $item.handle.AsyncWaitHandle.WaitOne(2000) | Out-Null; $item.ps.EndInvoke($item.handle) } catch {}
+    $item.ps.Dispose()
+}
+try { $Pool.Close(); $Pool.Dispose() } catch {}
+try { $listener.Stop() } catch {}
+Write-Host "Server stopped."
+[Environment]::Exit(0)
