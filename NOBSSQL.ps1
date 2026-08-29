@@ -81,7 +81,8 @@ function Use-FileLock {
 function Load-Cfg { if(Test-Path $script:CfgFile){ try { $raw=[IO.File]::ReadAllText($script:CfgFile); $raw=$raw.TrimStart([char]0xFEFF); if($raw.Trim()){ return ($raw | ConvertFrom-Json) } } catch {} } return $null }
 # Write the app config back to disk (config.json).
 function Save-Cfg { param($obj) Use-FileLock 'Cfg' { $d=Split-Path $script:CfgFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}; [IO.File]::WriteAllText($script:CfgFile, ($obj | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false))) } }
-# Find mysql.exe / mysqldump.exe: config -> PATH -> common install folders.
+# Find mysql.exe / mysqldump.exe: config -> env vars -> common install folders -> PATH.
+# Same order and same directories as the Tauri build's resolve_bin / tool_search_dirs.
 function Resolve-Tools {
     $script:MysqlSource = $null; $script:MysqldumpSource = $null
     # 0) user-configured / downloaded paths win
@@ -106,19 +107,42 @@ function Resolve-Tools {
             if ($script:MysqlPath) { return }
         } catch { }
     }
-    if (-not $script:MysqlPath)     { $c=Get-Command mysql.exe -ErrorAction SilentlyContinue;     if($c){$script:MysqlPath=$c.Source; $script:MysqlSource = 'Found on the system PATH'} }
-    if (-not $script:MysqldumpPath) { $c=Get-Command mysqldump.exe -ErrorAction SilentlyContinue; if($c){$script:MysqldumpPath=$c.Source; $script:MysqldumpSource = 'Found on the system PATH'} }
+    # 1) environment variables, matching the Tauri build's MYSQL_BIN / MYSQLDUMP_BIN step
+    if (-not $script:MysqlPath -and $env:MYSQL_BIN -and (Test-Path $env:MYSQL_BIN)) {
+        $script:MysqlPath = [string]$env:MYSQL_BIN; $script:MysqlSource = 'MYSQL_BIN environment variable'
+    }
+    if (-not $script:MysqldumpPath -and $env:MYSQLDUMP_BIN -and (Test-Path $env:MYSQLDUMP_BIN)) {
+        $script:MysqldumpPath = [string]$env:MYSQLDUMP_BIN; $script:MysqldumpSource = 'MYSQLDUMP_BIN environment variable'
+    }
+    # 2) common install folders, BEFORE the PATH, same order and same set of directories as the
+    #    Tauri build's tool_search_dirs: under each base, any child named MariaDB*/MySQL*
+    #    contributes its own bin and each of its children's bin. That covers both layouts these
+    #    products use - "Program Files\MariaDB 11.4\bin" with the version in the folder name, and
+    #    "Program Files\MySQL\MySQL Server 8.0\bin" one level deeper - plus WAMP. XAMPP keeps
+    #    its bin directly at "xampp\mysql\bin", so it is listed as-is.
     if (-not $script:MysqlPath -or -not $script:MysqldumpPath) {
-        foreach ($g in @("$env:ProgramFiles\MariaDB*\bin","$env:ProgramFiles\MySQL\*\bin","${env:ProgramFiles(x86)}\MySQL\*\bin","C:\xampp\mysql\bin")) {
-            $hit = Get-ChildItem -Path (Join-Path $g 'mysql.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($hit) {
-                if(-not $script:MysqlPath){$script:MysqlPath=$hit.FullName; $script:MysqlSource = "Found in $($hit.Directory.FullName)"}
-                $d=Join-Path $hit.Directory.FullName 'mysqldump.exe'
-                if(-not $script:MysqldumpPath -and (Test-Path $d)){$script:MysqldumpPath=$d; $script:MysqldumpSource = "Found in $($hit.Directory.FullName)"}
-                break
+        $dirs = New-Object System.Collections.Generic.List[string]
+        foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, 'C:\wamp64\bin')) {
+            if (-not $base) { continue }
+            foreach ($kid in (Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                if ($kid.Name -notmatch '^(?i)(mariadb|mysql)') { continue }
+                $dirs.Add((Join-Path $kid.FullName 'bin'))
+                foreach ($sub in (Get-ChildItem -LiteralPath $kid.FullName -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+                    $dirs.Add((Join-Path $sub.FullName 'bin'))
+                }
             }
         }
+        $dirs.Add('C:\xampp\mysql\bin')
+        foreach ($d in $dirs) {
+            if ($script:MysqlPath -and $script:MysqldumpPath) { break }
+            $m = Join-Path $d 'mysql.exe'; $dp = Join-Path $d 'mysqldump.exe'
+            if (-not $script:MysqlPath -and (Test-Path $m))      { $script:MysqlPath=$m;      $script:MysqlSource     = "Found in $d" }
+            if (-not $script:MysqldumpPath -and (Test-Path $dp)) { $script:MysqldumpPath=$dp; $script:MysqldumpSource = "Found in $d" }
+        }
     }
+    # 3) last resort: the bare name on the PATH
+    if (-not $script:MysqlPath)     { $c=Get-Command mysql.exe -ErrorAction SilentlyContinue;     if($c){$script:MysqlPath=$c.Source; $script:MysqlSource = 'Found on the system PATH'} }
+    if (-not $script:MysqldumpPath) { $c=Get-Command mysqldump.exe -ErrorAction SilentlyContinue; if($c){$script:MysqldumpPath=$c.Source; $script:MysqldumpSource = 'Found on the system PATH'} }
 }
 
 # Build the SSL-related lines for the temporary my.cnf options file.
@@ -2023,7 +2047,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div style="margin:10px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">STATUS</div>
  <div id="cfgStatus" style="background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:8px 12px;font-size:12px"></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">PATHS</div>
- <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; system PATH &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL, XAMPP).</div>
+ <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; MYSQL_BIN / MYSQLDUMP_BIN environment variable &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL*, WAMP, XAMPP) &rarr; system PATH.</div>
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysql" style="flex:1" placeholder="full path to mysql.exe (or mariadb.exe)"><button onclick="browse({title:'Select mysql.exe / mariadb.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysql').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
