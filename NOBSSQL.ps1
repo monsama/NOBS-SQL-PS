@@ -36,6 +36,12 @@
 param([switch]$NoBrowser)
 
 $script:PackedPayload = ''
+# Default MariaDB client-tools download URL, editable in Settings and stored under
+# "mariadb_download_url_template" in the same config file as the tool paths. {version} and
+# {file_name} are filled in from the latest LTS release the MariaDB REST API reports. A direct
+# mirror is the default rather than the API's own file_download_url, which has been observed
+# answering 403 with an error page instead of the archive.
+$script:DefaultMariaDbUrlTemplate = 'https://mirror.mariadb.org/mariadb-{version}/winx64-packages/{file_name}'
 
 $ErrorActionPreference = 'Stop'
 $script:MysqldumpPath = $null
@@ -966,15 +972,24 @@ function Api-GetConfig {
     $cfg = Load-Cfg
     $mb = if($cfg -and $cfg.mysql_bin){[string]$cfg.mysql_bin}else{''}
     $db = if($cfg -and $cfg.mysqldump_bin){[string]$cfg.mysqldump_bin}else{''}
-    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+'}}'
+    $tpl = if($cfg -and $cfg.mariadb_download_url_template){[string]$cfg.mariadb_download_url_template}else{''}
+    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+',"mariadb_download_url_template":'+(J-Str $tpl)+'},"mariadbDownloadUrlDefault":'+(J-Str $script:DefaultMariaDbUrlTemplate)+'}'
 }
 # Endpoint: save tool paths from the Settings dialog.
 function Api-SaveConfig { param($data)
     $cfg = Load-Cfg; if(-not $cfg){ $cfg=[pscustomobject]@{} }
-    $mb=''; $db=''
-    if($data.config){ if($data.config.mysql_bin){$mb=[string]$data.config.mysql_bin}; if($data.config.mysqldump_bin){$db=[string]$data.config.mysqldump_bin} }
-    $out=[pscustomobject]@{ mysql_bin=$mb; mysqldump_bin=$db }
-    Save-Cfg $out
+    # Merge the keys that were actually sent instead of rebuilding the object. The Settings
+    # dialog saves all three together, but the Download button saves only the URL template, and
+    # rebuilding from scratch would blank the tool paths it never sent.
+    if($data.config){
+        foreach($k in @('mysql_bin','mysqldump_bin','mariadb_download_url_template')){
+            $prop = $data.config.PSObject.Properties[$k]
+            if($prop){ $cfg | Add-Member -NotePropertyName $k -NotePropertyValue ([string]$prop.Value) -Force }
+        }
+    }
+    Save-Cfg $cfg
+    $mb = if($cfg.mysql_bin){[string]$cfg.mysql_bin}else{''}
+    $db = if($cfg.mysqldump_bin){[string]$cfg.mysqldump_bin}else{''}
     if($mb -and (Test-Path $mb)){ $script:MysqlPath=$mb }
     if($db -and (Test-Path $db)){ $script:MysqldumpPath=$db }
     '{"ok":true}'
@@ -1000,7 +1015,10 @@ function Api-DownloadTools {
         # The REST API's own file_download_url has been observed returning 403 regardless of http/https.
         # A direct mirror URL (same layout MariaDB Foundation publishes at mirror.mariadb.org) works reliably,
         # so try that first and only fall back to the API-provided URL if the mirror layout ever changes.
-        $mirrorUrl = "https://mirror.mariadb.org/mariadb-$patch/winx64-packages/$($zipEntry.file_name)"
+        $cfgNow = Load-Cfg
+        $tpl = if($cfgNow -and $cfgNow.mariadb_download_url_template){[string]$cfgNow.mariadb_download_url_template}else{''}
+        if(-not $tpl){ $tpl = $script:DefaultMariaDbUrlTemplate }
+        $mirrorUrl = $tpl.Replace('{version}', [string]$patch).Replace('{file_name}', [string]$zipEntry.file_name)
         $apiUrl = [string]$zipEntry.file_download_url -replace '^http://','https://'
         $curlOk = $false
         foreach ($tryUrl in @($mirrorUrl, $apiUrl)) {
@@ -2010,6 +2028,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
  <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB)</span></div>
+ <div class="row" style="margin-top:6px"><span style="width:92px">Download URL</span><input id="cfgDownloadUrl" style="flex:1;font-family:Consolas,monospace;font-size:11px" placeholder="https://mirror.mariadb.org/mariadb-{version}/winx64-packages/{file_name}"><button onclick="resetDownloadUrl()" title="Reset to the built-in default">Reset</button></div>
+ <div class="muted" style="font-size:11px;line-height:1.4;margin:2px 0 0">{version} and {file_name} are filled in automatically from the latest MariaDB LTS release. Only change this if the download above fails (mariadb.org occasionally changes its layout) - the error message will show what actually happened.</div>
  <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
  <div id="cfgPaths" class="muted" style="font-size:11px;font-family:Consolas,monospace;margin-top:10px;border-top:1px solid var(--bd2);padding-top:8px;line-height:1.6"></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LOCAL DATA</div>
@@ -2271,7 +2291,7 @@ if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
 // context menu
 function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n\u2022 saved connections (host / user / password)\n\u2022 the query library\n\u2022 caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
-async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';}catch(e){}show('mSettings');refreshToolsStatus();}
+async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}show('mSettings');refreshToolsStatus();}
 // Export and Import shell out to mysql.exe / mysqldump.exe. When the backend reports one
 // missing, the bare error leaves the user stuck - it names PATH and an environment variable but
 // not the dialog that actually fixes it - so pair it with a button that opens Settings, where the
@@ -2301,8 +2321,9 @@ async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.inn
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
  const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}
-async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
-async function downloadTools(){$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
+function resetDownloadUrl(){$('cfgDownloadUrl').value=window._mariadbDownloadUrlDefault||'';}
+async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
+async function downloadTools(){try{await api('/api/save-config',{config:{mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});}catch(e){}$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
 let _inpResolve=null;
 function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').textContent=opts.title||'Input';const box=$('inpFields');box.innerHTML='';
  (opts.fields||[]).forEach(f=>{const w=document.createElement('div');w.style.margin='6px 0';if(f.type==='checkbox'){w.style.display='flex';w.style.alignItems='center';w.style.gap='8px';const cbx=document.createElement('input');cbx.id='inp_'+f.key;cbx.type='checkbox';cbx.checked=!!f.value;const clb=document.createElement('label');clb.textContent=f.label||f.key;clb.style.fontSize='13px';clb.htmlFor=cbx.id;clb.style.cursor='pointer';cbx.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(cbx);w.appendChild(clb);box.appendChild(w);return;}const lb=document.createElement('label');lb.textContent=f.label||f.key;lb.style.display='block';lb.style.fontSize='12px';lb.style.marginBottom='2px';lb.style.color='var(--muted)';
