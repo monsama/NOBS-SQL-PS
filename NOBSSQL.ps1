@@ -64,7 +64,7 @@ function Use-FileLock {
 function Load-Cfg { if(Test-Path $script:CfgFile){ try { $raw=[IO.File]::ReadAllText($script:CfgFile); $raw=$raw.TrimStart([char]0xFEFF); if($raw.Trim()){ return ($raw | ConvertFrom-Json) } } catch {} } return $null }
 # Write the app config back to disk (config.json).
 function Save-Cfg { param($obj) Use-FileLock 'Cfg' { $d=Split-Path $script:CfgFile; if(-not(Test-Path $d)){New-Item -ItemType Directory -Path $d -Force|Out-Null}; [IO.File]::WriteAllText($script:CfgFile, ($obj | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false))) } }
-# Find mysql.exe / mysqldump.exe: config -> packaged -> PATH -> common install folders.
+# Find mysql.exe / mysqldump.exe: config -> PATH -> common install folders.
 function Resolve-Tools {
     $script:MysqlSource = $null; $script:MysqldumpSource = $null
     # 0) user-configured / downloaded paths win
@@ -88,11 +88,6 @@ function Resolve-Tools {
             if ($mm) { $script:MysqlPath     = $mm.FullName; $script:MysqlSource = 'Bundled with this script' }
             if ($script:MysqlPath) { return }
         } catch { }
-    }
-    $dirs = @((Get-Location).Path); if ($PSScriptRoot) { $dirs += $PSScriptRoot }
-    foreach ($b in ($dirs | Select-Object -Unique)) {
-        if (-not $script:MysqldumpPath -and (Test-Path (Join-Path $b 'mysqldump.exe'))) { $script:MysqldumpPath = Join-Path $b 'mysqldump.exe'; $script:MysqldumpSource = "Found next to the script ($b)" }
-        if (-not $script:MysqlPath     -and (Test-Path (Join-Path $b 'mysql.exe')))     { $script:MysqlPath     = Join-Path $b 'mysql.exe'; $script:MysqlSource = "Found next to the script ($b)" }
     }
     if (-not $script:MysqlPath)     { $c=Get-Command mysql.exe -ErrorAction SilentlyContinue;     if($c){$script:MysqlPath=$c.Source; $script:MysqlSource = 'Found on the system PATH'} }
     if (-not $script:MysqldumpPath) { $c=Get-Command mysqldump.exe -ErrorAction SilentlyContinue; if($c){$script:MysqldumpPath=$c.Source; $script:MysqldumpSource = 'Found on the system PATH'} }
@@ -374,7 +369,7 @@ function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
 # ---------------------------------------------------------------------------
 # Test the connection and return the server version (called when you click Connect).
 function Api-Connect { param($conn)
-    if (-not $script:MysqlPath -or -not (Test-Path $script:MysqlPath)) { return '{"ok":false,"error":"mysql.exe not found on this machine."}' }
+    if (-not $script:MysqlPath -or -not (Test-Path $script:MysqlPath)) { return '{"ok":false,"error":"mysql.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $cnf=New-Cnf $conn
     try {
         $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
@@ -619,7 +614,7 @@ function Api-CancelJob { param($data)
 }
 # Endpoint: export data (mysqldump for whole schemas, or CSV / INSERT statements).
 function Api-Export { param($conn,$data)
-    if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found."}' }
+    if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $dbs=@($data.dbs); if($dbs.Count -eq 0){ return '{"ok":false,"error":"No databases selected."}' }
     $jobId=[string]$data.jobId
     $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
@@ -1999,7 +1994,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div style="margin:10px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">STATUS</div>
  <div id="cfgStatus" style="background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:8px 12px;font-size:12px"></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">PATHS</div>
- <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; bundled with this script &rarr; next to the script &rarr; system PATH &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL, XAMPP).</div>
+ <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; system PATH &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL, XAMPP).</div>
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysql" style="flex:1" placeholder="full path to mysql.exe (or mariadb.exe)"><button onclick="browse({title:'Select mysql.exe / mariadb.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysql').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
@@ -2009,8 +2004,35 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LOCAL DATA</div>
  <div class="row"><button class="warn" onclick="clearAllData()">Clear all app data</button></div>
  <hr style="border:none;border-top:1px solid var(--bd2);margin:10px 0">
- <div class="row" style="gap:8px"><button class="sm needsconn" title="Clear the database overview cache and reload" onclick="clearOverviewCache()">Refresh Cache</button><button class="sm" title="Toggle light / dark theme" onclick="toggleTheme()">Switch Theme</button><button class="sm" title="Keyboard shortcuts" onclick="show('mShortcuts')">Shortcut Info</button></div>
+ <div class="row" style="gap:8px"><button class="sm needsconn" title="Clear the database overview cache and reload" onclick="clearOverviewCache()">Refresh Cache</button><button class="sm" title="Toggle light / dark theme" onclick="toggleTheme()">Switch Theme</button><button class="sm" title="Keyboard shortcuts" onclick="show('mShortcuts')">Shortcut Info</button><button class="sm" title="Version, license and project information" onclick="openAbout()">About</button></div>
  <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="go" onclick="saveSettings()">Save</button><button onclick="hide('mSettings')">Close</button></div></div></div>
+<div class="modal" id="mAbout"><div class="box" style="width:560px;max-width:92vw">
+ <h3 style="margin-top:0" id="aboutTitle">NOBS SQL Editor</h3>
+ <div class="muted" style="font-size:12px;line-height:1.6">
+  A lightweight client for MySQL and MariaDB, running as a single PowerShell script.<br>
+  Copyright &copy; 2026 Viktor Ljuca
+ </div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LICENSE</div>
+ <div class="muted" style="font-size:12px;line-height:1.6">
+  This program is free software: you may redistribute and/or modify it under the terms of the
+  <b>GNU General Public License version 2</b>, or (at your option) any later version.<br>
+  It is distributed in the hope that it will be useful, but <b>WITHOUT ANY WARRANTY</b> - without
+  even the implied warranty of merchantability or fitness for a particular purpose. See the
+  GNU General Public License for details.
+ </div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LINKS</div>
+ <div class="muted" style="font-size:12px;line-height:1.8;font-family:Consolas,monospace;user-select:text">
+  Website&nbsp;&nbsp;&nbsp;https://monsama.ch<br>
+  Source&nbsp;&nbsp;&nbsp;&nbsp;https://github.com/monsama/NOBS-SQL-PS<br>
+  License&nbsp;&nbsp;&nbsp;https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+ </div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">THIRD PARTY</div>
+ <div class="muted" style="font-size:11px;line-height:1.6">
+  Runs on Windows PowerShell with the .NET base class library; no third-party modules are
+  required. The MySQL / MariaDB client tools are not bundled; the MariaDB client tools, when
+  downloaded, are &copy; MariaDB Foundation under GPLv2 and come from mariadb.org.
+ </div>
+ <div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="hide('mAbout')">Close</button></div></div></div>
 <div class="modal" id="mShortcuts"><div class="box" style="width:560px;max-width:92vw"><h3 style="margin-top:0">Keyboard shortcuts &amp; tips</h3>
  <table style="border-collapse:collapse;font-size:13px"><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>F5</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the whole query</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Run the selected text (or all, if nothing is selected)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + Space</kbd></td><td style="padding:3px 0;color:var(--muted)">Autocomplete</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Tab</kbd></td><td style="padding:3px 0;color:var(--muted)">Indent (in the editor)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + D</kbd></td><td style="padding:3px 0;color:var(--muted)">Duplicate the current line (or every line touched by the selection) below</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + /</kbd></td><td style="padding:3px 0;color:var(--muted)">Toggle "-- " comment on the current line or selection</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Alt + &uarr; / &darr;</kbd></td><td style="padding:3px 0;color:var(--muted)">Move the current line (or selection) up or down</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + Shift + K</kbd></td><td style="padding:3px 0;color:var(--muted)">Delete the current line (or every line touched by the selection)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + S</kbd></td><td style="padding:3px 0;color:var(--muted)">Apply pending grid edits (save changes)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + T</kbd></td><td style="padding:3px 0;color:var(--muted)">New query tab</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + W</kbd></td><td style="padding:3px 0;color:var(--muted)">Close current tab</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Ctrl + L</kbd></td><td style="padding:3px 0;color:var(--muted)">Focus the editor and select all</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Enter</kbd></td><td style="padding:3px 0;color:var(--muted)">Connect (when focused in Host / Port / User / Pass)</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Esc</kbd></td><td style="padding:3px 0;color:var(--muted)">Close a dialog or the autocomplete popup</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Drag column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize a results column</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Double-click column edge</kbd></td><td style="padding:3px 0;color:var(--muted)">Auto-fit a results column</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Drag sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Resize the schema/objects sidebar</td></tr><tr><td style="padding:3px 14px 3px 0;white-space:nowrap"><kbd>Double-click sidebar divider</kbd></td><td style="padding:3px 0;color:var(--muted)">Reset the sidebar width</td></tr></table>
  <div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="hide('mShortcuts')">Close</button></div></div></div>
@@ -2239,6 +2261,31 @@ if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
 function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n• saved connections (host / user / password)\n• the query library\n• caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
 async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';}catch(e){}show('mSettings');refreshToolsStatus();}
+// Export and Import shell out to mysql.exe / mysqldump.exe. When the backend reports one
+// missing, the bare error leaves the user stuck - it names PATH and an environment variable but
+// not the dialog that actually fixes it - so pair it with a button that opens Settings, where the
+// path can be set or the tools downloaded. The message itself goes in via textContent, never
+// innerHTML: it can carry raw output from the server or the shelled-out tool.
+function showToolError(logId,ownerModalId,msg){
+ const el=$(logId); if(!el)return;
+ el.textContent=msg;
+ // Two wordings reach here: the Tauri build's "Could not find '<tool>'" and the PowerShell
+ // build's "<tool>.exe not found". Match both so the two front-ends can stay identical.
+ if(!/Could not find '|\.exe not found/.test(msg))return;
+ const row=document.createElement('div'); row.style.marginTop='8px';
+ const btn=document.createElement('button'); btn.className='sm'; btn.textContent='Open Settings...';
+ btn.title='Set the path to the client tools, or download them';
+ // Settings is a plain centred modal at z-index 9000 while an open floating window has been
+ // pushed above that by floatBringToFront, so Settings would open BEHIND the window the user
+ // clicked from. Closing that window first avoids the stacking problem entirely, and its form
+ // values stay in the DOM for when it is reopened.
+ btn.onclick=()=>{if(ownerModalId)hide(ownerModalId);openSettings();};
+ row.appendChild(btn); el.appendChild(row);
+}
+// No version lookup here, unlike the Tauri build: this backend has no app-info endpoint, and
+// api() treats any failed call as the server being gone - it calls showDead(), which would throw
+// a false "server down" overlay over the app just for opening the About box.
+function openAbout(){ show('mAbout'); }
 async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src)=>{const ok=path&&path!=='(not found)';return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};el.innerHTML=row('mysql',r.mysql,r.mysql_source)+row('mysqldump',r.mysqldump,r.mysqldump_source);
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
@@ -4376,7 +4423,7 @@ if(!dbs.length && tables.length){
  const r=await api('/api/export',{dbs,options:o,folder:$('expFolder').value,mode:mode,stamp:$('expStamp').checked,excludes:excludes,jobId:jobId});
  progStop('exp');
  if(r.cancelled){log('Export cancelled.');}
- if(!r.ok){$('expLog').textContent=r.error;log('Export error: '+r.error);return;}
+ if(!r.ok){showToolError('expLog','mExport',r.error);log('Export error: '+r.error);return;}
  $('expLog').textContent=r.log.join('\n');r.log.forEach(l=>log('EXPORT: '+l));}
 let _cmpTables=null;
 async function cmpFillConnSelect(sel){sel.innerHTML='';const r=await api('/api/conn-list');if(r.ok)r.items.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name;sel.appendChild(o);});}
@@ -4651,7 +4698,7 @@ async function runImport(){const files=$('impFiles').value.split(/\r?\n/).map(s=
  const r=await api('/api/import',{files,targetDb:$('impDb').value.trim(),createDb:$('impCreate').checked,fkOff:$('impFk').checked,force:$('impForce').checked,binaryMode:$('impBinary').checked,jobId:jobId});
  progStop('imp');
  if(r.cancelled){log('Import cancelled.');}
- if(!r.ok){$('impLog').textContent=r.error;log('Import error: '+r.error);return;}
+ if(!r.ok){showToolError('impLog','mImport',r.error);log('Import error: '+r.error);return;}
  $('impLog').textContent=r.log.join('\n');r.log.forEach(l=>log('IMPORT: '+l));}
 async function quit(){
  const activeJobs=Object.keys(_progJobIds||{}).filter(k=>_progJobIds[k]);
@@ -4821,7 +4868,7 @@ $url = "http://127.0.0.1:$port/"
 Write-Host ""
 Write-Host "  NOBS SQL Editor is running." -ForegroundColor Green
 Write-Host "  Open:  $url"
-if ($script:MysqlPath){ Write-Host "  mysql:     $script:MysqlPath" } else { Write-Host "  mysql.exe NOT found - put it next to this script." -ForegroundColor Yellow }
+if ($script:MysqlPath){ Write-Host "  mysql:     $script:MysqlPath" } else { Write-Host "  mysql.exe NOT found - open Settings in the app to select it, or to download the MariaDB client tools." -ForegroundColor Yellow }
 if ($script:MysqldumpPath){ Write-Host "  mysqldump: $script:MysqldumpPath" }
 Write-Host "  Close this window to stop the server." -ForegroundColor DarkGray
 Write-Host ""
