@@ -529,7 +529,12 @@ function Run-Exec { param($conn,$sql)
 # Read-only guard: true only if EVERY statement is a pure read (SELECT/SHOW/EXPLAIN...).
 function Test-SqlReadOnly { param([string]$sql)
     if(-not $sql){ return $true }
-    $s = [regex]::Replace($sql, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    # /*! ... */ and /*!50000 ... */ are NOT comments: MySQL executes their contents. Stripping
+    # them like a comment hid the statement inside from the keyword check below, so
+    # "/*!50000 DELETE FROM t */" passed as read-only and then deleted rows. Unwrap them first so
+    # the SQL they carry is checked like any other, and only then strip real comments.
+    $s = [regex]::Replace($sql, '/\*!\d*(.*?)\*/', ' $1 ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    $s = [regex]::Replace($s, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
     $s = [regex]::Replace($s, '(?m)--.*$', ' ')
     $s = [regex]::Replace($s, '(?m)#.*$', ' ')
     $allow = 'SELECT','SHOW','DESCRIBE','DESC','EXPLAIN','USE','WITH','SET','HELP','VALUES','TABLE','ANALYZE','CHECK','CHECKSUM'
@@ -538,6 +543,14 @@ function Test-SqlReadOnly { param([string]$sql)
         if(-not $t){ continue }
         $w = (($t -split '\s+',2)[0]).ToUpper()
         if($allow -notcontains $w){ return $false }
+        # SET is allowed because a session variable is harmless, but SET GLOBAL / SET PERSIST -
+        # and their @@GLOBAL. / @@PERSIST. spellings - reconfigure the server for every
+        # connection, which a read-only connection should not be able to do.
+        if($w -eq 'SET'){
+            $up = $t.ToUpper()
+            $second = ($up -split '\s+')[1]
+            if($second -match '^(GLOBAL|PERSIST)' -or $up -match '@@(GLOBAL|PERSIST)'){ return $false }
+        }
     }
     return $true
 }
