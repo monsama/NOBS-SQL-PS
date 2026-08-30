@@ -590,6 +590,12 @@ function Api-Script { param($conn,$data)
     try {
         $scriptSql = [string]$data.sql
         if($data.db){ $bt=[string][char]96; $dbEsc=([string]$data.db).Replace($bt,$bt+$bt); $scriptSql = "USE $bt$dbEsc$bt;`n" + $scriptSql }
+        # Applying staged grid edits sends several statements that only make sense together: if
+        # the third fails, the first two must not stay. mysql.exe stops at the first error by
+        # default, so it never reaches the COMMIT and the transaction is rolled back when the
+        # connection closes. Without this the batch ran on autocommit and a failure left the
+        # table half-updated - the one outcome a pending-changes model exists to prevent.
+        if($data.transaction){ $scriptSql = "START TRANSACTION;`n" + $scriptSql + "`nCOMMIT;" }
         [IO.File]::WriteAllText($tmp, $scriptSql, (New-Object System.Text.UTF8Encoding($false)))
         $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId
         if ($r.exit -ne 0 -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
@@ -3831,7 +3837,11 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  t.pending.del.forEach(ri=>{const wh=t.pk.map(p=>qid(p)+'='+lit(t.rows[ri][t.cols.indexOf(p)]));S.push('DELETE FROM '+tbl+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
  t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>lit(row[c])).join(',')+');');});
  if(!S.length)return;log('APPLY:\n'+S.join('\n'));
- const r=await api('/api/script',{sql:'SET FOREIGN_KEY_CHECKS=0;\n'+S.join('\n')});
+ // Runs as one transaction, so a failure part-way leaves the table exactly as it was.
+ // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
+ // parent that does not exist and silently break referential integrity the schema was
+ // written to guarantee.
+ const r=await api('/api/script',{sql:S.join('\n'),transaction:true});
  if(r.ok){log('Applied '+S.length+' change(s).');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);alert('Apply failed:\n\n'+r.error);}}
 
 async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const r=await api('/api/script',{sql:$('ed_'+id).value,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl)loadObjects(t.ddl.db);}else{st.className='status err';st.textContent=r.error;log('APPLY ERROR: '+r.error);}}
