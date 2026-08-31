@@ -673,6 +673,20 @@ function Api-CancelJob { param($data)
     return '{"ok":false,"error":"Job not found - it may have already finished."}'
 }
 # Endpoint: export data (mysqldump for whole schemas, or CSV / INSERT statements).
+# mysqldump has no flag for this (unlike HeidiSQL's own exporter) - DEFINER=`user`@`host`
+# hardcodes whichever MySQL account happened to create each view/trigger/procedure/event into
+# the dump. Restoring on a server where that exact account doesn't exist (a different host, a
+# managed DB service, a teammate's machine, CI) then fails or warns on every one of those
+# objects. Strip it from the resulting file after a successful dump, leaving the surrounding
+# `SQL SECURITY DEFINER/INVOKER` clause and versioned comment wrappers intact - the object just
+# falls back to CURRENT_USER at creation time, which restores identically on the original server too.
+function Strip-DefinerFile { param($file)
+    try {
+        $content = [IO.File]::ReadAllText($file)
+        $stripped = [regex]::Replace($content, 'DEFINER=`(?:[^`]|``)*`@`(?:[^`]|``)*`\s*', '')
+        [IO.File]::WriteAllText($file, $stripped)
+    } catch {}
+}
 function Api-Export { param($conn,$data)
     if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $dbs=@($data.dbs); if($dbs.Count -eq 0){ return '{"ok":false,"error":"No databases selected."}' }
@@ -711,7 +725,7 @@ function Api-Export { param($conn,$data)
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                 [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
             }
-            elseif($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) all_selected : "+(FirstErr $r.err)) }
+            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) all_selected : "+(FirstErr $r.err)) }
         }
         elseif($mode -eq 'db'){
             # One file per database (includes routines/events/create-db as chosen).
@@ -730,7 +744,7 @@ function Api-Export { param($conn,$data)
                     [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                     break
                 }
-                if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(FirstErr $r.err)) }
+                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(FirstErr $r.err)) }
             }
         }
         else {
@@ -755,7 +769,7 @@ function Api-Export { param($conn,$data)
                         [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                         break dbloop
                     }
-                    if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(FirstErr $r.err)) }
+                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(FirstErr $r.err)) }
                 }
                 if($job.Cancelled){ break }
                 # Routines + events are database-level, so they go in one extra file per database.
@@ -765,7 +779,7 @@ function Api-Export { param($conn,$data)
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
                     $a+=$d; $a+="--result-file=$file"
                     $r=Run-Proc $script:MysqldumpPath $a $null $jobId
-                    if($r.exit -eq 0 -and (Test-Path $file)){ $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(FirstErr $r.err)) }
+                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(FirstErr $r.err)) }
                 }
             }
         }
@@ -4560,7 +4574,8 @@ const EXPOPTS=[
  ['quick','quick',1,'Stream rows instead of buffering the whole table: needed for very large tables.','Performance'],
  ['compress','compress',0,'Compress the client/server connection during the dump (more CPU, less network).','Performance'],
  ['gtid','set-gtid-purged=OFF',0,'Do not write GTID replication info: avoids import errors on non-GTID servers.','Compatibility'],
- ['colstats','column-statistics=0',0,'Disable column statistics: fixes an error when a MySQL 8 client dumps MariaDB.','Compatibility']
+ ['colstats','column-statistics=0',0,'Disable column statistics: fixes an error when a MySQL 8 client dumps MariaDB.','Compatibility'],
+ ['nodefiner','remove DEFINER clauses',1,'Strip DEFINER=`user`@`host` from views/triggers/procedures/events: without this, restoring on a server where that exact account does not exist fails or warns on every one of them.','Compatibility']
 ];
 // openExport() rebuilds the option checkboxes every time it runs, so each one came back at
 // its EXPOPTS default and any choice the user had made was silently discarded the next time
