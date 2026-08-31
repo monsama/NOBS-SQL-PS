@@ -290,6 +290,17 @@ function FirstErr { param($e)
     $err=$lines | Where-Object{ $_ -match '(?i)error' } | Select-Object -First 1
     if($err){ $err } elseif($lines.Count){ $lines[0] } else { '' }
 }
+# mysqldump/mysql print exactly this wording (no "ERROR NNNN" prefix, so FirstErr returns it
+# verbatim) when a flag the binary doesn't recognise is passed - which happens whenever an
+# export/import option only supported by one dump-tool flavor (MySQL vs MariaDB, or an older
+# version of either) is used against the other. Name the likely cause instead of leaving a bare
+# "unknown variable" for the user to puzzle over.
+function Friendly-DumpErr { param($raw)
+    if($raw -match "unknown variable '([^']*)'"){
+        return "$raw - '$($matches[1])' isn't supported by this build of the tool (MySQL and MariaDB's client tools, and different versions of each, support different flag sets). Uncheck the matching export/import option, or point Settings at the other flavor's .exe."
+    }
+    return $raw
+}
 
 $script:JStrSpecialChars = [char[]]@('\','"',"`r","`n","`t",[char]0,[char]1,[char]2,[char]3,[char]4,[char]5,[char]6,[char]7,[char]8,[char]11,[char]12,[char]14,[char]15,[char]16,[char]17,[char]18,[char]19,[char]20,[char]21,[char]22,[char]23,[char]24,[char]25,[char]26,[char]27,[char]28,[char]29,[char]30,[char]31)
 # Encode ONE raw value as JSON (we build JSON by hand to avoid ConvertTo-Json quirks).
@@ -711,9 +722,15 @@ function Api-Export { param($conn,$data)
         if($o.tzutc){$common+='--tz-utc'}else{$common+='--skip-tz-utc'}
         if($o.maxpacket){ $common+=("--max-allowed-packet="+[string]$o.maxpacket) }
 
+        # Only meaningful in 'single' mode - db/table mode each produce one file per object, so
+        # a single manual name has nowhere to go. A trailing .sql the user typed themselves is
+        # stripped so it doesn't end up doubled ("backup.sql" + our own ".sql" suffix).
+        $customName = ([string]$data.filename).Trim()
+        $singleBase = if(-not $customName){ 'all_selected' } else { ($customName -replace '\.sql$','' -replace '[^\w\.\-]','_') }
+
         if($mode -eq 'single'){
             # One combined file for all selected databases.
-            $file=Join-Path $folder ("all_selected$stamp.sql")
+            $file=Join-Path $folder ("$singleBase$stamp.sql")
             $a=@()+$common+@('--databases')
             if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
             if($o.adddropdb){$a+='--add-drop-database'}; if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
@@ -725,7 +742,7 @@ function Api-Export { param($conn,$data)
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                 [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
             }
-            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) all_selected : "+(FirstErr $r.err)) }
+            elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $singleBase : "+(Friendly-DumpErr (FirstErr $r.err))) }
         }
         elseif($mode -eq 'db'){
             # One file per database (includes routines/events/create-db as chosen).
@@ -744,7 +761,7 @@ function Api-Export { param($conn,$data)
                     [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                     break
                 }
-                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(FirstErr $r.err)) }
+                if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))) }
             }
         }
         else {
@@ -769,7 +786,7 @@ function Api-Export { param($conn,$data)
                         [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
                         break dbloop
                     }
-                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(FirstErr $r.err)) }
+                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(Friendly-DumpErr (FirstErr $r.err))) }
                 }
                 if($job.Cancelled){ break }
                 # Routines + events are database-level, so they go in one extra file per database.
@@ -779,7 +796,7 @@ function Api-Export { param($conn,$data)
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
                     $a+=$d; $a+="--result-file=$file"
                     $r=Run-Proc $script:MysqldumpPath $a $null $jobId
-                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(FirstErr $r.err)) }
+                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))) }
                 }
             }
         }
@@ -809,7 +826,7 @@ function Api-Import { param($conn,$data)
                 $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId
                 $autoRetried = $true
             }
-            [void]$log.Add($(if($r.exit -eq 0){"OK  "+[IO.Path]::GetFileName($f)+$(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})}else{"FAILED ($($r.exit)) "+[IO.Path]::GetFileName($f)+" : "+(FirstErr $r.err)+$(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})}))
+            [void]$log.Add($(if($r.exit -eq 0){"OK  "+[IO.Path]::GetFileName($f)+$(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})}else{"FAILED ($($r.exit)) "+[IO.Path]::GetFileName($f)+" : "+(Friendly-DumpErr (FirstErr $r.err))+$(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})}))
         }
         if($job.Cancelled){ '{"ok":true,"cancelled":true,"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"log":'+(J-Arr $log)+'}' }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
@@ -1026,7 +1043,16 @@ function Api-ToolsStatus {
     $d = if($script:MysqldumpPath){$script:MysqldumpPath}else{'(not found)'}
     $ms = if($script:MysqlSource){$script:MysqlSource}else{''}
     $ds = if($script:MysqldumpSource){$script:MysqldumpSource}else{''}
-    '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
+    # A handful of export options only exist on one dump-tool flavor: --set-gtid-purged is
+    # MySQL 5.6+ only, --column-statistics is MySQL 8+ only - MariaDB's mysqldump has neither,
+    # and checking either against it aborts the whole export with "unknown variable". Running
+    # --version once here lets the export dialog grey those options out up front instead of
+    # letting the user discover it mid-export.
+    $dumpIsMariaDb = 'null'
+    if($script:MysqldumpPath){
+        try { $ver = & $script:MysqldumpPath --version 2>$null; if($ver -match '(?i)mariadb'){ $dumpIsMariaDb='true' } else { $dumpIsMariaDb='false' } } catch {}
+    }
+    '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"mysqldump_is_mariadb":'+$dumpIsMariaDb+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
 }
 # Endpoint: return the current tool paths / config for the Settings dialog.
 function Api-GetConfig {
@@ -1965,9 +1991,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="expDbs" style="max-height:150px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div>
  <div class="row"><b>Options</b></div><div class="grid2" id="expOpts"></div>
  <div class="row"><label title="How a NULL is written to CSV. \N is what LOAD DATA reads back; blank makes NULL and an empty string indistinguishable in the file.">NULL value <input id="expNullVal" value="\N" style="width:52px;font-family:Consolas,monospace"></label> Charset <select id="expCharset"><option>utf8mb4</option><option>utf8</option><option>latin1</option><option>binary</option></select>
-  <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle"> single file</label>
+  <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked onchange="expSyncFilenameField()"> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer" onchange="expSyncFilenameField()"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle" onchange="expSyncFilenameField()"> single file</label>
   <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked> timestamp</label>
-  <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label></div>
+  <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label>
+  <label id="expFilenameRow" title="Only applies to “single file” mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none">filename <input id="expFilename" placeholder="all_selected" style="width:120px"></label></div>
  <div class="row">Folder <input id="expFolder" style="flex:1" value="C:\temp"><button onclick="browse({title:'Select export folder',mode:'folder',start:$('expFolder').value,onPick:pp=>$('expFolder').value=pp})">Browse...</button></div>
  <div class="row"><button class="go" id="expGoBtn" onclick="runExport()">Start Export</button><button class="warn" id="expCancelBtn" disabled onclick="cancelJob('exp')">Cancel</button><button onclick="hide('mExport')">Close</button></div>
  <div id="expProgress" style="display:none;margin-top:8px">
@@ -4600,6 +4627,8 @@ const grouped={};EXPOPTS.forEach(o=>{const g=o[4]||'Other';(grouped[g]=grouped[g
   grouped[g].forEach(([k,l,d,t])=>{ob.innerHTML+='<label class="ck" title="'+esc(t||'')+'"><input type="checkbox" id="eo_'+k+'" '+(d?'checked':'')+'> '+l+'</label>';});
 });
 expOptsRestore();
+expSyncFilenameField();
+expApplyDumpFlavor();
 if(preselect&&preselect.db){
   document.querySelectorAll('.expdb').forEach(cb=>{cb.checked=(cb.value===preselect.db);});
   if(preselect.table){
@@ -4612,6 +4641,35 @@ if(preselect&&preselect.db){
 }
 show('mExport');}
 function expAll(v){[...document.querySelectorAll('.expdb')].forEach(c=>c.checked=v);}
+function expSyncFilenameField(){const row=$('expFilenameRow');if(row)row.style.display=$('expSingle').checked?'inline-flex':'none';}
+// A few export options only exist on one mysqldump flavor: --set-gtid-purged is MySQL 5.6+
+// only, --column-statistics is MySQL 8+ only - MariaDB's mysqldump has neither, and checking
+// either against it aborts the WHOLE export with "unknown variable". Grey them out up front
+// (based on tools_status's one-time `--version` check) instead of letting that be a surprise
+// mid-export - the backend also has a friendlier error message as a fallback for anything this
+// doesn't catch (an unusual custom mysqldump path, a version too old for a flag, etc).
+const MYSQL_ONLY_EXPOPTS={
+ gtid:'set-gtid-purged is MySQL 5.6+ only - not supported by MariaDB’s mysqldump.',
+ colstats:'column-statistics is MySQL 8+ only - not supported by MariaDB’s mysqldump.'
+};
+async function expApplyDumpFlavor(){
+ let r; try{ r=await api('/api/tools-status'); }catch(e){ return; }
+ const isMariaDb=!!(r&&r.ok&&r.mysqldump_is_mariadb===true);
+ Object.keys(MYSQL_ONLY_EXPOPTS).forEach(k=>{
+  const el=$('eo_'+k); if(!el)return;
+  const lbl=el.closest('label');
+  let note=lbl&&lbl.querySelector('.expoptsdis');
+  if(isMariaDb){
+   el.disabled=true; el.checked=false;
+   if(lbl){ lbl.title='Not supported: '+MYSQL_ONLY_EXPOPTS[k]; lbl.style.opacity='.55';
+    if(!note){ note=document.createElement('span'); note.className='expoptsdis'; note.style.cssText='font-size:10px;color:var(--del);margin-left:4px'; note.textContent='(unsupported by this mysqldump)'; lbl.appendChild(note); } }
+  } else {
+   el.disabled=false;
+   if(lbl)lbl.style.opacity='';
+   if(note)note.remove();
+  }
+ });
+}
 async function expTables(db,safe){const c=$('expt_'+safe);if(!c)return;const cx=$('expx_'+safe);if(c.style.display==='none'){c.style.display='block';if(cx)cx.textContent='\u25BE';if(!c.dataset.loaded){c.innerHTML='<span class="muted" style="font-size:11px">Loading\u2026</span>';const q=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit(db)+' ORDER BY TABLE_NAME'});if(!q.ok){c.innerHTML='<span class="muted" style="font-size:11px">'+esc(q.error||'Could not list tables')+'</span>';return;}if(!q.rows.length){c.innerHTML='<span class="muted" style="font-size:11px">(no tables)</span>';c.dataset.loaded='1';return;}const dbCk=document.querySelector('.expdb[value="'+db.replace(/"/g,'&quot;')+'"]');const on=dbCk?dbCk.checked:true;let h='<div class="muted" style="font-size:11px;margin:1px 0 3px">Untick a table to exclude it from the export:</div>';q.rows.forEach(r=>{const tn=r[0];h+='<label class="ck" style="font-size:12px"><input type="checkbox" class="exptbl" data-db="'+esc(db)+'" value="'+esc(tn)+'" '+(on?'checked':'')+'> '+esc(tn)+'</label>';});c.innerHTML=h;c.dataset.loaded='1';}}else{c.style.display='none';if(cx)cx.textContent='\u25B8';}}
 function expDbToggle(safe,on){document.querySelectorAll('#expt_'+safe+' .exptbl').forEach(c=>{c.checked=on;});}
 async function runExport(){const dbs=[...document.querySelectorAll('.expdb:checked')].map(c=>c.value);
@@ -4640,7 +4698,7 @@ if(!dbs.length && tables.length){
  if(mode==='table'){try{const cq=await api('/api/query',{sql:"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA IN ("+dbs.map(lit).join(',')+")"});if(cq.ok&&cq.rows.length){label+=' (~'+fmtCount(cq.rows[0][0])+' tables)';}}catch(e){}}
  const jobId=(crypto.randomUUID?crypto.randomUUID():('j'+Date.now()+Math.random()));
  progStart('exp',label,jobId);
- const r=await api('/api/export',{dbs,options:o,folder:$('expFolder').value,mode:mode,stamp:$('expStamp').checked,excludes:excludes,jobId:jobId});
+ const r=await api('/api/export',{dbs,options:o,folder:$('expFolder').value,mode:mode,filename:$('expFilename').value.trim(),stamp:$('expStamp').checked,excludes:excludes,jobId:jobId});
  progStop('exp');
  if(r.cancelled){log('Export cancelled.');}
  if(!r.ok){showToolError('expLog','mExport',r.error);log('Export error: '+r.error);return;}
