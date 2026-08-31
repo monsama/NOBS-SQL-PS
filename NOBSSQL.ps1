@@ -5364,7 +5364,16 @@ $RequestHandler = {
         $req = Read-Request $client
         if ($req.path -eq '/api/ping') { $SharedState.LastPing = Get-Date; Send-Json $client '{"ok":true}'; return }
         if ($req.path -eq '/' -or $req.path -eq '/index.html') { Send-Http $client '200 OK' 'text/html; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes($Html)); return }
-        if ($req.path -eq '/api/quit') { Send-Json $client '{"ok":true}'; $SharedState.Quit = $true; return }
+        if ($req.path -eq '/api/quit') {
+            # Same token check every other /api/* route gets below - without it, any local
+            # process (or script, or malicious page if this port were ever reachable another
+            # way) could force-quit the server with a bare unauthenticated POST. The frontend's
+            # own quit() already sends the token via api()'s p.token=TOKEN, so this costs nothing
+            # for the legitimate caller.
+            $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
+            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            Send-Json $client '{"ok":true}'; $SharedState.Quit = $true; return
+        }
         if ($req.path -like '/api/*') {
             $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
             if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }

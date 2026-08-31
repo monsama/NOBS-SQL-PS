@@ -1,0 +1,22 @@
+name: test
+
+# Runs the existing read-only/safe-mode guard test (tests/Test-SqlReadOnly.Tests.ps1) on every
+# push to main and every PR against it. It's the safety net people rely on when pointing this at
+# a production server, so it should fail the check on a regression rather than only being caught
+# by hand-testing later - previously this only ran when someone remembered to run it locally.
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  test:
+    # windows-latest ships PowerShell 7 (pwsh) already, matching this app's actual target
+    # platform - no extra setup needed.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run Test-SqlReadOnly tests
+        shell: pwsh
+        run: ./tests/Test-SqlReadOnly.Tests.ps1 ./NOBSSQL.ps1
