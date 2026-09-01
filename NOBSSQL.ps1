@@ -49,6 +49,13 @@ $script:MysqlPath     = $null
 $script:ServerIsMariaDB = $null
 $script:RunningQueries = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# Live, streaming query cursors opened by /api/query and read incrementally by
+# /api/fetch-cursor-batch (possibly from a DIFFERENT pooled runspace than the one that opened
+# it - see the RUNSPACE POOL SETUP section near the bottom, which shares this dictionary the
+# same way it already shares $script:RunningQueries). Keyed by a generated cursorId; each value
+# is the pscustomobject built by Open-QueryCursor (Process/Reader/Headers/Pending/RequestId/
+# Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
+$script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
 # MANY sequential queries (one per table/chunk) rather than one big one, so instead of trying to
 # kill whichever single sub-query happens to be in flight, each loop just checks this set between
@@ -384,6 +391,152 @@ function Run-Query2 {
         return @{ ok=$true; columns=$headers; rows=$rows }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
+
+# ============================================================================
+#  STREAMING QUERY CURSORS (large-result-set editor queries)
+#  ----------------------------------------------------------------------------
+#  Run-Query2 above (and Run-Query2Bulk below) read the ENTIRE mysql.exe stdout
+#  via ReadToEndAsync() before parsing a single row - fine for the DDL/PK/FK/
+#  compare-support queries they're used for, but a real crash risk for an
+#  editor query against a large table: a high/missing LIMIT fully materializes
+#  the whole result set as one giant .NET string before any of it is returned.
+#
+#  mysql.exe (both the Oracle and MariaDB client) makes this WORSE than it
+#  looks: by default it buffers the entire result set INSIDE the client
+#  process (mysql_store_result semantics) before it prints anything at all -
+#  so reading its stdout incrementally, by itself, does NOT bound memory; the
+#  full buffering already happened before a single line reaches us. The
+#  --quick flag switches the client to unbuffered/streaming mode
+#  (mysql_use_result semantics: fetch-and-print one row at a time as the
+#  server sends it), which is what actually makes incremental reading here
+#  meaningful. Every cursor-path invocation below passes --quick for exactly
+#  this reason - Run-Query2/Run-Query2Bulk deliberately do NOT, since their
+#  callers already assume a fully-materialized in-memory result.
+#
+#  Because every query still shells out to a fresh mysql.exe process (there is
+#  no persistent DB connection object to hold a server-side cursor on, unlike
+#  a real DB driver), the "cursor" here IS the live mysql.exe process plus an
+#  open StreamReader over its stdout: Open-QueryCursor starts it and reads
+#  just the first page; Api-FetchCursorBatch reads more pages from the SAME
+#  still-running process on a later request (possibly handled by a different
+#  pooled runspace, which is why the registry is a ConcurrentDictionary shared
+#  via $iss.Variables exactly like $script:RunningQueries already is). The
+#  process is registered under the caller's RequestId in $script:RunningQueries
+#  using the EXISTING Api-CancelQuery kill path - no second cancel mechanism -
+#  and that registration is intentionally NOT cleared just because the first
+#  page returned; only whichever event eventually finishes the cursor
+#  (exhaustion, an explicit /api/close-cursor, the idle sweep in the main
+#  server loop, or a Cancel-triggered kill) clears it, via Close-QueryCursorProc.
+# ============================================================================
+
+# Reads up to $PageSize more data rows from a cursor's stream, using the
+# shared cell-decoding logic (CellVal, defined above) rather than duplicating
+# it. Uses the classic "read one extra row, and hold onto it" trick to learn
+# whether more data remains without blocking on a row that isn't there yet:
+# if the (PageSize+1)th row is read successfully, it is stashed on
+# $cursorObj.Pending (NOT included in this call's returned rows) so the NEXT
+# call to this function starts by consuming it before reading anything new.
+function Read-CursorRows {
+    param($cursorObj, [int]$PageSize)
+    $hCount = $cursorObj.Headers.Count
+    $rows = New-Object System.Collections.ArrayList
+    $count = 0
+    if ($null -ne $cursorObj.Pending) {
+        $fields = $cursorObj.Pending.Split([char]9)
+        $cells = New-Object object[] $hCount
+        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
+        [void]$rows.Add($cells)
+        $cursorObj.Pending = $null
+        $count = 1
+    }
+    while ($count -lt $PageSize) {
+        $line = $null
+        try { $line = $cursorObj.Reader.ReadLine() } catch { $line = $null }
+        if ($null -eq $line) { return @{ rows=$rows; hasMore=$false } }
+        $fields = $line.Split([char]9)
+        $cells = New-Object object[] $hCount
+        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
+        [void]$rows.Add($cells)
+        $count++
+    }
+    # Got a full page - peek one more line to learn whether more data remains.
+    $peek = $null
+    try { $peek = $cursorObj.Reader.ReadLine() } catch { $peek = $null }
+    if ($null -eq $peek) { return @{ rows=$rows; hasMore=$false } }
+    $cursorObj.Pending = $peek
+    return @{ rows=$rows; hasMore=$true }
+}
+
+# Finishes a cursor: waits for the process to exit (it is expected to be at or
+# very near EOF/exit by the time this is called - either naturally exhausted,
+# or already Kill()ed by the caller), collects stderr, disposes the
+# reader/process, removes its RunningQueries registration (the SAME dictionary
+# /api/cancel-query already looks requestId up in - this is the sole point
+# that clears it for a cursor-backed query), and deletes its temp my.cnf.
+function Close-QueryCursorProc {
+    param($cursor)
+    try { $cursor.Process.WaitForExit() } catch {}
+    $errTxt = try { $cursor.ErrTask.Result } catch { '' }
+    $exitCode = try { $cursor.Process.ExitCode } catch { -1 }
+    try { $cursor.Reader.Dispose() } catch {}
+    try { $cursor.Process.Dispose() } catch {}
+    if ($cursor.RequestId) { $null = $script:RunningQueries.TryRemove($cursor.RequestId, [ref]$null) }
+    if ($cursor.Cnf) { Remove-Item $cursor.Cnf -Force -ErrorAction SilentlyContinue }
+    @{ exit=$exitCode; err=$errTxt }
+}
+
+# Starts mysql.exe --quick for an editor query, registers it in RunningQueries
+# under $RequestId (the existing Api-CancelQuery kill path), reads the header
+# line, then reads up to $PageSize+1 rows. If the whole result fit in one page
+# the process has already finished by the time this returns - it is closed
+# immediately and no cursor is registered. Otherwise a cursorId is generated
+# and the still-open process/reader is registered in $script:OpenCursors for
+# Api-FetchCursorBatch to continue from.
+function Open-QueryCursor {
+    param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
+    if ($PageSize -lt 1) { $PageSize = 1000 }
+    $cnf = New-Cnf $conn
+    $a=@("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
+    if ($db) { $a += "--database=$db" }
+    $a += @("-e",$sql)
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$script:MysqlPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+    $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
+    $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
+    $psi.Arguments=Format-Args $a
+    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
+    $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
+    if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
+    $cursor=[pscustomobject]@{
+        Process=$p; Reader=$p.StandardOutput; ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry
+        Headers=$null; Pending=$null; RequestId=$RequestId; Cnf=$cnf
+        LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
+    }
+    $headerLine=$null
+    try { $headerLine = $cursor.Reader.ReadLine() } catch { $headerLine = $null }
+    if ($null -eq $headerLine) {
+        # No stdout at all - either a real error, or a statement with no result set.
+        $r = Close-QueryCursorProc $cursor
+        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
+        if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
+        return @{ ok=$true; columns=@(); rows=@(); hasMore=$false }
+    }
+    $cursor.Headers = @($headerLine.Split([char]9))
+    $page = Read-CursorRows $cursor $PageSize
+    if (-not $page.hasMore) {
+        $r = Close-QueryCursorProc $cursor
+        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
+        # Rare: --quick already streamed some rows, then the connection/query failed partway
+        # through (lost connection, deadlock victim, etc). Surface as an error rather than
+        # silently showing a truncated result as if it were the complete one.
+        if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
+        return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$false }
+    }
+    $cursorId = [guid]::NewGuid().ToString()
+    $script:OpenCursors[$cursorId] = $cursor
+    return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$true; cursorId=$cursorId }
+}
+
 # Leaner variant of Run-Query2, purpose-built for bulk-fetching a PRIMARY KEY column list (e.g.
 # ~950,000 ids to work out what's missing/different in Compare). Run-Query2 is general-purpose -
 # it checks every single cell for NULL, decodes backslash-escapes, and hex-encodes control
@@ -641,20 +794,72 @@ function Api-RowOp { param($conn,$data)
     } else { return '{"ok":false,"error":"bad op"}' }
     Run-Exec $conn $sql
 }
-# Endpoint: run a SELECT and return rows for the results grid.
-function Api-Query { param($conn,$sql,$db,$RequestId)
+# Endpoint: run a SELECT and return the first page of rows for the results grid, via a streaming
+# --quick cursor (Open-QueryCursor) instead of Run-Query2's full-buffer read - the fix for a
+# high/missing LIMIT against a large table crashing the whole server. The SQL runs completely
+# as-is: no LIMIT/OFFSET rewriting, no detection of whether it already has a LIMIT. If more rows
+# remain than fit in one page, the response carries hasMore:true and a cursorId for
+# Api-FetchCursorBatch to continue from; otherwise the cursor is already closed server-side.
+function Api-Query { param($conn,$sql,$db,$RequestId,$PageSize)
     if(-not $sql -or -not ([string]$sql).Trim()){ return '{"ok":false,"error":"Empty query."}' }
+    $ps=[int]$PageSize; if($ps -lt 1){ $ps=1000 }
     $sw=[System.Diagnostics.Stopwatch]::StartNew()
-    $r=Run-Query2 $conn $sql $db $RequestId
-    $swFetch=$sw.ElapsedMilliseconds
-    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
-    if($r.columns.Count -eq 0){ $sw.Stop(); return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
-    $rowsJson = J-RowsFast $r.rows
+    $r=Open-QueryCursor $conn $sql $db $RequestId $ps
     $sw.Stop()
-    $jsonMs = $sw.ElapsedMilliseconds - $swFetch
-    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+',"fetchMs":'+$swFetch+',"jsonMs":'+$jsonMs+'}'
+    if(-not $r.ok){
+        if($r.cancelled){ return '{"ok":false,"error":'+(J-Str $r.err)+',"cancelled":true}' }
+        return '{"ok":false,"error":'+(J-Str $r.err)+'}'
+    }
+    if($r.columns.Count -eq 0){ return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
+    $rowsJson = J-RowsFast $r.rows
+    $tail = if($r.hasMore){ ',"hasMore":true,"cursorId":"'+$r.cursorId+'"' } else { '' }
+    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+$tail+'}'
+}
+# Endpoint: continue reading from a still-open cursor opened by Api-Query, returning the next
+# page. On exhaustion, closes the cursor (process + reader + its RunningQueries registration).
+# A cursor killed via Cancel (same $script:RunningQueries entry Api-CancelQuery already kills)
+# is reported as a cancellation here rather than a raw read/pipe error.
+function Api-FetchCursorBatch { param($data)
+    $cid = [string]$data.cursorId
+    if (-not $cid) { return '{"ok":false,"error":"no cursorId"}' }
+    $cursor = $null
+    if (-not $script:OpenCursors.TryGetValue($cid, [ref]$cursor)) {
+        return '{"ok":false,"error":"Cursor not found - it may have already finished or been closed."}'
+    }
+    $ps=[int]$data.pageSize; if($ps -lt 1){ $ps=1000 }
+    [System.Threading.Monitor]::Enter($cursor.Lock)
+    try {
+        $cursor.LastUsed = [DateTime]::UtcNow
+        $page = Read-CursorRows $cursor $ps
+        if (-not $page.hasMore) {
+            $null = $script:OpenCursors.TryRemove($cid, [ref]$null)
+            $r = Close-QueryCursorProc $cursor
+            if ($cursor.Entry.Cancelled) { return '{"ok":false,"error":"Query cancelled.","cancelled":true}' }
+            if ($r.exit -ne 0) { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
+            return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":false}'
+        }
+        return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":true,"cursorId":"'+$cid+'"}'
+    } finally { [System.Threading.Monitor]::Exit($cursor.Lock) }
+}
+# Endpoint: close a cursor the frontend no longer needs (tab closed, new query replacing it, or
+# just tidying up after a fully-consumed one). Always returns ok:true, even for an
+# unknown/already-gone cursorId - the frontend calls this defensively at several sites.
+function Api-CloseCursor { param($data)
+    $cid = [string]$data.cursorId
+    if ($cid) {
+        $cursor = $null
+        if ($script:OpenCursors.TryRemove($cid, [ref]$cursor)) {
+            try { if (-not $cursor.Process.HasExited) { $cursor.Process.Kill() } } catch {}
+            $null = Close-QueryCursorProc $cursor
+        }
+    }
+    '{"ok":true}'
 }
 # Endpoint: cancel a running query started with the given requestId (kills its mysql.exe process).
+# This is also what kills a streaming cursor's process mid-read - the cursor stays registered
+# under its original RequestId in $script:RunningQueries for its whole life (see Open-QueryCursor
+# / Close-QueryCursorProc above), so Cancel keeps working across "fetch next" calls too, not just
+# the very first page.
 function Api-CancelQuery { param($data)
     $rid = [string]$data.requestId
     if (-not $rid) { return '{"ok":false,"error":"no requestId"}' }
@@ -2177,6 +2382,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 
 <script>
 const TOKEN="__TOKEN__";
+const PAGE_BATCH=1000;
 let curSchema=null, tabs=[], tabSeq=0, activeTab=null;
 /* ============================================================================
    FRONT-END (runs in the browser)
@@ -2717,8 +2923,9 @@ function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st
   const rowLabel=(t.table&&t.estRows!=null)?(t.rows.length+' row(s) of '+fmtCount(t.estRows)+' rows.'):(t.rows.length+' row(s).');
   const viewLabel=(t.rows.length>0)?(' View shows '+viewRangeLabel(id)+'.'):'';
   const ms=(t.lastElapsedMs!=null)?(' '+t.lastElapsedMs+' ms'):'';
+  const moreLabel=t.hasMore?('  |  more rows available - Fetch next '+PAGE_BATCH+' rows'):'';
   st.className='status';
-  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'');
+  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'')+moreLabel;
 }
 let objData=null;
 async function loadObjects(db) {
@@ -3170,6 +3377,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'" style="display:none;gap:9px;align-items:center" class="tbgroup">'+
   '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')">Wrap: Off</button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)">Columns</button>'+
+  '<button class="sm" id="fetchmore_'+id+'" style="display:none" title="The result set was too large to load in one go - pull the next '+PAGE_BATCH+' rows from the still-open query" onclick="fetchNextBatch(\''+id+'\')">Fetch next '+PAGE_BATCH+' rows</button>'+
   '<span class="tbsep"></span></span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
@@ -3334,7 +3542,7 @@ const MODAL_CLOSE_OVERRIDES={mCompare:cmpCloseAndCancel,mCompareRows:cmprCloseAn
 // exactly the bug Escape already had before this existed.
 function modalClose(id){const fn=MODAL_CLOSE_OVERRIDES[id];if(fn)fn();else hide(id);}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){const open=[...document.querySelectorAll('.modal.show')].filter(m=>!window._floatingMinimized[m.id]);if(open.length){modalClose(open[open.length-1].id);}}});
-function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
+function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}closeCursorFor(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
 // Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
 // connections are keyed by host+user+port so different credentials don't collide).
 function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
@@ -3476,6 +3684,7 @@ function markEdited(id){
 function dbOf(t){ if(t&&(t.table||t.ddl)&&!t.sqlEdited)return t.db||curSchema||null; /* table-view + DDL tabs keep their own schema, until their SQL is edited - see markEdited() */ return curSchema||(t&&t.db)||null; /* plain query tabs follow the selected sidebar schema */ }
 // runSql(): send the editor SQL to the server and show the rows (or the error).
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
+ closeCursorFor(t);
  addHistory(sql);
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const lastStmt=(stmts[stmts.length-1]||sql).trim();
@@ -3524,13 +3733,15 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
-    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId},t.abortCtrl.signal);
+    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
     if(!T(id))return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
     t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();$('edit_'+id).innerHTML='';
-    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
+    t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
+    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';updateFetchMoreBtn(id);return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
+    updateFetchMoreBtn(id);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
@@ -3589,6 +3800,38 @@ async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.
    else{try{await fetch('/api/cancel-query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,requestId:rid})});}catch(e){}}
  }
  log('Cancel requested.');}
+
+// Fire-and-forget: tell the server to close a tab's open streaming query cursor (if any), and
+// clear the local handle. Safe to call whenever - an unknown/already-gone cursorId is a no-op on
+// the server. Called before a tab starts a new run (replacing whatever cursor the previous run
+// left open) and from closeTab/closeAll/closeOthers, since a tab can have an open cursor waiting
+// on "fetch next" independently of whether a query is actively "running" (t.runningReqId).
+function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
+ try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
+function updateFetchMoreBtn(id){const b=$('fetchmore_'+id);if(!b)return;const t=T(id);b.style.display=(t&&t.hasMore)?'':'none';}
+// fetchNextBatch(): pulls the next page of rows from the SAME still-open server-side cursor (not
+// a re-run with a growing OFFSET) and appends them to the tab's already-loaded rows. Reuses the
+// same t.runningReqId/setRunning toggle the initial run uses - and keeps t.cursorReqId (the SAME
+// requestId the cursor was originally registered under) as the id sent to /api/cancel-query - so
+// the existing Cancel button/cancelQuery(id) plumbing keeps working unmodified during a slow
+// "fetch next" too, not just on the very first page.
+async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId)return;
+ const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
+ t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
+ if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows…';}
+ try{
+  const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
+  if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
+  if(!T(id))return;
+  if(!r.ok){if(st){st.className='status err';st.textContent=r.error;}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;updateFetchMoreBtn(id);return;}
+  t.rows=t.rows.concat(r.rows);
+  t.hasMore=!!r.hasMore;t.cursorId=r.hasMore?(r.cursorId||t.cursorId):null;t.cursorReqId=t.hasMore?t.cursorReqId:null;
+  if(st){st.className=wasClassName;st.textContent=wasText;}
+  renderGrid(id);updatePager(id);updateStatusLine(id);updateFetchMoreBtn(id);
+ } finally {
+  if(T(id)){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+ }
+}
 
 function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total){p.innerHTML='';return;}
  const ps=t.limit||1000;const off=t.offset||0;const shown=Math.min(ps,Math.max(0,total-off));const prevDis=off<=0?' disabled':'';const nextDis=(off+ps>=total)?' disabled':'';
@@ -5179,9 +5422,14 @@ function impAddFiles(){browse({title:'Select SQL files',filter:'*.sql',mode:'fil
 function impAddFolder(){browse({title:'Select a folder (imports all .sql inside)',mode:'folder',onPick:async folder=>{const r=await api('/api/browse',{path:folder,filter:'*.sql',dirsOnly:false});if(r.ok){const ps=r.files.map(f=>f.path);impAppend(ps);log('Added '+ps.length+' .sql file(s) from '+folder);}else alert(r.error);}});}
 // ---- close tabs ----
 async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
+ await Promise.all(tabs.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
+ tabs.forEach(t=>closeCursorFor(t));
  [...tabs].forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=[];activeTab=null;saveSession();toggleOverview();const _sb=$('schemaBadge');if(_sb){_sb.style.display='none';_sb.textContent='';}}
 async function closeOthers(id){const dirty=tabs.filter(t=>t.id!==id&&pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' other tab(s) have unsaved changes. Close them and discard the changes?')))return;}
- tabs.filter(t=>t.id!==id).forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
+ const others=tabs.filter(t=>t.id!==id);
+ await Promise.all(others.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
+ others.forEach(t=>closeCursorFor(t));
+ others.forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
 
 // ---- keyboard navigation for side lists ----
 function focusList(box){box.focus();const items=[...box.querySelectorAll('.item')];if(items.length){items.forEach(x=>x.classList.remove('kbsel'));items[0].classList.add('kbsel');items[0].scrollIntoView({block:'nearest'});}}
@@ -5342,7 +5590,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -5393,7 +5641,9 @@ $RequestHandler = {
                 '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
                 '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
                 '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
-                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId) }
+                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize) }
+                '/api/fetch-cursor-batch' { Send-Json $client (Api-FetchCursorBatch $data) }
+                '/api/close-cursor' { Send-Json $client (Api-CloseCursor $data) }
                 '/api/cancel-query' { Send-Json $client (Api-CancelQuery $data) }
                 '/api/cancel-job'   { Send-Json $client (Api-CancelJob $data) }
                 '/api/exec'    { Send-Json $client (Api-Exec $conn $data) }
@@ -5480,6 +5730,24 @@ while ($run) {
         } else { $stillRunning.Add($item) }
     }
     $InFlight = $stillRunning
+
+    # Idle-cursor sweep: there's no per-cursor background thread here (unlike a real thread-per-
+    # connection design), so a cursor the frontend opened but never finished reading (e.g. the tab
+    # was left mid-result and closed via something other than closeTab/closeAll/closeOthers, or
+    # the browser tab was simply killed) is reaped here instead, on the loop that already runs
+    # every ~200ms. Kept cheap: normally $script:OpenCursors is empty.
+    if ($script:OpenCursors.Count -gt 0) {
+        $idleCutoff = [DateTime]::UtcNow.AddMinutes(-10)
+        foreach ($kv in @($script:OpenCursors.GetEnumerator())) {
+            if ($kv.Value.LastUsed -lt $idleCutoff) {
+                $idleCursor = $null
+                if ($script:OpenCursors.TryRemove($kv.Key, [ref]$idleCursor)) {
+                    try { if (-not $idleCursor.Process.HasExited) { $idleCursor.Process.Kill() } } catch {}
+                    $null = Close-QueryCursorProc $idleCursor
+                }
+            }
+        }
+    }
 
     if ($SharedState.Quit) { $run = $false }
     elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
