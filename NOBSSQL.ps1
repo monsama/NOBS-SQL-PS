@@ -49,6 +49,13 @@ $script:MysqlPath     = $null
 $script:ServerIsMariaDB = $null
 $script:RunningQueries = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# Live, streaming query cursors opened by /api/query and read incrementally by
+# /api/fetch-cursor-batch (possibly from a DIFFERENT pooled runspace than the one that opened
+# it - see the RUNSPACE POOL SETUP section near the bottom, which shares this dictionary the
+# same way it already shares $script:RunningQueries). Keyed by a generated cursorId; each value
+# is the pscustomobject built by Open-QueryCursor (Process/Reader/Headers/Pending/RequestId/
+# Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
+$script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
 # MANY sequential queries (one per table/chunk) rather than one big one, so instead of trying to
 # kill whichever single sub-query happens to be in flight, each loop just checks this set between
@@ -155,12 +162,19 @@ function Get-SslLines {
     return @()
 }
 # Create a temp my.cnf so the CLI tools can log in WITHOUT the password showing on the command line.
+# A raw newline in a value would otherwise start a brand new line in the .cnf file, letting a
+# saved connection's host/user/password inject an arbitrary extra option-file directive (e.g.
+# "pager=<command>", which the mysql CLI executes) rather than staying part of THIS value.
+# Backslash-doubling (below) only protects against a value being misread as an escape sequence -
+# it does nothing for an actual embedded newline character, which this strips outright since none
+# of these fields have any legitimate use for one.
+function Get-CnfSafe { param([string]$s) if(-not $s){ return $s }; return ($s -replace "[\r\n]", '') }
 function New-Cnf {
     param($conn)
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$($conn.host)"); [void]$sb.AppendLine("port=$($conn.port)"); [void]$sb.AppendLine("user=$($conn.user)")
-    if ($conn.password) { [void]$sb.AppendLine("password=$($conn.password -replace '\\','\\')") }
+    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
+    if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
     foreach ($l in (Get-SslLines $conn.ssl)) { [void]$sb.AppendLine($l) }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
@@ -384,6 +398,152 @@ function Run-Query2 {
         return @{ ok=$true; columns=$headers; rows=$rows }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
+
+# ============================================================================
+#  STREAMING QUERY CURSORS (large-result-set editor queries)
+#  ----------------------------------------------------------------------------
+#  Run-Query2 above (and Run-Query2Bulk below) read the ENTIRE mysql.exe stdout
+#  via ReadToEndAsync() before parsing a single row - fine for the DDL/PK/FK/
+#  compare-support queries they're used for, but a real crash risk for an
+#  editor query against a large table: a high/missing LIMIT fully materializes
+#  the whole result set as one giant .NET string before any of it is returned.
+#
+#  mysql.exe (both the Oracle and MariaDB client) makes this WORSE than it
+#  looks: by default it buffers the entire result set INSIDE the client
+#  process (mysql_store_result semantics) before it prints anything at all -
+#  so reading its stdout incrementally, by itself, does NOT bound memory; the
+#  full buffering already happened before a single line reaches us. The
+#  --quick flag switches the client to unbuffered/streaming mode
+#  (mysql_use_result semantics: fetch-and-print one row at a time as the
+#  server sends it), which is what actually makes incremental reading here
+#  meaningful. Every cursor-path invocation below passes --quick for exactly
+#  this reason - Run-Query2/Run-Query2Bulk deliberately do NOT, since their
+#  callers already assume a fully-materialized in-memory result.
+#
+#  Because every query still shells out to a fresh mysql.exe process (there is
+#  no persistent DB connection object to hold a server-side cursor on, unlike
+#  a real DB driver), the "cursor" here IS the live mysql.exe process plus an
+#  open StreamReader over its stdout: Open-QueryCursor starts it and reads
+#  just the first page; Api-FetchCursorBatch reads more pages from the SAME
+#  still-running process on a later request (possibly handled by a different
+#  pooled runspace, which is why the registry is a ConcurrentDictionary shared
+#  via $iss.Variables exactly like $script:RunningQueries already is). The
+#  process is registered under the caller's RequestId in $script:RunningQueries
+#  using the EXISTING Api-CancelQuery kill path - no second cancel mechanism -
+#  and that registration is intentionally NOT cleared just because the first
+#  page returned; only whichever event eventually finishes the cursor
+#  (exhaustion, an explicit /api/close-cursor, the idle sweep in the main
+#  server loop, or a Cancel-triggered kill) clears it, via Close-QueryCursorProc.
+# ============================================================================
+
+# Reads up to $PageSize more data rows from a cursor's stream, using the
+# shared cell-decoding logic (CellVal, defined above) rather than duplicating
+# it. Uses the classic "read one extra row, and hold onto it" trick to learn
+# whether more data remains without blocking on a row that isn't there yet:
+# if the (PageSize+1)th row is read successfully, it is stashed on
+# $cursorObj.Pending (NOT included in this call's returned rows) so the NEXT
+# call to this function starts by consuming it before reading anything new.
+function Read-CursorRows {
+    param($cursorObj, [int]$PageSize)
+    $hCount = $cursorObj.Headers.Count
+    $rows = New-Object System.Collections.ArrayList
+    $count = 0
+    if ($null -ne $cursorObj.Pending) {
+        $fields = $cursorObj.Pending.Split([char]9)
+        $cells = New-Object object[] $hCount
+        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
+        [void]$rows.Add($cells)
+        $cursorObj.Pending = $null
+        $count = 1
+    }
+    while ($count -lt $PageSize) {
+        $line = $null
+        try { $line = $cursorObj.Reader.ReadLine() } catch { $line = $null }
+        if ($null -eq $line) { return @{ rows=$rows; hasMore=$false } }
+        $fields = $line.Split([char]9)
+        $cells = New-Object object[] $hCount
+        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
+        [void]$rows.Add($cells)
+        $count++
+    }
+    # Got a full page - peek one more line to learn whether more data remains.
+    $peek = $null
+    try { $peek = $cursorObj.Reader.ReadLine() } catch { $peek = $null }
+    if ($null -eq $peek) { return @{ rows=$rows; hasMore=$false } }
+    $cursorObj.Pending = $peek
+    return @{ rows=$rows; hasMore=$true }
+}
+
+# Finishes a cursor: waits for the process to exit (it is expected to be at or
+# very near EOF/exit by the time this is called - either naturally exhausted,
+# or already Kill()ed by the caller), collects stderr, disposes the
+# reader/process, removes its RunningQueries registration (the SAME dictionary
+# /api/cancel-query already looks requestId up in - this is the sole point
+# that clears it for a cursor-backed query), and deletes its temp my.cnf.
+function Close-QueryCursorProc {
+    param($cursor)
+    try { $cursor.Process.WaitForExit() } catch {}
+    $errTxt = try { $cursor.ErrTask.Result } catch { '' }
+    $exitCode = try { $cursor.Process.ExitCode } catch { -1 }
+    try { $cursor.Reader.Dispose() } catch {}
+    try { $cursor.Process.Dispose() } catch {}
+    if ($cursor.RequestId) { $null = $script:RunningQueries.TryRemove($cursor.RequestId, [ref]$null) }
+    if ($cursor.Cnf) { Remove-Item $cursor.Cnf -Force -ErrorAction SilentlyContinue }
+    @{ exit=$exitCode; err=$errTxt }
+}
+
+# Starts mysql.exe --quick for an editor query, registers it in RunningQueries
+# under $RequestId (the existing Api-CancelQuery kill path), reads the header
+# line, then reads up to $PageSize+1 rows. If the whole result fit in one page
+# the process has already finished by the time this returns - it is closed
+# immediately and no cursor is registered. Otherwise a cursorId is generated
+# and the still-open process/reader is registered in $script:OpenCursors for
+# Api-FetchCursorBatch to continue from.
+function Open-QueryCursor {
+    param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
+    if ($PageSize -lt 1) { $PageSize = 1000 }
+    $cnf = New-Cnf $conn
+    $a=@("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
+    if ($db) { $a += "--database=$db" }
+    $a += @("-e",$sql)
+    $psi=New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName=$script:MysqlPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+    $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
+    $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
+    $psi.Arguments=Format-Args $a
+    $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
+    $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
+    if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
+    $cursor=[pscustomobject]@{
+        Process=$p; Reader=$p.StandardOutput; ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry
+        Headers=$null; Pending=$null; RequestId=$RequestId; Cnf=$cnf
+        LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
+    }
+    $headerLine=$null
+    try { $headerLine = $cursor.Reader.ReadLine() } catch { $headerLine = $null }
+    if ($null -eq $headerLine) {
+        # No stdout at all - either a real error, or a statement with no result set.
+        $r = Close-QueryCursorProc $cursor
+        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
+        if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
+        return @{ ok=$true; columns=@(); rows=@(); hasMore=$false }
+    }
+    $cursor.Headers = @($headerLine.Split([char]9))
+    $page = Read-CursorRows $cursor $PageSize
+    if (-not $page.hasMore) {
+        $r = Close-QueryCursorProc $cursor
+        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
+        # Rare: --quick already streamed some rows, then the connection/query failed partway
+        # through (lost connection, deadlock victim, etc). Surface as an error rather than
+        # silently showing a truncated result as if it were the complete one.
+        if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
+        return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$false }
+    }
+    $cursorId = [guid]::NewGuid().ToString()
+    $script:OpenCursors[$cursorId] = $cursor
+    return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$true; cursorId=$cursorId }
+}
+
 # Leaner variant of Run-Query2, purpose-built for bulk-fetching a PRIMARY KEY column list (e.g.
 # ~950,000 ids to work out what's missing/different in Compare). Run-Query2 is general-purpose -
 # it checks every single cell for NULL, decodes backslash-escapes, and hex-encodes control
@@ -538,6 +698,35 @@ function Run-Exec { param($conn,$sql)
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
 # Read-only guard: true only if EVERY statement is a pure read (SELECT/SHOW/EXPLAIN...).
+# Removes every balanced (...) group, tracking nesting depth AND quote state (so a ')' or keyword
+# inside a quoted string/identifier - "WHERE a=')SELECT('" is one string literal, not tokens -
+# never gets mistaken for a real paren or a real keyword). Used by Test-SqlReadOnly to see past a
+# CTE's own body (or a subquery's) to the keyword actually driving the statement. Each removed
+# group leaves a single space behind so words on either side don't get glued together.
+function Strip-Parens { param([string]$s)
+    $out = New-Object System.Text.StringBuilder
+    $depth = 0
+    $quote = $null
+    $escaped = $false
+    $chars = $s.ToCharArray()
+    for($i = 0; $i -lt $chars.Length; $i++){
+        $c = $chars[$i]
+        if($quote){
+            if($escaped){ $escaped = $false; continue }
+            if($c -eq '\'){ $escaped = $true; continue }
+            if($c -eq $quote){
+                if(($i + 1) -lt $chars.Length -and $chars[$i + 1] -eq $quote){ $i++ }
+                else { $quote = $null }
+            }
+            continue
+        }
+        if($c -eq "'" -or $c -eq '"' -or $c -eq '`'){ $quote = $c; continue }
+        if($c -eq '('){ if($depth -eq 0){ [void]$out.Append(' ') }; $depth++; continue }
+        if($c -eq ')'){ if($depth -gt 0){ $depth-- }; if($depth -eq 0){ [void]$out.Append(' ') }; continue }
+        if($depth -eq 0){ [void]$out.Append($c) }
+    }
+    return $out.ToString()
+}
 function Test-SqlReadOnly { param([string]$sql)
     if(-not $sql){ return $true }
     # /*! ... */ and /*!50000 ... */ are NOT comments: MySQL executes their contents. Stripping
@@ -561,6 +750,34 @@ function Test-SqlReadOnly { param([string]$sql)
             $up = $t.ToUpper()
             $second = ($up -split '\s+')[1]
             if($second -match '^(GLOBAL|PERSIST)' -or $up -match '@@(GLOBAL|PERSIST)'){ return $false }
+        }
+        # A CTE only stays read-only if it's actually prefixing a SELECT/TABLE/VALUES - MySQL
+        # 8.0.19+/MariaDB also allow "WITH x AS (...) DELETE/UPDATE FROM t ...", which the leading
+        # "WITH" alone can't reveal. Strip every CTE's own (possibly nested) body via Strip-Parens,
+        # leaving roughly "WITH cte1 AS , cte2 AS  DELETE FROM t ..." - the first remaining
+        # recognizable verb after that is the statement actually being run.
+        if($w -eq 'WITH'){
+            $verbs = 'SELECT','INSERT','UPDATE','DELETE','REPLACE','TABLE','VALUES'
+            $verb = $null
+            foreach($tok in ((Strip-Parens $t) -split '\s+')){
+                $tu = $tok.ToUpper()
+                if($verbs -contains $tu){ $verb = $tu; break }
+            }
+            if($verb -ne 'SELECT' -and $verb -ne 'TABLE' -and $verb -ne 'VALUES'){ return $false }
+        }
+        # MariaDB's ANALYZE [FORMAT=JSON] <statement> form (distinct from ANALYZE TABLE) actually
+        # EXECUTES the wrapped statement while profiling it - bare "ANALYZE" was allow-listed for
+        # the genuinely read-only ANALYZE TABLE form, which would otherwise let "ANALYZE DELETE
+        # FROM t" straight through untouched.
+        if($w -eq 'ANALYZE'){
+            $parts = $t -split '\s+', 2
+            $rest = if($parts.Length -gt 1){ $parts[1].TrimStart() } else { '' }
+            $firstTok = ($rest -split '\s+')[0]
+            if($firstTok -notmatch '(?i)^TABLE$'){
+                $inner = [regex]::Replace($rest, '(?i)^FORMAT\s*=\s*JSON\s+', '')
+                $innerW = (($inner.Trim() -split '\s+')[0]).ToUpper()
+                if($innerW -ne 'SELECT'){ return $false }
+            }
         }
     }
     return $true
@@ -641,20 +858,72 @@ function Api-RowOp { param($conn,$data)
     } else { return '{"ok":false,"error":"bad op"}' }
     Run-Exec $conn $sql
 }
-# Endpoint: run a SELECT and return rows for the results grid.
-function Api-Query { param($conn,$sql,$db,$RequestId)
+# Endpoint: run a SELECT and return the first page of rows for the results grid, via a streaming
+# --quick cursor (Open-QueryCursor) instead of Run-Query2's full-buffer read - the fix for a
+# high/missing LIMIT against a large table crashing the whole server. The SQL runs completely
+# as-is: no LIMIT/OFFSET rewriting, no detection of whether it already has a LIMIT. If more rows
+# remain than fit in one page, the response carries hasMore:true and a cursorId for
+# Api-FetchCursorBatch to continue from; otherwise the cursor is already closed server-side.
+function Api-Query { param($conn,$sql,$db,$RequestId,$PageSize)
     if(-not $sql -or -not ([string]$sql).Trim()){ return '{"ok":false,"error":"Empty query."}' }
+    $ps=[int]$PageSize; if($ps -lt 1){ $ps=1000 }
     $sw=[System.Diagnostics.Stopwatch]::StartNew()
-    $r=Run-Query2 $conn $sql $db $RequestId
-    $swFetch=$sw.ElapsedMilliseconds
-    if(-not $r.ok){ return '{"ok":false,"error":'+(J-Str $r.err)+'}' }
-    if($r.columns.Count -eq 0){ $sw.Stop(); return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
-    $rowsJson = J-RowsFast $r.rows
+    $r=Open-QueryCursor $conn $sql $db $RequestId $ps
     $sw.Stop()
-    $jsonMs = $sw.ElapsedMilliseconds - $swFetch
-    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+',"fetchMs":'+$swFetch+',"jsonMs":'+$jsonMs+'}'
+    if(-not $r.ok){
+        if($r.cancelled){ return '{"ok":false,"error":'+(J-Str $r.err)+',"cancelled":true}' }
+        return '{"ok":false,"error":'+(J-Str $r.err)+'}'
+    }
+    if($r.columns.Count -eq 0){ return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
+    $rowsJson = J-RowsFast $r.rows
+    $tail = if($r.hasMore){ ',"hasMore":true,"cursorId":"'+$r.cursorId+'"' } else { '' }
+    '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+$tail+'}'
+}
+# Endpoint: continue reading from a still-open cursor opened by Api-Query, returning the next
+# page. On exhaustion, closes the cursor (process + reader + its RunningQueries registration).
+# A cursor killed via Cancel (same $script:RunningQueries entry Api-CancelQuery already kills)
+# is reported as a cancellation here rather than a raw read/pipe error.
+function Api-FetchCursorBatch { param($data)
+    $cid = [string]$data.cursorId
+    if (-not $cid) { return '{"ok":false,"error":"no cursorId"}' }
+    $cursor = $null
+    if (-not $script:OpenCursors.TryGetValue($cid, [ref]$cursor)) {
+        return '{"ok":false,"error":"Cursor not found - it may have already finished or been closed."}'
+    }
+    $ps=[int]$data.pageSize; if($ps -lt 1){ $ps=1000 }
+    [System.Threading.Monitor]::Enter($cursor.Lock)
+    try {
+        $cursor.LastUsed = [DateTime]::UtcNow
+        $page = Read-CursorRows $cursor $ps
+        if (-not $page.hasMore) {
+            $null = $script:OpenCursors.TryRemove($cid, [ref]$null)
+            $r = Close-QueryCursorProc $cursor
+            if ($cursor.Entry.Cancelled) { return '{"ok":false,"error":"Query cancelled.","cancelled":true}' }
+            if ($r.exit -ne 0) { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
+            return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":false}'
+        }
+        return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":true,"cursorId":"'+$cid+'"}'
+    } finally { [System.Threading.Monitor]::Exit($cursor.Lock) }
+}
+# Endpoint: close a cursor the frontend no longer needs (tab closed, new query replacing it, or
+# just tidying up after a fully-consumed one). Always returns ok:true, even for an
+# unknown/already-gone cursorId - the frontend calls this defensively at several sites.
+function Api-CloseCursor { param($data)
+    $cid = [string]$data.cursorId
+    if ($cid) {
+        $cursor = $null
+        if ($script:OpenCursors.TryRemove($cid, [ref]$cursor)) {
+            try { if (-not $cursor.Process.HasExited) { $cursor.Process.Kill() } } catch {}
+            $null = Close-QueryCursorProc $cursor
+        }
+    }
+    '{"ok":true}'
 }
 # Endpoint: cancel a running query started with the given requestId (kills its mysql.exe process).
+# This is also what kills a streaming cursor's process mid-read - the cursor stays registered
+# under its original RequestId in $script:RunningQueries for its whole life (see Open-QueryCursor
+# / Close-QueryCursorProc above), so Cancel keeps working across "fetch next" calls too, not just
+# the very first page.
 function Api-CancelQuery { param($data)
     $rid = [string]$data.requestId
     if (-not $rid) { return '{"ok":false,"error":"no requestId"}' }
@@ -883,10 +1152,16 @@ function Api-ImportCsv { param($conn,$data)
     $db=[string]$data.db; $table=[string]$data.table
     if(-not $db -or -not $table){ return '{"ok":false,"error":"No target table."}' }
     $dbl=SqlLit $db; $tl=SqlLit $table
-	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
+	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME,DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
     if(-not $cr.ok){ return '{"ok":false,"error":'+(J-Str $cr.err)+'}' }
     $tableCols=@($cr.rows | ForEach-Object { $_[0] })
     if($tableCols.Count -eq 0){ return '{"ok":false,"error":"Table not found or has no columns."}' }
+    # The "0xDEADBEEF passes through unquoted as a hex literal" rule below exists so a genuinely
+    # binary/BIT column can be filled from its own hex display - it's not meant for an ordinary
+    # text column that merely happens to contain a value that LOOKS like hex ("0xFF", a hash, an
+    # ID). Only the columns information_schema actually reports as binary/BIT get that treatment.
+    $binTypes=@('binary','varbinary','blob','tinyblob','mediumblob','longblob','bit')
+    $binCols=@($cr.rows | Where-Object { $binTypes -contains ([string]$_[1]).ToLower() } | ForEach-Object { $_[0] })
     try { if($data.hasHeader){ $rows=@(Import-Csv -Path $file) } else { $rows=@(Import-Csv -Path $file -Header $tableCols) } }
     catch { return '{"ok":false,"error":'+(J-Str ("CSV parse error: "+$_.Exception.Message))+'}' }
     if($rows.Count -eq 0){ return '{"ok":false,"error":"CSV has no data rows."}' }
@@ -904,7 +1179,7 @@ function Api-ImportCsv { param($conn,$data)
         # The export writes NULL as an explicit marker (\N by default) so it stays distinct
         # from an empty string in the file. Read it back the same way; an empty cell keeps its
         # long-standing meaning of NULL, so importing a spreadsheet is unchanged.
-        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -eq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif($v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
+        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -eq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
         [void]$batch.Add('('+($vals -join ',')+')'); $n++
         if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
     }
@@ -2177,6 +2452,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 
 <script>
 const TOKEN="__TOKEN__";
+const PAGE_BATCH=1000;
 let curSchema=null, tabs=[], tabSeq=0, activeTab=null;
 /* ============================================================================
    FRONT-END (runs in the browser)
@@ -2345,7 +2621,11 @@ function hide(id){
 }
 const RESERVED=new Set(['accessible','add','all','alter','analyze','and','as','asc','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','current_date','current_time','current_timestamp','cursor','database','databases','default','delete','desc','describe','distinct','div','double','drop','dual','each','else','exists','explain','false','fetch','float','for','force','foreign','from','fulltext','function','group','having','if','ignore','in','index','inner','insert','int','integer','interval','into','is','join','key','keys','left','like','limit','lock','long','longblob','longtext','match','mediumblob','mediumint','mediumtext','natural','not','null','numeric','offset','on','optimize','option','or','order','outer','primary','procedure','references','rename','repeat','replace','restrict','return','revoke','right','rlike','schema','schemas','select','set','show','smallint','spatial','sql','table','then','tinyblob','tinyint','tinytext','to','trigger','true','union','unique','unlock','unsigned','update','usage','use','using','values','varbinary','varchar','varying','when','where','while','with','write','zerofill']);
 function qid(n){n=String(n);if(n===''||!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)||RESERVED.has(n.toLowerCase()))return '`'+n.replace(/`/g,'``')+'`';return n;}
-function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return "'"+s.replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
+function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return strLit(s);}
+// Always a quoted string literal - unlike lit(), never reinterprets a hex-looking value as a raw
+// unquoted hex literal. lit()'s passthrough is meant for grid cell values; a password or other
+// plain-text field that happens to look like hex should stay exactly the text the user typed.
+function strLit(v){return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
 
 async function searchAllSchemas(){
   const term=($('objFilter').value||'').trim();
@@ -2717,8 +2997,9 @@ function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st
   const rowLabel=(t.table&&t.estRows!=null)?(t.rows.length+' row(s) of '+fmtCount(t.estRows)+' rows.'):(t.rows.length+' row(s).');
   const viewLabel=(t.rows.length>0)?(' View shows '+viewRangeLabel(id)+'.'):'';
   const ms=(t.lastElapsedMs!=null)?(' '+t.lastElapsedMs+' ms'):'';
+  const moreLabel=t.hasMore?('  |  more rows available - Fetch next '+PAGE_BATCH+' rows'):'';
   st.className='status';
-  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'');
+  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'')+moreLabel;
 }
 let objData=null;
 async function loadObjects(db) {
@@ -3170,6 +3451,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'" style="display:none;gap:9px;align-items:center" class="tbgroup">'+
   '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')">Wrap: Off</button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)">Columns</button>'+
+  '<button class="sm" id="fetchmore_'+id+'" style="display:none" title="The result set was too large to load in one go - pull the next '+PAGE_BATCH+' rows from the still-open query" onclick="fetchNextBatch(\''+id+'\')">Fetch next '+PAGE_BATCH+' rows</button>'+
   '<span class="tbsep"></span></span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
@@ -3334,7 +3616,7 @@ const MODAL_CLOSE_OVERRIDES={mCompare:cmpCloseAndCancel,mCompareRows:cmprCloseAn
 // exactly the bug Escape already had before this existed.
 function modalClose(id){const fn=MODAL_CLOSE_OVERRIDES[id];if(fn)fn();else hide(id);}
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){const open=[...document.querySelectorAll('.modal.show')].filter(m=>!window._floatingMinimized[m.id]);if(open.length){modalClose(open[open.length-1].id);}}});
-function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
+function closeTab(id){const t=T(id);if(t&&t.runningReqId){cancelQuery(id);}closeCursorFor(t);const i=tabs.findIndex(t=>t.id===id);if(i<0)return;tabs.splice(i,1);$('tabbtn_'+id).remove();$('pane_'+id).remove();if(activeTab===id&&tabs.length)activate(tabs[tabs.length-1].id);if(tabs.length===0){activeTab=null;}saveSession();toggleOverview();}
 // Each saved connection remembers its own open tabs (keyed by connection name; ad-hoc/unsaved
 // connections are keyed by host+user+port so different credentials don't collide).
 function sessionKeyFor(){const cn=$('connlist')?$('connlist').value:'';if(cn)return 'conn:'+cn;return 'adhoc:'+($('user')?$('user').value:'')+'@'+($('host')?$('host').value:'')+':'+($('port')?$('port').value:'');}
@@ -3476,6 +3758,7 @@ function markEdited(id){
 function dbOf(t){ if(t&&(t.table||t.ddl)&&!t.sqlEdited)return t.db||curSchema||null; /* table-view + DDL tabs keep their own schema, until their SQL is edited - see markEdited() */ return curSchema||(t&&t.db)||null; /* plain query tabs follow the selected sidebar schema */ }
 // runSql(): send the editor SQL to the server and show the rows (or the error).
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
+ closeCursorFor(t);
  addHistory(sql);
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const lastStmt=(stmts[stmts.length-1]||sql).trim();
@@ -3524,13 +3807,15 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
-    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId},t.abortCtrl.signal);
+    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
     if(!T(id))return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
     t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();$('edit_'+id).innerHTML='';
-    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
+    t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
+    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';updateFetchMoreBtn(id);return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
+    updateFetchMoreBtn(id);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
@@ -3589,6 +3874,38 @@ async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.
    else{try{await fetch('/api/cancel-query',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,requestId:rid})});}catch(e){}}
  }
  log('Cancel requested.');}
+
+// Fire-and-forget: tell the server to close a tab's open streaming query cursor (if any), and
+// clear the local handle. Safe to call whenever - an unknown/already-gone cursorId is a no-op on
+// the server. Called before a tab starts a new run (replacing whatever cursor the previous run
+// left open) and from closeTab/closeAll/closeOthers, since a tab can have an open cursor waiting
+// on "fetch next" independently of whether a query is actively "running" (t.runningReqId).
+function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
+ try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
+function updateFetchMoreBtn(id){const b=$('fetchmore_'+id);if(!b)return;const t=T(id);b.style.display=(t&&t.hasMore)?'':'none';}
+// fetchNextBatch(): pulls the next page of rows from the SAME still-open server-side cursor (not
+// a re-run with a growing OFFSET) and appends them to the tab's already-loaded rows. Reuses the
+// same t.runningReqId/setRunning toggle the initial run uses - and keeps t.cursorReqId (the SAME
+// requestId the cursor was originally registered under) as the id sent to /api/cancel-query - so
+// the existing Cancel button/cancelQuery(id) plumbing keeps working unmodified during a slow
+// "fetch next" too, not just on the very first page.
+async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId)return;
+ const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
+ t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
+ if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows…';}
+ try{
+  const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
+  if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
+  if(!T(id))return;
+  if(!r.ok){if(st){st.className='status err';st.textContent=r.error;}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;updateFetchMoreBtn(id);return;}
+  t.rows=t.rows.concat(r.rows);
+  t.hasMore=!!r.hasMore;t.cursorId=r.hasMore?(r.cursorId||t.cursorId):null;t.cursorReqId=t.hasMore?t.cursorReqId:null;
+  if(st){st.className=wasClassName;st.textContent=wasText;}
+  renderGrid(id);updatePager(id);updateStatusLine(id);updateFetchMoreBtn(id);
+ } finally {
+  if(T(id)){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+ }
+}
 
 function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total){p.innerHTML='';return;}
  const ps=t.limit||1000;const off=t.offset||0;const shown=Math.min(ps,Math.max(0,total-off));const prevDis=off<=0?' disabled':'';const nextDis=(off+ps>=total)?' disabled':'';
@@ -3754,7 +4071,7 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
    h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val)+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
-   t.cols.forEach((c,ci)=>{const v=row[c];h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
+   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
@@ -4538,7 +4855,7 @@ async function refreshProcessList(){
   // button at all rather than one that would only ever fail.
   const info=infoIdx>=0?String(row[infoIdx]||'').trim().toLowerCase():'';
   const isSelf=(info==='show full processlist'||info==='show processlist');
-  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid)+'\')">Kill</button>':'')+'</td>';
+  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\x27/g,'\\x27')+'\')">Kill</button>':'')+'</td>';
   h+='</tr>';
  });
  h+='</tbody></table>';
@@ -4553,14 +4870,17 @@ async function killProcess(pid){
 async function openUsers(){const r=await api('/api/query',{sql:"SELECT User,Host FROM mysql.user ORDER BY User,Host"});const sel=$('userSel');sel.innerHTML='';$('grantsBox').textContent='';window._selUser='';
  if(!r.ok){toast(r.error,true);return;}r.rows.forEach(u=>{const d=document.createElement('div');d.className='uitem';d.textContent=u[0]+'@'+u[1];d.dataset.v=u[0]+'\x01'+u[1];d.onclick=()=>{[...sel.children].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');window._selUser=d.dataset.v;showGrants();};sel.appendChild(d);});show('mUsers');}
 async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+lit(u)+"@"+lit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
-async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+lit(res.pw),'Created user'))openUsers();}
+async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw),'Created user'))openUsers();}
 async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Revoke privileges',okText:'Revoke',fields:[{key:'g',label:'Privileges to revoke (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
 async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+lit(u)+"@"+lit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
 async function changePassword(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const parts=v.split('\x01');const u=parts[0],h=parts[1];
  const res=await inputBox({title:'Change password for '+u+'@'+h,okText:'Change',fields:[{key:'pw',label:'New password',type:'password',value:''},{key:'pw2',label:'Confirm new password',type:'password',value:''}]});
  if(!res)return;if(!res.pw){toast('Password cannot be empty.',true);return;}if(res.pw!==res.pw2){toast('Passwords do not match.',true);return;}
- const uu=u.replace(/'/g,"''"),hh=h.replace(/'/g,"''"),pp=res.pw.replace(/'/g,"''");
- const sql="ALTER USER '"+uu+"'@'"+hh+"' IDENTIFIED BY '"+pp+"';";
+ // lit() for user/host (matching lockUser()), but strLit() - always quoted - for the password:
+ // lit()'s hex-literal passthrough is meant for cell values, not a password field, and a plain
+ // quote-double (no backslash escaping first) let a value ending in a backslash close the literal
+ // one character early.
+ const sql="ALTER USER "+lit(u)+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw)+";";
  const r=await api('/api/exec',{sql:sql});
  if(r.ok){log('Password changed for '+u+'@'+h+'.');}else{alert('Failed: '+(r.error||'unknown'));}}
 async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+lit(u)+"@"+lit(h),'Dropped user'))openUsers();}
@@ -5179,9 +5499,14 @@ function impAddFiles(){browse({title:'Select SQL files',filter:'*.sql',mode:'fil
 function impAddFolder(){browse({title:'Select a folder (imports all .sql inside)',mode:'folder',onPick:async folder=>{const r=await api('/api/browse',{path:folder,filter:'*.sql',dirsOnly:false});if(r.ok){const ps=r.files.map(f=>f.path);impAppend(ps);log('Added '+ps.length+' .sql file(s) from '+folder);}else alert(r.error);}});}
 // ---- close tabs ----
 async function closeAll(){const dirty=tabs.filter(t=>pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' tab(s) have unsaved changes. Close all and discard them?')))return;}
+ await Promise.all(tabs.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
+ tabs.forEach(t=>closeCursorFor(t));
  [...tabs].forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=[];activeTab=null;saveSession();toggleOverview();const _sb=$('schemaBadge');if(_sb){_sb.style.display='none';_sb.textContent='';}}
 async function closeOthers(id){const dirty=tabs.filter(t=>t.id!==id&&pendingCount(t)>0);if(dirty.length){if(!(await ask(dirty.length+' other tab(s) have unsaved changes. Close them and discard the changes?')))return;}
- tabs.filter(t=>t.id!==id).forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
+ const others=tabs.filter(t=>t.id!==id);
+ await Promise.all(others.filter(t=>t.runningReqId).map(t=>cancelQuery(t.id)));
+ others.forEach(t=>closeCursorFor(t));
+ others.forEach(t=>{$('tabbtn_'+t.id).remove();$('pane_'+t.id).remove();});tabs=tabs.filter(t=>t.id===id);activate(id);}
 
 // ---- keyboard navigation for side lists ----
 function focusList(box){box.focus();const items=[...box.querySelectorAll('.item')];if(items.length){items.forEach(x=>x.classList.remove('kbsel'));items[0].classList.add('kbsel');items[0].scrollIntoView({block:'nearest'});}}
@@ -5342,7 +5667,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -5393,7 +5718,9 @@ $RequestHandler = {
                 '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
                 '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
                 '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
-                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId) }
+                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize) }
+                '/api/fetch-cursor-batch' { Send-Json $client (Api-FetchCursorBatch $data) }
+                '/api/close-cursor' { Send-Json $client (Api-CloseCursor $data) }
                 '/api/cancel-query' { Send-Json $client (Api-CancelQuery $data) }
                 '/api/cancel-job'   { Send-Json $client (Api-CancelJob $data) }
                 '/api/exec'    { Send-Json $client (Api-Exec $conn $data) }
@@ -5480,6 +5807,24 @@ while ($run) {
         } else { $stillRunning.Add($item) }
     }
     $InFlight = $stillRunning
+
+    # Idle-cursor sweep: there's no per-cursor background thread here (unlike a real thread-per-
+    # connection design), so a cursor the frontend opened but never finished reading (e.g. the tab
+    # was left mid-result and closed via something other than closeTab/closeAll/closeOthers, or
+    # the browser tab was simply killed) is reaped here instead, on the loop that already runs
+    # every ~200ms. Kept cheap: normally $script:OpenCursors is empty.
+    if ($script:OpenCursors.Count -gt 0) {
+        $idleCutoff = [DateTime]::UtcNow.AddMinutes(-10)
+        foreach ($kv in @($script:OpenCursors.GetEnumerator())) {
+            if ($kv.Value.LastUsed -lt $idleCutoff) {
+                $idleCursor = $null
+                if ($script:OpenCursors.TryRemove($kv.Key, [ref]$idleCursor)) {
+                    try { if (-not $idleCursor.Process.HasExited) { $idleCursor.Process.Kill() } } catch {}
+                    $null = Close-QueryCursorProc $idleCursor
+                }
+            }
+        }
+    }
 
     if ($SharedState.Quit) { $run = $false }
     elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
