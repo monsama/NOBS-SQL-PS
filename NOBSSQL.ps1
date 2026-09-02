@@ -1170,9 +1170,22 @@ function Api-ImportCsv { param($conn,$data)
     if($useCols.Count -eq 0){ return '{"ok":false,"error":"No CSV columns match the table columns (check the header row)."}' }
     $tbl=(SqlId $db)+'.'+(SqlId $table)
     $colList=($useCols | ForEach-Object { SqlId $_ }) -join ','
+    # "Truncate table" + a mid-file failure (a bad value, an FK violation, disk full) used to
+    # leave the table permanently truncated and only partially reloaded - mysql.exe stops at the
+    # first error by default, but every statement before that had already committed on its own
+    # (autocommit), with nothing to undo them. Wrapped in START TRANSACTION/COMMIT instead: if any
+    # statement fails, mysql.exe stops before reaching COMMIT, and MySQL automatically rolls back
+    # whatever's still open the moment the connection closes.
+    #
+    # TRUNCATE TABLE itself is DDL - MySQL/MariaDB implicitly commit it the moment it runs,
+    # transaction or not, so wrapping THAT in START TRANSACTION would do nothing to protect it.
+    # DELETE FROM (no WHERE) does the same job here and, unlike TRUNCATE, is ordinary
+    # transactional DML that a rollback genuinely undoes - the one real cost is that it doesn't
+    # reset an AUTO_INCREMENT counter the way TRUNCATE does.
     $sb=New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('START TRANSACTION;')
     [void]$sb.AppendLine('SET FOREIGN_KEY_CHECKS=0;'); [void]$sb.AppendLine('SET UNIQUE_CHECKS=0;')
-    if($data.truncate){ [void]$sb.AppendLine('TRUNCATE TABLE '+$tbl+';') }
+    if($data.truncate){ [void]$sb.AppendLine('DELETE FROM '+$tbl+';') }
     $batch=New-Object System.Collections.ArrayList; $n=0
     foreach($row in $rows){
         $vals=@()
@@ -1184,6 +1197,7 @@ function Api-ImportCsv { param($conn,$data)
         if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
     }
     if($batch.Count){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';') }
+    [void]$sb.AppendLine('COMMIT;')
     $cnf=New-Cnf $conn
     $tmp=Join-Path $env:TEMP ("mysqlcsv_"+[Guid]::NewGuid().ToString('N')+".sql")
     try {
@@ -1888,28 +1902,58 @@ function Api-CompareRowsApplyDiff { param($data)
     $pkCols = @($data.pkCols); $updates = @($data.updates)
     if($pkCols.Count -eq 0 -or $updates.Count -eq 0){ return '{"ok":false,"error":"No rows to update."}' }
     $obj = (SqlId $db) + '.' + (SqlId $table)
+    # Unlike Api-CompareRowsApply/Api-CompareRowsInsertAll (INSERT-only, each batch already atomic
+    # as one statement, and a chunk failing partway through a large bulk insert shouldn't block
+    # the rest), this updates EXISTING target rows one at a time - the exact "apply this reviewed
+    # set of corrections" shape the grid's own staged-edits apply already treats as one
+    # transaction. Every statement used to run as its own separate mysql.exe process/connection
+    # (so a per-connection START TRANSACTION couldn't have spanned them even if added naively) -
+    # now the whole batch is one script in one connection, wrapped in START TRANSACTION/COMMIT:
+    # mysql.exe stops at the first error by default, and MySQL rolls back whatever's still open
+    # the moment the connection then closes.
+    $stmts = New-Object System.Collections.ArrayList
+    $pkDescs = New-Object System.Collections.ArrayList
+    $skipped = New-Object System.Collections.ArrayList
+    foreach($u in $updates){
+        $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValLit $cd.src) }
+        $whs = @(); $pkv = @($u.pk)
+        for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValLit $pkv[$i]) }
+        $pkDesc = ($pkv -join ',')
+        if($sets.Count -eq 0 -or $whs.Count -eq 0){ [void]$skipped.Add($pkDesc); continue }
+        [void]$stmts.Add("UPDATE $obj SET " + ($sets -join ',') + ' WHERE ' + ($whs -join ' AND ') + ' LIMIT 1;')
+        [void]$pkDescs.Add($pkDesc)
+    }
     $log = New-Object System.Collections.ArrayList
+    foreach($s in $skipped){ [void]$log.Add("SKIPPED (no columns/key) id=$s") }
+    if($stmts.Count -eq 0){ return '{"ok":true,"log":'+(J-Arr $log)+'}' }
+    $script = "START TRANSACTION;`n" + ($stmts -join "`n") + "`nCOMMIT;`n"
     $cnf = New-Cnf $tgt
     try {
-        foreach($u in $updates){
-            $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValLit $cd.src) }
-            $whs = @(); $pkv = @($u.pk)
-            for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValLit $pkv[$i]) }
-            if($sets.Count -eq 0 -or $whs.Count -eq 0){ [void]$log.Add("SKIPPED (no columns/key)"); continue }
-            $sql = "UPDATE $obj SET " + ($sets -join ',') + ' WHERE ' + ($whs -join ' AND ') + ' LIMIT 1'
-            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null
-            $pkDesc = ($pkv -join ',')
-            if($r2.exit -eq 0){ [void]$log.Add("OK  updated id="+$pkDesc) }
-            else { [void]$log.Add("FAILED id="+$pkDesc+" : "+(FirstErr $r2.err)) }
+        $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $script $null
+        if($r2.exit -eq 0){
+            foreach($d in $pkDescs){ [void]$log.Add("OK  updated id=$d") }
+            return '{"ok":true,"log":'+(J-Arr $log)+'}'
+        } else {
+            [void]$log.Add("FAILED : "+(FirstErr $r2.err))
+            [void]$log.Add("No rows were updated - the batch was rolled back.")
+            return '{"ok":false,"log":'+(J-Arr $log)+'}'
         }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
-    '{"ok":true,"log":'+(J-Arr $log)+'}'
 }
 # Inserts EVERY missing row (source rows absent from target), not just the first 2000 that fit
 # in the interactive review list. Unlike Api-CompareRows/Api-CompareRowsApply, this never sends
 # the row data to the browser at all - it fetches a chunk of missing rows from source and
 # inserts that SAME chunk into target immediately, chunk by chunk, so the full amount of data
 # moved is not limited by what's practical to render as a checkbox list. Still insert-only.
+#
+# Deliberately not wrapped in one big transaction across every chunk: each chunk's INSERT is
+# already its own mysql.exe invocation/statement, which MySQL/InnoDB only ever applies
+# all-or-nothing - a chunk failing partway through can't leave that chunk half-inserted. What
+# continue-on-error across chunks buys here is that ONE bad chunk (say, a duplicate key from a
+# row someone else inserted since the scan started) doesn't abort inserting the rest of what
+# could be tens of thousands of otherwise-good rows - unlike Api-CompareRowsApplyDiff above, this
+# never touches an existing row, so a chunk that fails simply leaves those rows still missing,
+# not corrupted.
 function Api-CompareRowsInsertAll { param($data)
     $src = Resolve-SavedConn $data.sourceConnName; $tgt = Resolve-SavedConn $data.targetConnName
     if(-not $src -or -not $tgt){ return '{"ok":false,"error":"Connection not found."}' }
@@ -1967,6 +2011,9 @@ function Api-CompareRowsInsertAll { param($data)
     if($rid){ $null = $script:CancelledCompares.TryRemove($rid, [ref]$null) }
     '{"ok":true,"missingTotal":'+$missingTotal+',"inserted":'+$inserted+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+',"log":'+(J-Arr $log)+'}'
 }
+# Same reasoning as Api-CompareRowsInsertAll above: insert-only, each batch already its own
+# atomic mysql.exe invocation, continue-on-error across batches so one bad batch doesn't block
+# the rest of a large reviewed set from landing.
 function Api-CompareRowsApply { param($data)
     $tgt = Resolve-SavedConn $data.targetConnName
     if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
@@ -2040,6 +2087,13 @@ function Api-CompareSchemas { param($data)
     }
     '{"ok":true,"tables":['+($tj -join ',')+'],"targetReadonly":'+($(if($tgt.readonly){'true'}else{'false'}))+',"cancelled":'+($(if($cmpResult.cancelled){'true'}else{'false'}))+'}'
 }
+# Deliberately NOT wrapped in a transaction: these are schema-diff statements (ALTER/CREATE/DROP
+# TABLE), and every one of them is an implicit-commit statement in MySQL/MariaDB - a
+# START TRANSACTION here would be silently ignored the moment the first DDL statement ran, giving
+# false confidence that a failure partway through could be rolled back when it can't be. Running
+# each independently and reporting OK/FAILED per line (as already done below) is the honest
+# behavior given that constraint - a half-migrated schema is visible in the log, not hidden by a
+# rollback that was never actually possible.
 function Api-CompareApply { param($data)
     $tgt = Resolve-SavedConn $data.targetConnName
     if(-not $tgt){ return '{"ok":false,"error":"Target connection not found."}' }
@@ -4311,7 +4365,10 @@ function csvNullHint(rows){
  toast('NULLs were written as '+nm+'. Clear "NULL value" in the Export dialog to copy them as blanks instead.');
 }
 function csvNullMarker(){ const el=$('expNullVal'); return el?el.value:'\\N'; }
-function bCSV(cols,rows){const nm=csvNullMarker();const q=s=>s===null?nm:/[",\n]/.test(s)?'"'+String(s).replace(/"/g,'""')+'"':s;return cols.map(c=>c===null?'':q(c)).join(',')+'\n'+rows.map(r=>r.map(q).join(',')).join('\n');}
+// A bare \r (no following \n) has to be quoted too, not just \n - both this app's own CSV
+// importer and a spreadsheet's CSV rules treat a lone \r as ending the row, so an unquoted one
+// silently splits one logical row into two and shifts every column after it.
+function bCSV(cols,rows){const nm=csvNullMarker();const q=s=>s===null?nm:/[",\n\r]/.test(s)?'"'+String(s).replace(/"/g,'""')+'"':s;return cols.map(c=>c===null?'':q(c)).join(',')+'\n'+rows.map(r=>r.map(q).join(',')).join('\n');}
 function bMD(cols,rows){
   const esc=s=>s===null?'':String(s).replace(/\|/g,'\\|').replace(/\n/g,' ');
   let h='| '+cols.map(esc).join(' | ')+' |\n';
