@@ -162,12 +162,19 @@ function Get-SslLines {
     return @()
 }
 # Create a temp my.cnf so the CLI tools can log in WITHOUT the password showing on the command line.
+# A raw newline in a value would otherwise start a brand new line in the .cnf file, letting a
+# saved connection's host/user/password inject an arbitrary extra option-file directive (e.g.
+# "pager=<command>", which the mysql CLI executes) rather than staying part of THIS value.
+# Backslash-doubling (below) only protects against a value being misread as an escape sequence -
+# it does nothing for an actual embedded newline character, which this strips outright since none
+# of these fields have any legitimate use for one.
+function Get-CnfSafe { param([string]$s) if(-not $s){ return $s }; return ($s -replace "[\r\n]", '') }
 function New-Cnf {
     param($conn)
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$($conn.host)"); [void]$sb.AppendLine("port=$($conn.port)"); [void]$sb.AppendLine("user=$($conn.user)")
-    if ($conn.password) { [void]$sb.AppendLine("password=$($conn.password -replace '\\','\\')") }
+    [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
+    if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
     foreach ($l in (Get-SslLines $conn.ssl)) { [void]$sb.AppendLine($l) }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
@@ -691,6 +698,35 @@ function Run-Exec { param($conn,$sql)
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
 # Read-only guard: true only if EVERY statement is a pure read (SELECT/SHOW/EXPLAIN...).
+# Removes every balanced (...) group, tracking nesting depth AND quote state (so a ')' or keyword
+# inside a quoted string/identifier - "WHERE a=')SELECT('" is one string literal, not tokens -
+# never gets mistaken for a real paren or a real keyword). Used by Test-SqlReadOnly to see past a
+# CTE's own body (or a subquery's) to the keyword actually driving the statement. Each removed
+# group leaves a single space behind so words on either side don't get glued together.
+function Strip-Parens { param([string]$s)
+    $out = New-Object System.Text.StringBuilder
+    $depth = 0
+    $quote = $null
+    $escaped = $false
+    $chars = $s.ToCharArray()
+    for($i = 0; $i -lt $chars.Length; $i++){
+        $c = $chars[$i]
+        if($quote){
+            if($escaped){ $escaped = $false; continue }
+            if($c -eq '\'){ $escaped = $true; continue }
+            if($c -eq $quote){
+                if(($i + 1) -lt $chars.Length -and $chars[$i + 1] -eq $quote){ $i++ }
+                else { $quote = $null }
+            }
+            continue
+        }
+        if($c -eq "'" -or $c -eq '"' -or $c -eq '`'){ $quote = $c; continue }
+        if($c -eq '('){ if($depth -eq 0){ [void]$out.Append(' ') }; $depth++; continue }
+        if($c -eq ')'){ if($depth -gt 0){ $depth-- }; if($depth -eq 0){ [void]$out.Append(' ') }; continue }
+        if($depth -eq 0){ [void]$out.Append($c) }
+    }
+    return $out.ToString()
+}
 function Test-SqlReadOnly { param([string]$sql)
     if(-not $sql){ return $true }
     # /*! ... */ and /*!50000 ... */ are NOT comments: MySQL executes their contents. Stripping
@@ -714,6 +750,34 @@ function Test-SqlReadOnly { param([string]$sql)
             $up = $t.ToUpper()
             $second = ($up -split '\s+')[1]
             if($second -match '^(GLOBAL|PERSIST)' -or $up -match '@@(GLOBAL|PERSIST)'){ return $false }
+        }
+        # A CTE only stays read-only if it's actually prefixing a SELECT/TABLE/VALUES - MySQL
+        # 8.0.19+/MariaDB also allow "WITH x AS (...) DELETE/UPDATE FROM t ...", which the leading
+        # "WITH" alone can't reveal. Strip every CTE's own (possibly nested) body via Strip-Parens,
+        # leaving roughly "WITH cte1 AS , cte2 AS  DELETE FROM t ..." - the first remaining
+        # recognizable verb after that is the statement actually being run.
+        if($w -eq 'WITH'){
+            $verbs = 'SELECT','INSERT','UPDATE','DELETE','REPLACE','TABLE','VALUES'
+            $verb = $null
+            foreach($tok in ((Strip-Parens $t) -split '\s+')){
+                $tu = $tok.ToUpper()
+                if($verbs -contains $tu){ $verb = $tu; break }
+            }
+            if($verb -ne 'SELECT' -and $verb -ne 'TABLE' -and $verb -ne 'VALUES'){ return $false }
+        }
+        # MariaDB's ANALYZE [FORMAT=JSON] <statement> form (distinct from ANALYZE TABLE) actually
+        # EXECUTES the wrapped statement while profiling it - bare "ANALYZE" was allow-listed for
+        # the genuinely read-only ANALYZE TABLE form, which would otherwise let "ANALYZE DELETE
+        # FROM t" straight through untouched.
+        if($w -eq 'ANALYZE'){
+            $parts = $t -split '\s+', 2
+            $rest = if($parts.Length -gt 1){ $parts[1].TrimStart() } else { '' }
+            $firstTok = ($rest -split '\s+')[0]
+            if($firstTok -notmatch '(?i)^TABLE$'){
+                $inner = [regex]::Replace($rest, '(?i)^FORMAT\s*=\s*JSON\s+', '')
+                $innerW = (($inner.Trim() -split '\s+')[0]).ToUpper()
+                if($innerW -ne 'SELECT'){ return $false }
+            }
         }
     }
     return $true
@@ -1088,10 +1152,16 @@ function Api-ImportCsv { param($conn,$data)
     $db=[string]$data.db; $table=[string]$data.table
     if(-not $db -or -not $table){ return '{"ok":false,"error":"No target table."}' }
     $dbl=SqlLit $db; $tl=SqlLit $table
-	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
+	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME,DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
     if(-not $cr.ok){ return '{"ok":false,"error":'+(J-Str $cr.err)+'}' }
     $tableCols=@($cr.rows | ForEach-Object { $_[0] })
     if($tableCols.Count -eq 0){ return '{"ok":false,"error":"Table not found or has no columns."}' }
+    # The "0xDEADBEEF passes through unquoted as a hex literal" rule below exists so a genuinely
+    # binary/BIT column can be filled from its own hex display - it's not meant for an ordinary
+    # text column that merely happens to contain a value that LOOKS like hex ("0xFF", a hash, an
+    # ID). Only the columns information_schema actually reports as binary/BIT get that treatment.
+    $binTypes=@('binary','varbinary','blob','tinyblob','mediumblob','longblob','bit')
+    $binCols=@($cr.rows | Where-Object { $binTypes -contains ([string]$_[1]).ToLower() } | ForEach-Object { $_[0] })
     try { if($data.hasHeader){ $rows=@(Import-Csv -Path $file) } else { $rows=@(Import-Csv -Path $file -Header $tableCols) } }
     catch { return '{"ok":false,"error":'+(J-Str ("CSV parse error: "+$_.Exception.Message))+'}' }
     if($rows.Count -eq 0){ return '{"ok":false,"error":"CSV has no data rows."}' }
@@ -1109,7 +1179,7 @@ function Api-ImportCsv { param($conn,$data)
         # The export writes NULL as an explicit marker (\N by default) so it stays distinct
         # from an empty string in the file. Read it back the same way; an empty cell keeps its
         # long-standing meaning of NULL, so importing a spreadsheet is unchanged.
-        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -eq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif($v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
+        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -eq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
         [void]$batch.Add('('+($vals -join ',')+')'); $n++
         if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
     }
@@ -2551,7 +2621,11 @@ function hide(id){
 }
 const RESERVED=new Set(['accessible','add','all','alter','analyze','and','as','asc','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','current_date','current_time','current_timestamp','cursor','database','databases','default','delete','desc','describe','distinct','div','double','drop','dual','each','else','exists','explain','false','fetch','float','for','force','foreign','from','fulltext','function','group','having','if','ignore','in','index','inner','insert','int','integer','interval','into','is','join','key','keys','left','like','limit','lock','long','longblob','longtext','match','mediumblob','mediumint','mediumtext','natural','not','null','numeric','offset','on','optimize','option','or','order','outer','primary','procedure','references','rename','repeat','replace','restrict','return','revoke','right','rlike','schema','schemas','select','set','show','smallint','spatial','sql','table','then','tinyblob','tinyint','tinytext','to','trigger','true','union','unique','unlock','unsigned','update','usage','use','using','values','varbinary','varchar','varying','when','where','while','with','write','zerofill']);
 function qid(n){n=String(n);if(n===''||!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)||RESERVED.has(n.toLowerCase()))return '`'+n.replace(/`/g,'``')+'`';return n;}
-function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return "'"+s.replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
+function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return strLit(s);}
+// Always a quoted string literal - unlike lit(), never reinterprets a hex-looking value as a raw
+// unquoted hex literal. lit()'s passthrough is meant for grid cell values; a password or other
+// plain-text field that happens to look like hex should stay exactly the text the user typed.
+function strLit(v){return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
 
 async function searchAllSchemas(){
   const term=($('objFilter').value||'').trim();
@@ -3997,7 +4071,7 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
    h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val)+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
-   t.cols.forEach((c,ci)=>{const v=row[c];h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+c.replace(/'/g,"\\'")+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
+   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
@@ -4781,7 +4855,7 @@ async function refreshProcessList(){
   // button at all rather than one that would only ever fail.
   const info=infoIdx>=0?String(row[infoIdx]||'').trim().toLowerCase():'';
   const isSelf=(info==='show full processlist'||info==='show processlist');
-  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid)+'\')">Kill</button>':'')+'</td>';
+  h+='<td style="padding:4px 6px;border-bottom:1px solid var(--bd2)">'+((pid!=null&&!isSelf)?'<button class="sm warn" onclick="killProcess(\''+esc(pid).replace(/\x27/g,'\\x27')+'\')">Kill</button>':'')+'</td>';
   h+='</tr>';
  });
  h+='</tbody></table>';
@@ -4796,14 +4870,17 @@ async function killProcess(pid){
 async function openUsers(){const r=await api('/api/query',{sql:"SELECT User,Host FROM mysql.user ORDER BY User,Host"});const sel=$('userSel');sel.innerHTML='';$('grantsBox').textContent='';window._selUser='';
  if(!r.ok){toast(r.error,true);return;}r.rows.forEach(u=>{const d=document.createElement('div');d.className='uitem';d.textContent=u[0]+'@'+u[1];d.dataset.v=u[0]+'\x01'+u[1];d.onclick=()=>{[...sel.children].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');window._selUser=d.dataset.v;showGrants();};sel.appendChild(d);});show('mUsers');}
 async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+lit(u)+"@"+lit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
-async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+lit(res.pw),'Created user'))openUsers();}
+async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw),'Created user'))openUsers();}
 async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Revoke privileges',okText:'Revoke',fields:[{key:'g',label:'Privileges to revoke (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
 async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+lit(u)+"@"+lit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
 async function changePassword(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const parts=v.split('\x01');const u=parts[0],h=parts[1];
  const res=await inputBox({title:'Change password for '+u+'@'+h,okText:'Change',fields:[{key:'pw',label:'New password',type:'password',value:''},{key:'pw2',label:'Confirm new password',type:'password',value:''}]});
  if(!res)return;if(!res.pw){toast('Password cannot be empty.',true);return;}if(res.pw!==res.pw2){toast('Passwords do not match.',true);return;}
- const uu=u.replace(/'/g,"''"),hh=h.replace(/'/g,"''"),pp=res.pw.replace(/'/g,"''");
- const sql="ALTER USER '"+uu+"'@'"+hh+"' IDENTIFIED BY '"+pp+"';";
+ // lit() for user/host (matching lockUser()), but strLit() - always quoted - for the password:
+ // lit()'s hex-literal passthrough is meant for cell values, not a password field, and a plain
+ // quote-double (no backslash escaping first) let a value ending in a backslash close the literal
+ // one character early.
+ const sql="ALTER USER "+lit(u)+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw)+";";
  const r=await api('/api/exec',{sql:sql});
  if(r.ok){log('Password changed for '+u+'@'+h+'.');}else{alert('Failed: '+(r.error||'unknown'));}}
 async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+lit(u)+"@"+lit(h),'Dropped user'))openUsers();}
