@@ -2169,11 +2169,24 @@ $Html = @'
  input,select,textarea{background:var(--in);color:var(--fg);border:1px solid var(--bd);border-radius:3px;padding:3px 6px;box-sizing:border-box}
  #bar input,#bar select{height:28px}
  #bar input.h{width:130px}#bar input.s{width:52px}#bar input.p{width:120px} #pass{-webkit-text-security:disc;text-security:disc}
- button{padding:0 9px;height:28px;box-sizing:border-box;border:1px solid var(--bd);border-radius:4px;background:var(--btn);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;line-height:1;vertical-align:middle;font-size:13px}
- button:hover:not(:disabled){filter:brightness(1.08)} button:active:not(:disabled){filter:brightness(.93)} button:disabled{opacity:.45;cursor:not-allowed;filter:none} button:focus-visible{outline:2px solid var(--accent);outline-offset:1px} .chip{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.5;letter-spacing:.4px;white-space:nowrap;border:1px solid transparent;box-shadow:inset 0 0 0 1px rgba(255,255,255,.10)} .chip.ok{background:#2e7d46;color:#fff} .chip.bad{background:#c0504d;color:#fff} button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18)} button.go{background:#2e7d32;color:#fff;border-color:#276b2b} button.sm{padding:0 6px;font-size:12px} button.warn{background:#b23b3b;color:#fff;border-color:#933}
+ /* white-space:nowrap: a button squeezed by a flex-shrinking sibling (e.g. the OBJECTS panel's
+    filter input) has no min-width floor otherwise, so its own label can wrap to two lines inside
+    the fixed 28px height instead of the button just staying its natural single-line width. */
+ button{padding:0 9px;height:28px;box-sizing:border-box;border:1px solid var(--bd);border-radius:4px;background:var(--btn);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;line-height:1;vertical-align:middle;font-size:13px;white-space:nowrap}
+ button:hover:not(:disabled){filter:brightness(1.08)} button:active:not(:disabled){filter:brightness(.93)} button:disabled{opacity:.45;cursor:not-allowed;filter:none} button:focus-visible{outline:2px solid var(--accent);outline-offset:1px} .chip{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:10.5px;font-weight:600;line-height:1.5;letter-spacing:.4px;white-space:nowrap;border:1px solid transparent;box-shadow:inset 0 0 0 1px rgba(255,255,255,.10)} .chip.ok{background:#2e7d46;color:#fff} .chip.bad{background:#c0504d;color:#fff}
+ /* A saved connection name or environment label is free text with no length limit at the point
+    of use (only a maxlength on the input, as a soft cap) - without this, a long one would either
+    stretch the bar past the window or wrap it onto a second line. Ellipsize instead; the title
+    attribute (set alongside the text in JS) carries the untruncated value on hover. */
+ #connStatus,#envChip,#schemaBadge{overflow:hidden;text-overflow:ellipsis;max-width:220px} button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18)} button.go{background:#2e7d32;color:#fff;border-color:#276b2b} button.sm{padding:0 6px;font-size:12px} button.warn{background:#b23b3b;color:#fff;border-color:#933}
  #main{flex:1;display:flex;min-height:0}
- #side{width:280px;min-width:170px;flex:0 0 auto;display:flex;flex-direction:column} #sideResize{flex:0 0 7px;cursor:col-resize;background:var(--bd);position:relative;touch-action:none;z-index:5} #sideResize:hover,#sideResize.drag{background:var(--accent)} body.disconnected #sideResize{pointer-events:auto !important;opacity:1 !important}
- .hdr{background:var(--panel2);padding:4px 8px;font-weight:600;font-size:11px;letter-spacing:.5px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;height:52px;box-sizing:border-box}
+ /* 280px is not an arbitrary floor - it's the narrowest the SCHEMAS header's label + its 4
+    buttons (+ Schema/+ Table/ER/refresh) fit on one line without wrapping into an overlapping
+    mess (measured empirically; wraps below ~270px, so 280 keeps a small safety margin for
+    font-metric differences across platforms). Below this, the header row that's been fixed to
+    never move would go right back to breaking. */
+ #side{width:280px;min-width:280px;flex:0 0 auto;display:flex;flex-direction:column} #sideResize{flex:0 0 7px;cursor:col-resize;background:var(--bd);position:relative;touch-action:none;z-index:5} #sideResize:hover,#sideResize.drag{background:var(--accent)} body.disconnected #sideResize{pointer-events:auto !important;opacity:1 !important}
+ .hdr{background:var(--panel2);padding:4px 8px;font-weight:600;font-size:11px;letter-spacing:.5px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;gap:8px;height:52px;box-sizing:border-box}
  #schemas{flex:0 0 40%;overflow:auto;border-bottom:1px solid var(--bd)} #objects{flex:1;overflow:auto}
  .item{padding:3px 10px 3px 16px;cursor:pointer;white-space:nowrap} #schemas .item{overflow:hidden;text-overflow:ellipsis} .uitem{padding:3px 10px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis} .uitem:hover{background:var(--hover)} .uitem.sel{background:var(--accent);color:#fff} .item:hover{background:var(--hover)} .item.sel{background:var(--accent);color:#fff}
  .ohdr{padding:3px 8px;font-weight:600;font-size:11px;color:var(--muted);background:var(--panel);border-top:1px solid var(--bd2);position:sticky;top:0}
@@ -2255,6 +2268,10 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
     behavior are deliberately kept distinct. */
  body:not(.disconnected):not(.show-connform) #connFormRow{display:none}
  body.disconnected #main.needsconn{display:flex !important;visibility:hidden}
+ /* Same reasoning as #main above: hiding topActions outright while disconnected would let
+    Settings/Quit slide left to fill the gap, then jump right the moment you connect - keeping
+    its layout box (just invisible) holds Settings/Quit in a fixed spot in both states. */
+ body.disconnected #topActions.needsconn{display:inline-flex !important;visibility:hidden}
  body.ro .write{opacity:.4;pointer-events:none;filter:grayscale(45%);cursor:not-allowed} #ctx .item.rodis{opacity:.4;pointer-events:none;cursor:not-allowed} .ctxsub{display:none;position:absolute;background:var(--panel);border:1px solid var(--bd);border-radius:4px;box-shadow:0 4px 16px rgba(0,0,0,.35);min-width:180px;z-index:9999;padding:3px 0} .ctxsub .item{white-space:nowrap} #objects .item{display:flex;justify-content:space-between;gap:8px;align-items:center} #objects .onm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap} #objects .osz{color:var(--muted);font-size:11px;flex:none} #overview h2{margin:2px 0 12px;font-size:15px;font-weight:600} table.ovgrid{border-collapse:collapse;width:auto;min-width:60%} table.ovgrid th{border:none;border-bottom:2px solid var(--bd);padding:4px 12px;text-align:left;white-space:nowrap} .ovgrid td{border:none;border-bottom:1px solid var(--bd2);padding:4px 12px;text-align:left;white-space:nowrap} table.ovgrid th{background:var(--gridh);font-weight:600} table.ovgrid td.num{text-align:right} table.ovgrid tbody tr{cursor:pointer} table.ovgrid tbody tr:hover{background:var(--hover,rgba(127,127,127,.12))}
 .expdbrow{margin:1px 0}
 .exptoggle{display:inline-block;width:14px;cursor:pointer;color:var(--muted);user-select:none;font-size:10px;text-align:center}
@@ -2271,8 +2288,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div id="bar">
  <div class="barrow">
   <b class="brand">NOBS SQL Editor</b>
-	<select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select><span id="pwChip" title="This connection has a saved password" style="display:none;margin-left:6px;font-size:14px;cursor:default">&#128274;</span><span id="connStatus" class="chip bad" style="margin-left:6px">Not connected</span><span id="envChip" class="chip bad" style="display:none;margin-left:6px"></span><span id="schemaBadge" class="chip ok" style="display:none;margin-left:6px"></span>
+	<select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select>
   <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()">New</button><button class="sm" title="Save these connection details" onclick="saveConn()">Save</button><button id="mgrBtn" class="sm" title="Edit, clone, delete or set primary for the selected connection" onclick="connMenu(event)">Manage &#9662;</button>
+  <span id="connStatusGroup" style="display:inline-flex;gap:6px;align-items:center;min-width:0;margin-left:4px"><span id="pwChip" title="This connection has a saved password" style="display:none;font-size:14px;cursor:default;flex:none">&#128274;</span><span id="connStatus" class="chip bad">Not connected</span><span id="envChip" class="chip bad" style="display:none"></span><span id="schemaBadge" class="chip ok" style="display:none"></span></span>
   <span style="flex:1"></span><span id="topActions" class="needsconn" style="display:inline-flex;gap:9px;align-items:center"><button class="primary" onclick="newTab()" title="Open a new query tab">+ New Query</button><span class="tbsep"></span><button class="sm" title="View users and privileges" onclick="openUsers()">Users</button><button class="sm" title="View and kill server processes/queries (SHOW FULL PROCESSLIST)" onclick="openProcessList()">Processes</button><button class="sm" title="Browse and reopen previous queries" onclick="openHistory()">History</button><button class="sm" title="Save and browse reusable queries" onclick="openLibrary()">Library</button><span class="tbsep"></span><button class="sm" title="Export databases with mysqldump" onclick="openExport()">Export</button><button class="sm" title="Import SQL files or a whole folder" onclick="openImport()">Import</button><button class="sm" title="Compare table structure between two databases" onclick="openCompare()">Compare DB</button></span><button class="sm" title="Configure or download the mysql / mysqldump client tools" onclick="openSettings()">Settings</button><span class="tbsep" style="margin:2px 10px"></span><a href="https://buymeacoffee.com/monsama" target="_blank" rel="noopener" title="Buy me a coffee, if NOBS SQL Editor saved you some time" style="cursor:pointer;line-height:1;text-decoration:none"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" style="height:26px;vertical-align:middle;opacity:.85;border-radius:4px" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.85"></a><button class="sm warn" title="Stop the local server and exit (the clean way to close the app)" onclick="quit()" style="margin-left:10px">Quit</button>
  </div>
  <div class="barrow" id="connFormRow">
@@ -2284,11 +2302,14 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 </div>
 <div id="main" class="needsconn">
  <div id="side">
-  <div class="hdr"><span>SCHEMAS</span><span><button class="sm" title="Create a new schema" onclick="newSchema()">+ Schema</button> <button class="sm" title="Open the table designer" onclick="designTable(null)">+ Table</button> <button class="sm" title="ER Diagram for the selected schema" onclick="openErdForCurSchema()">ER</button> <button class="sm" title="Refresh the schema list and tables" onclick="refreshSchemasAndTables()">&#8635;</button></span></div>
+  <div class="hdr"><span>SCHEMAS</span><span style="white-space:nowrap"><button class="sm" title="Create a new schema" onclick="newSchema()">+ Schema</button> <button class="sm" title="Open the table designer" onclick="designTable(null)">+ Table</button> <button class="sm" title="ER Diagram for the selected schema" onclick="openErdForCurSchema()">ER</button> <button class="sm" title="Refresh the schema list and tables" onclick="refreshSchemasAndTables()">&#8635;</button></span></div>
   <div id="schemas" tabindex="0"></div>
-  <div class="hdr"><span>OBJECTS</span><span id="objdb" class="muted"></span></div>
+  <!-- The schema name gets its own row under the "OBJECTS" label rather than squeezed onto the
+       same line - a flat width cap still truncated a real schema name that only just didn't fit
+       alongside "OBJECTS" but comfortably fits on a full-width line of its own. -->
+  <div class="hdr" style="flex-direction:column;align-items:flex-start;justify-content:center;gap:2px"><span>OBJECTS</span><span id="objdb" class="muted" style="width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
 <div style="display:flex;gap:4px;margin:4px 6px;align-items:center">
-<input id="objFilter" placeholder="filter objects..." oninput="renderObjects()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;font-size:12px">
+<input id="objFilter" placeholder="filter objects..." oninput="renderObjects()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;min-width:0;font-size:12px">
 <button class="sm" id="allSchemasBtn" title="Search this name across all schemas" onclick="searchAllSchemas()" style="padding:2px 6px;font-size:11px">All DBs</button>
 </div>
   <div id="objects" tabindex="0"></div>
@@ -2298,7 +2319,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 </div>
 <div id="loghdr"><span>Action Output</span><span style="cursor:pointer" onclick="document.getElementById('log').textContent=''">clear</span></div><div id="log"></div>
 <div id="ctx"></div>
-<div id="minimizedTray" style="display:none;position:fixed;bottom:10px;right:10px;gap:8px;z-index:9500"></div>
+<div id="minimizedTray" style="display:none;position:fixed;bottom:10px;right:10px;gap:8px;z-index:9500;max-width:70vw;flex-wrap:wrap;justify-content:flex-end"></div>
 <div id="colPicker"></div>
 <div id="copyMenu"></div>
 <div id="acx"></div>
@@ -2491,7 +2512,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="inpFields" style="flex:1 1 auto;min-height:0;overflow:auto"></div>
  <div class="row" style="justify-content:flex-end;margin-top:6px;flex:none"><button class="go" id="inpOk" onclick="inpOk()">OK</button><button onclick="inpCancel()">Cancel</button></div></div></div>
 <div class="modal floating" id="mLib"><div class="box" style="width:640px;max-width:92vw;top:60px;left:180px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mLib')" title="Drag to move"><h3 style="margin:0">Query Library</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mLib')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
- <div class="row"><input id="libName" placeholder="Name for the current query" style="flex:1" onkeydown="if(event.key==='Enter')libSaveCurrent()"><button class="go" onclick="libSaveCurrent()">Save current query</button></div>
+ <div class="row"><input id="libName" placeholder="Name for the current query" maxlength="80" style="flex:1" onkeydown="if(event.key==='Enter')libSaveCurrent()"><button class="go" onclick="libSaveCurrent()">Save current query</button></div>
  <div class="row"><input id="libSearch" placeholder="Search saved queries..." oninput="libRender()" style="flex:1"></div>
  <div id="libList" style="max-height:380px;overflow:auto;border:1px solid var(--bd);border-radius:4px"></div>
  <div class="row"><button class="warn" onclick="libClearAll()" title="Delete all saved queries">Clear all</button><button onclick="libExport()" title="Download the whole library as a JSON file">Export library</button><button onclick="$('libFile').click()" title="Load a query-library.json from another machine (merges)">Import library</button><input type="file" id="libFile" accept="application/json,.json" style="display:none" onchange="libImportFile(event)"><span style="flex:1"></span><button onclick="hide('mLib')">Close</button></div></div></div>
@@ -2533,7 +2554,7 @@ window.readOnly=false;window.curEnv='';
 // Pure DOM rendering for the env chip - no side effects on window.readOnly/curEnv, so it's
 // safe to call for a merely-selected (not yet connected) connection as a preview, same as the
 // password lock icon already does. Only applyEnv() (below) touches the real enforcement state.
-function renderEnvChip(env,ro,acc){const el=$('envChip');if(!el)return;if(env||ro){el.style.display='inline-flex';el.textContent=(env||'')+(ro?(env?' - ':'')+'READ-ONLY':'');if(acc){el.className='chip';el.style.background=acc;el.style.color='#fff';el.style.borderColor='transparent';}else{el.className='chip '+(ro?'bad':'ok');el.style.background='';el.style.color='';el.style.borderColor='';}}else{el.style.display='none';}}
+function renderEnvChip(env,ro,acc){const el=$('envChip');if(!el)return;if(env||ro){el.style.display='inline-flex';el.textContent=(env||'')+(ro?(env?' - ':'')+'READ-ONLY':'');el.title=el.textContent;if(acc){el.className='chip';el.style.background=acc;el.style.color='#fff';el.style.borderColor='transparent';}else{el.className='chip '+(ro?'bad':'ok');el.style.background='';el.style.color='';el.style.borderColor='';}}else{el.style.display='none';}}
 function applyEnv(name){const m=connMeta()[name]||{};window.readOnly=!!m.readonly;window.curEnv=m.env||'';const acc=window.curAccent||accMap()[name]||'';renderEnvChip(window.curEnv,window.readOnly,acc);document.body.classList.toggle('ro',window.readOnly);}
 function roBlock(){if(window.readOnly){alert('This connection is marked READ-ONLY (safe mode). Writes are disabled.\n\nUncheck "Read-only" in the saved connection to allow changes.');return true;}return false;}
 function accMap(){const m=window._connMeta||{};const o={};for(const k in m){if(m[k]&&m[k].accent)o[k]=m[k].accent;}return o;}
@@ -2629,11 +2650,14 @@ function floatRenderTray(){
  // inside a shared clickable wrapper - a click on either fires only its own handler and bubbles
  // up through elements with no onclick of their own, so there's no risk of clicking the x also
  // triggering restore (or vice versa), and no stopPropagation is needed for that reason.
- tray.innerHTML=ids.map(id=>
-  '<span class="chip" style="background:var(--panel);border-color:var(--bd2);color:var(--fg);gap:8px;cursor:default">'
-  +'<span onclick="floatRestore(\''+id+'\')" style="cursor:pointer" title="Restore">'+esc(floatTrayLabel(id))+'</span>'
+ // A minimized modal's title can be arbitrarily long (e.g. the ER Diagram title includes the
+ // schema name) - the label gets its own width cap + ellipsis so one long chip can't push earlier
+ // ones off the left edge of the tray (the tray itself wraps to a new row once it runs out of
+ // room - see its max-width/flex-wrap above).
+ tray.innerHTML=ids.map(id=>{const lbl=floatTrayLabel(id);return '<span class="chip" style="background:var(--panel);border-color:var(--bd2);color:var(--fg);gap:8px;cursor:default">'
+  +'<span onclick="floatRestore(\''+id+'\')" style="cursor:pointer;display:inline-block;max-width:160px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;vertical-align:middle" title="'+esc(lbl)+' — Restore">'+esc(lbl)+'</span>'
   +'<span onclick="modalClose(\''+id+'\')" style="cursor:pointer;font-weight:700;padding:0 1px" title="Close">&times;</span>'
-  +'</span>'
+  +'</span>';}
  ).join('');
 }
 function floatMinimize(id){
@@ -2694,7 +2718,7 @@ async function searchAllSchemas(){
     d.innerHTML='<span class="onm">'+esc(it.name)+'</span><span class="osz">'+esc(it.schema)+' \u00B7 '+esc(it.type)+'</span>';
     d.onclick=()=>{
       curSchema=it.schema;
-      $('objdb').textContent=it.schema;
+      $('objdb').textContent=it.schema;$('objdb').title=it.schema;
 
       // Highlight the schema in the schemas list
       const schemasBox = $('schemas');
@@ -2762,7 +2786,7 @@ function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').t
   // real problem, even in a local, developer-facing tool. inpOk()'s extraction needs no changes
   // for this: it already just reads .value off any non-checkbox input regardless of its type.
   if(f.type==='password'){const wrap=document.createElement('div');wrap.style.position='relative';const inp=document.createElement('input');inp.id='inp_'+f.key;inp.type='password';inp.style.width='100%';inp.style.paddingRight='28px';inp.style.boxSizing='border-box';if(f.value!=null)inp.value=f.value;inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};const eye=document.createElement('span');eye.textContent='\u{1F441}';eye.title='Show/hide password';eye.style.cssText='position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:13px;user-select:none;opacity:.7';eye.onclick=()=>{inp.type=(inp.type==='password')?'text':'password';};wrap.appendChild(inp);wrap.appendChild(eye);w.appendChild(lb);w.appendChild(wrap);box.appendChild(w);return;}
-  const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';}if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;
+  const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';}if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;if(f.maxlength)inp.maxLength=f.maxlength;
   inp.onkeydown=e=>{if(e.key==='Enter'&&!isTa){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(lb);w.appendChild(inp);box.appendChild(w);});
  $('inpOk').textContent=opts.okText||'OK';show('mInput');setTimeout(()=>{const f0=box.querySelector('input');if(f0){f0.focus();f0.select();}},40);});}
 function inpOk(){const out={};$('inpFields').querySelectorAll('input,textarea,select').forEach(i=>{out[i.id.slice(4)]=(i.type==='checkbox')?i.checked:i.value;});hide('mInput');const r=_inpResolve;_inpResolve=null;if(r)r(out);}
@@ -2862,14 +2886,14 @@ async function saveConn(){
  const m0=n0?(connMeta()[n0]||{}):{};
  const dn=n0||($('user').value+'@'+$('host').value);
  const res=await inputBox({title:'Save connection',okText:'Save',fields:[
-  {key:'name',label:'Save connection as',value:dn},
+  {key:'name',label:'Save connection as',value:dn,maxlength:60},
   {key:'host',label:'Host',value:$('host').value},
   {key:'port',label:'Port',value:$('port').value},
   {key:'user',label:'User',value:$('user').value},
   {key:'password',label:'Password',type:'password',value:$('pass').value},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify'}],value:$('ssl').value},
   {key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:n0?(accMap()[n0]||'#3b82f6'):'#3b82f6'},
-  {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||''},
+  {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!$('pass').value:true}
  ]});
@@ -2889,14 +2913,14 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
  const g=await api('/api/conn-get',{name:n0});if(!g.ok){toast('Could not load connection.',true);return;}
  const m0=connMeta()[n0]||{};
  const res=await inputBox({title:'Edit connection',okText:'Save',fields:[
-  {key:'name',label:'Name',value:n0},
+  {key:'name',label:'Name',value:n0,maxlength:60},
   {key:'host',label:'Host',value:g.conn.host},
   {key:'port',label:'Port',value:g.conn.port},
   {key:'user',label:'User',value:g.conn.user},
   {key:'password',label:'Password',type:'password',value:g.conn.password||''},
   {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify'}],value:g.conn.ssl},
   {key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},
-  {key:'env',label:'Environment label (optional)',value:m0.env||''},
+  {key:'env',label:'Environment label (optional)',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}
  ]});
@@ -2912,7 +2936,7 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
 async function cloneConn(){const n0=$('connlist').value;
  if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('pass').value=g.conn.password;}}
  const base=n0||($('user').value+'@'+$('host').value);
- const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)'}]});
+ const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)',maxlength:60}]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
  const r=await api('/api/conn-save',{name:nn,conn:getConn()});if(!r.ok){toast(r.error,true);return;}
  if(n0){const c=accMap()[n0];if(c)accSet(nn,c);const m=connMeta()[n0];if(m)connMetaSet(nn,m);}
@@ -2941,7 +2965,7 @@ async function connect() {
   window.mariadb = !!r.mariadb;
   document.body.classList.remove('disconnected');
   document.body.classList.remove('show-connform');
-  const _cs = $('connStatus'); if (_cs) { const _sel=$('connlist'); _cs.textContent = 'Connected: ' + (_sel && _sel.value ? _sel.options[_sel.selectedIndex].text.replace(/^\u2605 /, '') : ($('user').value + '@' + $('host').value)); _cs.className = 'chip ok'; }
+  const _cs = $('connStatus'); if (_cs) { const _sel=$('connlist'); _cs.textContent = 'Connected: ' + (_sel && _sel.value ? _sel.options[_sel.selectedIndex].text.replace(/^\u2605 /, '') : ($('user').value + '@' + $('host').value)); _cs.title = _cs.textContent; _cs.className = 'chip ok'; }
   applyAccent(window.curAccent || '');
   applyEnv($('connlist').value);
   // IMPORTANT: snapshot the active connection BEFORE restoring any tabs below - restoring a
@@ -2993,12 +3017,14 @@ async function loadSchemas() {
         d.className = 'item';
         const sizeStr = sc.size > 0 ? ' (' + fmtBytes(sc.size) + ')' : '';
         d.textContent = sc.name + sizeStr;
+        d.title = sc.name + sizeStr;
 
         d.onclick = () => {
             [...box.children].forEach(c => c.classList.remove('sel'));
             d.classList.add('sel');
             curSchema = sc.name;
             $('objdb').textContent = sc.name;
+            $('objdb').title = sc.name;
             // dbOf() gives curSchema priority for a plain query tab, so this click changes
             // where the next query runs - the badge has to say so, or it keeps advertising
             // the previous schema while queries go somewhere else.
@@ -3142,13 +3168,13 @@ function renderObjects(){const box=$('objects');box.innerHTML='';if(!objData)ret
  if(pinned.length){
    const fil=pinned.filter(n=>r.tables.includes(n)&&(!f||n.toLowerCase().includes(f)));
    if(fil.length){const h=document.createElement('div');h.className='ohdr';h.textContent='\u2605 Pinned ('+fil.length+')';box.appendChild(h);
-     fil.forEach(n=>{const d=document.createElement('div');d.className='item';if(objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
+     fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
       d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,'table',n);};
       d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,'table',n);};box.appendChild(d);});}
  }
  const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
  groups.forEach(([label,items,type])=>{const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;const h=document.createElement('div');h.className='ohdr';h.textContent=label+' ('+fil.length+(f?'/'+items.length:'')+')';box.appendChild(h);
-  fil.forEach(n=>{const d=document.createElement('div');d.className='item';if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
+  fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
    d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,type,n);};
    d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});});}
 async function buildColHints(db){try{const r=await api('/api/query',{sql:"SELECT DISTINCT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)});window.acColumns=(r.ok?r.rows.map(x=>x[0]):[]);}catch(e){window.acColumns=[];}}
@@ -3342,6 +3368,7 @@ function renderOverview() {
             });
             curSchema = db;
             $('objdb').textContent = db;
+            $('objdb').title = db;
             loadObjects(db);
         };
     });
@@ -3494,11 +3521,15 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
  tb.addEventListener('drop',e=>{e.preventDefault();tb.classList.remove('dragover');const srcId=e.dataTransfer.getData('text/plain');if(!srcId||srcId===id)return;reorderTab(srcId,id);});
  $('tabsbar').appendChild(tb);saveSession();
  const pane=document.createElement('div');pane.className='tabpane';pane.id='pane_'+id;
- const applyBtn=tab.ddl?'<button class="go write" onclick="applyDdl(\''+id+'\')">Apply (recreate)</button>':'';const lastBtn=tab.ddl?'':'<button title="Toggle between the current query and the last one you ran" onclick="toggleLast(\''+id+'\')">\u21C4 Last query</button>';const selBtn=tab.table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">\u21C4 Show all</button>':'';
+ const applyBtn=tab.ddl?'<button class="go write" onclick="applyDdl(\''+id+'\')">Apply (recreate)</button>':'';const lastBtn=tab.ddl?'':'<button title="Toggle between the current query and the last one you ran" onclick="toggleLast(\''+id+'\')">\u21C4 Last query</button>';const selBtn='<span id="selbtn_'+id+'">'+selBtnHtml(id,tab.table)+'</span>';
  const pager='<span class="tbsep"></span><span id="pager_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>';
  pane.innerHTML='<div class="edwrap" id="ew_'+id+'"><pre class="hl" id="hl_'+id+'"></pre><textarea class="editor" id="ed_'+id+'" spellcheck="false"></textarea></div>'+
   '<div class="edsplit" id="es_'+id+'" title="Drag to resize the editor"></div>'+
-  '<div class="toolbar"><button class="primary" id="runbtn_'+id+'" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')">Run Query Selection</button><button title="Prepend EXPLAIN to the current statement and run it" onclick="explainTab(\''+id+'\')">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')">Format</button><button class="warn" id="cancelbtn_'+id+'" style="display:none" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button>'+
+  // Run Query and Cancel are mutually-exclusive states of the same "primary action" slot, not
+  // two independent buttons - stacked in one shared grid cell (both always in layout, only one
+  // ever visible) so swapping between them on every run/cancel never shifts Run Query Selection/
+  // Explain/Format, which display:none toggling used to do on every single query execution.
+  '<div class="toolbar"><span style="display:inline-grid"><button class="primary" id="runbtn_'+id+'" style="grid-area:1/1" title="Run the query (F5)" onclick="runTab(\''+id+'\')">Run Query</button><button class="warn" id="cancelbtn_'+id+'" style="grid-area:1/1;visibility:hidden" title="Cancel the running query" onclick="cancelQuery(\''+id+'\')">Cancel</button></span><button title="Run the selected text (Ctrl+Enter) - or, if nothing is selected, whichever statement the cursor is currently inside" onclick="runSel(\''+id+'\')">Run Query Selection</button><button title="Prepend EXPLAIN to the current statement and run it" onclick="explainTab(\''+id+'\')">Explain</button><button title="Reformat the query for readability (safe - only changes whitespace/line breaks, never the query itself)" onclick="formatTabSql(\''+id+'\')">Format</button>'+
   '<span class="tbsep"></span>'+
   lastBtn+selBtn+applyBtn+
   '<label title="If a statement fails, keep running the rest of the script instead of stopping at the first error - useful for bulk, mostly-independent statements like seed data or batch table creation. Every failure is reported, not just the first. Only applies to a script that does NOT end in a SELECT." style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="coe_'+id+'"> Continue on error</label>'+
@@ -3621,7 +3652,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
  });
  syncHl(id);activate(id);if(run)runTab(id);return id;}
 function activate(id){activeTab=id;const _ov=$('overview');if(_ov)_ov.style.display='none';tabs.forEach(t=>{$('tabbtn_'+t.id).classList.toggle('active',t.id===id);$('pane_'+t.id).classList.toggle('active',t.id===id);});const ta=$('ed_'+id);if(ta)setTimeout(()=>ta.focus(),0);updateSchemaBadge(id);const _t=T(id);if(_t&&_t.cols&&_t.cols.length&&!_t.colsFitted){requestAnimationFrame(()=>autofitAll(id));}}
-function updateSchemaBadge(id){const el=$('schemaBadge');if(!el)return;if(document.body.classList.contains('disconnected')){el.style.display='none';el.textContent='';return;}const t=T(id);const db=t?dbOf(t):null;el.textContent=db?('Schema: '+db):'';el.style.display=db?'inline-flex':'none';}
+function updateSchemaBadge(id){const el=$('schemaBadge');if(!el)return;if(document.body.classList.contains('disconnected')){el.style.display='none';el.textContent='';return;}const t=T(id);const db=t?dbOf(t):null;el.textContent=db?('Schema: '+db):'';el.title=el.textContent;el.style.display=db?'inline-flex':'none';}
 function pendingCount(t){if(!t||!t.pending)return 0;return Object.keys(t.pending.upd||{}).length+((t.pending.del&&t.pending.del.size)||0)+((t.pending.ins&&t.pending.ins.length)||0);}
 function uniqueTabTitle(base){
   let title=base, n=2;
@@ -3865,11 +3896,20 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
     if(!T(id))return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
-    t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();$('edit_'+id).innerHTML='';
+    t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
+    // Direct clear (not updateEditBar) since a fresh query's table-ness isn't known yet - gives
+    // instant feedback instead of showing stale buttons from whatever was loaded before while
+    // this one is still fetching. Must also drop updateEditBar's own "nothing changed" cache
+    // (dataset.sig) here, or a freshly-loaded editable table whose starting state (0 pending, no
+    // selection) happens to match whatever sig was last cached gets wrongly treated as "already
+    // showing this" and the bar - now genuinely empty from the innerHTML='' below - never gets
+    // rebuilt at all, even though this new table has a PK and should show +Row/Apply/etc.
+    {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
     if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';updateFetchMoreBtn(id);return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
     updateFetchMoreBtn(id);
+    refreshRunTableBinding(id,lastStmt);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
@@ -3919,7 +3959,17 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
  }
 }
 
-function setRunning(id,running){const rb=$('runbtn_'+id),cb=$('cancelbtn_'+id);if(!rb||!cb)return;rb.style.display=running?'none':'';cb.style.display=running?'':'none';
+// Swapping to Cancel is delayed 900ms rather than instant: most runs - including every silent
+// background "fetch more rows" call, which goes through this exact same function - finish well
+// under that, so the button bar never flips at all for the common case instead of flashing to
+// Cancel and back within a fraction of a second on every one of them. A run that's still going
+// when the delay elapses shows Cancel immediately, same as before; cancelling (or finishing)
+// always clears the pending timer so a since-completed run can't pop it up late.
+const _runDelayTimers={};
+function setRunning(id,running){const rb=$('runbtn_'+id),cb=$('cancelbtn_'+id);if(!rb||!cb)return;
+ if(_runDelayTimers[id]){clearTimeout(_runDelayTimers[id]);delete _runDelayTimers[id];}
+ if(running){_runDelayTimers[id]=setTimeout(()=>{delete _runDelayTimers[id];rb.style.visibility='hidden';cb.style.visibility='';},900);}
+ else{rb.style.visibility='';cb.style.visibility='hidden';}
  const tb=$('tabbtn_'+id);if(tb){let dot=tb.querySelector('.runningdot');if(running){if(!dot){dot=document.createElement('span');dot.className='runningdot';dot.title='Query running';tb.insertBefore(dot,tb.firstChild);}}else if(dot){dot.remove();}}}
 async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.abortCtrl.abort();}catch(e){}}
  const rid=t.runningReqId;
@@ -3969,6 +4019,44 @@ function setLimit(id){const t=T(id);const v=Math.max(1,parseInt($('lim_'+id).val
 function pg(id,dir){const t=T(id);t.limit=Math.max(1,parseInt($('lim_'+id).value)||1000);const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));let no=(t.offset||0)+dir*t.limit;if(no<0)no=0;if(no>=total)no=Math.max(0,(t.offset||0));t.offset=no;pageShow(id);}
 function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}ta.value=t.prevRun;if(typeof syncHl==='function')syncHl(id);runSql(id,t.prevRun);}
 function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+' LIMIT '+(t.limit||1000)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
+function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">⇄ Show all</button>':'';}
+// t.table (and thus row-edit capability, export-as-table, quick filter, ...) used to be fixed
+// at whatever the tab was opened with and never revisited - so a tab opened as a non-editable
+// "SELECT COUNT(*)" stayed permanently non-editable even after retyping it into a plain
+// "SELECT * FROM x", AND (worse) a tab opened against one table that got hand-edited to query a
+// DIFFERENT one stayed silently bound to the ORIGINAL table for Apply's UPDATE/DELETE target -
+// editing rows that were never really identified by the PK it thought it had. Called once per
+// run with the statement actually about to execute, so t.table always reflects the query that
+// produced what's on screen right now, not whatever the tab happened to start as.
+function refreshRunTableBinding(id,lastStmt){
+ const t=T(id);if(!t||t.ddl)return;
+ const m=parseSingleEditableTable(lastStmt,t.db||curSchema);
+ const newTable=m?m.table:null, newDb=m?m.db:(t.db||curSchema);
+ if(t.table===newTable&&t.db===newDb)return;
+ t.table=newTable;t.db=newDb;
+ const sb=$('selbtn_'+id);if(sb)sb.innerHTML=selBtnHtml(id,t.table);
+}
+// Conservative on purpose: only recognizes "SELECT ... FROM <one table>" with no JOIN/comma-join,
+// UNION, GROUP BY, DISTINCT, or bare aggregate call - any of those can produce a result that
+// isn't one row per primary key, which is exactly what row-editing (and Apply's UPDATE/DELETE
+// WHERE pk=...) assumes. No alias support either, matching the one pattern this app itself ever
+// generates (openRun/toggleAll's own "SELECT * FROM db.table"). False negatives (a hand-written
+// query that IS safely editable but doesn't match) just mean no edit bar, never a false positive.
+function parseSingleEditableTable(sql,fallbackDb){
+ const head=sqlHead(sql).replace(/;\s*$/,'').trim();
+ if(!/^select\b/i.test(head))return null;
+ if(/^select\s+distinct\b/i.test(head))return null;
+ if(/\bunion\b/i.test(head))return null;
+ if(/\bgroup\s+by\b/i.test(head))return null;
+ const ID='(?:`(?:[^`]|``)+`|[A-Za-z_$][A-Za-z0-9_$]*)';
+ const m=head.match(new RegExp('\\bfrom\\s+('+ID+')(?:\\s*\\.\\s*('+ID+'))?','i'));
+ if(!m)return null;
+ if(/\b(count|sum|avg|min|max|group_concat|std|stddev|variance|bit_and|bit_or|bit_xor)\s*\(/i.test(head.slice(0,m.index)))return null;
+ const rest=head.slice(m.index+m[0].length).trim();
+ if(rest&&!/^(where|order\s+by|limit|having)\b/i.test(rest))return null;
+ const unq=s=>s.startsWith('`')?s.slice(1,-1).replace(/``/g,'`'):s;
+ return m[2]?{db:unq(m[1]),table:unq(m[2])}:{db:fallbackDb,table:unq(m[1])};
+}
 async function openRun(id){const t=T(id);const wh=t.filter?(' WHERE '+t.filter):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+' LIMIT 1000;';$('ed_'+id).value=sql;syncHl(id);t.offset=0;await runSql(id,sql);updateFilterBar(id);}
 function pageShow(id){renderBody(id);updatePager(id);updateStatusLine(id);}
 
@@ -4090,7 +4178,14 @@ function syncFilterRowTop(id){
  const h=hdr.getBoundingClientRect().height;
  if(h>0)[...fr.children].forEach(th=>th.style.top=h+'px');
 }
-function sortHeader(id,ed){const t=T(id);let h='<th style="width:22px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');h+='<th style="cursor:pointer" title="Click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')">'+esc(c)+kb+ar+'<span class="rz" data-ci="'+ci+'"></span></th>';});return h+'<th></th>';}
+// Header cells force an explicit height (28px, matching the app's button height) on both the
+// th AND its inner flex wrapper, instead of centering via height:100% (percentage) or the
+// browser's default table vertical-align - a sticky th (position:sticky, which every header
+// cell here is) doesn't reliably get treated as having a "definite" height for either of those
+// in every rendering engine, which is what let header text and the select-all checkbox render
+// top-aligned instead of centered under a real WebView2 build. An explicit pixel height on both
+// sides of the relationship sidesteps the question entirely.
+function sortHeader(id,ed){const t=T(id);const H=28;let h='<th style="width:22px;height:'+H+'px;padding:0"><span style="display:flex;align-items:center;justify-content:center;height:'+H+'px"><input type="checkbox" title="Select/clear all shown rows" onclick="selAll(\''+id+'\',this.checked)"></span></th>'+(ed?'<th></th>':'');t.cols.forEach((c,ci)=>{const ar=t.sortCol===ci?(t.sortDir>0?' \u25B2':' \u25BC'):'';const isPk=t.pk&&t.pk.indexOf(c)>=0;const isFk=t.fk&&t.fk.indexOf(c)>=0;const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');h+='<th style="cursor:pointer;height:'+H+'px;padding:0 8px" title="'+esc(c)+' \u2014 click to sort (drag edge to resize, double-click edge to auto-fit)" onclick="sortBy(\''+id+'\','+ci+')"><span style="display:flex;align-items:center;gap:4px;height:'+H+'px;min-width:0"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">'+esc(c)+'</span>'+kb+ar+'</span><span class="rz" data-ci="'+ci+'"></span></th>';});return h+'<th></th>';}
 function setFilter(id,ci,v){const t=T(id);t.filters[ci]=v;renderBody(id);updatePager(id);updateStatusLine(id);}
 function sortBy(id,ci){const t=T(id);if(t.sortCol===ci){if(t.sortDir>0){t.sortDir=-1;}else{t.sortCol=-1;t.sortDir=1;}}else{t.sortCol=ci;t.sortDir=1;}$('sortrow_'+id).innerHTML=sortHeader(id,!!t.pk);renderBody(id);syncFilterRowTop(id);wireColResize(id);updatePager(id);updateStatusLine(id);}
 function viewIndices(id){const t=T(id);let view=t.rows.map((r,ri)=>ri);
@@ -4129,10 +4224,19 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
-function updateEditBar(id){const t=T(id);if(!t.pk){$('edit_'+id).innerHTML='';return;}
+// renderBody() (the grid's own virtualized-scroll re-render, up to ~60/sec while actively
+// scrolling) calls this every time, but the pending count/selection it depends on almost never
+// actually changes between those calls - rebuilding the whole innerHTML anyway tore the buttons
+// down and recreated them dozens of times a second during plain scrolling, which is what read as
+// a flicker. Skip the rebuild entirely when the two values this bar's markup actually depends on
+// haven't changed since the last time it was built.
+function updateEditBar(id){const t=T(id);const el=$('edit_'+id);if(!el)return;if(!t.pk){if(el.innerHTML){el.innerHTML='';delete el.dataset.sig;}return;}
  const n=Object.keys(t.pending.upd).length+t.pending.del.size+t.pending.ins.length;
  const hasSel=t.selected&&t.selected.size>0;
- $('edit_'+id).innerHTML='<span class="pill">'+n+' pending</span><button class="write" onclick="addRow(\''+id+'\')">+ Row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')">Revert</button>';}
+ const sig=n+':'+hasSel;
+ if(el.dataset.sig===sig)return;
+ el.dataset.sig=sig;
+ el.innerHTML='<button class="write" onclick="addRow(\''+id+'\')">+ Row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')">Revert</button><span class="pill">'+n+' pending</span>';}
 function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;const ta=$('vText');const sel=$('vSelect');
  // Dropdown mode: used for ENUM columns (their real defined values) and tinyint(1) "boolean"
  // columns (treated as a 2-value enum of '0'/'1') - picking from the actual valid values is
@@ -4259,10 +4363,23 @@ function goToFkRow(db,refTable,refCol,val){
 }
 function copyRow(id,ri){const t=T(id);const vals=t.cols.map((c,ci)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];});window._rowClipboard=vals;navigator.clipboard.writeText(vals.map(v=>v===null?'':v).join('\t')).then(()=>log('Copied 1 row (TSV, '+t.cols.length+' column(s)).'));}
 function copySelRows(id){const t=T(id);const idxs=viewIndices(id).filter(ri=>t.selected&&t.selected.has(ri));if(!idxs.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}const rowsData=idxs.map(ri=>t.cols.map((c,ci)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];}));window._rowsClipboard=rowsData;const lines=rowsData.map(vals=>vals.map(v=>v===null?'':v).join('\t'));navigator.clipboard.writeText(lines.join('\n')).then(()=>log('Copied '+idxs.length+' row(s) (TSV, '+t.cols.length+' column(s)).'));}
-function pasteRowInto(id,ri){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const vals=window._rowClipboard;if(!vals||!vals.length){toast('Copy a row first, then right-click a target row to paste it.',true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
+// "Copy row" and "Copy rows (selected)" write to two separate clipboards (single row vs a
+// list), since pasting several rows only makes sense as new rows, never as an overwrite of one
+// target row - but a single-row paste shouldn't care which command put that one row there.
+// Falls back to _rowsClipboard when it holds exactly one row and _rowClipboard is empty/stale.
+function singleRowClipboard(){if(window._rowClipboard&&window._rowClipboard.length)return window._rowClipboard;if(window._rowsClipboard&&window._rowsClipboard.length===1)return window._rowsClipboard[0];return null;}
+// Distinguishes "nothing copied" from "multiple rows copied" for the two single-row-target paste
+// spots below - both used to show the same "Copy a row first" message for either case, which is
+// actively misleading when rows genuinely were copied, just more than the one this paste can use.
+function noSingleRowMsg(target){const n=window._rowsClipboard&&window._rowsClipboard.length;if(n>1)return 'You copied '+n+' rows - overwrite can only use one. Copy just the row you want, or use "Paste rows as new" instead.';return 'Copy a row first, then right-click a '+target+' row to paste it.';}
+function pasteRowInto(id,ri){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const vals=singleRowClipboard();if(!vals||!vals.length){toast(noSingleRowMsg('target'),true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
  t.cols.forEach((c,ci)=>{if(t.pk.indexOf(c)>=0)return;const v=vals[ci];const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;});
  renderGrid(id);log('Pasted copied row into row '+(ri+1)+' (primary key column(s) left unchanged). Review and click Apply to commit.');}
-function pasteRowsAsNew(id){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}const rowsData=window._rowsClipboard;if(!rowsData||!rowsData.length){toast('Copy some rows first (Copy rows (selected)), then paste them as new rows.',true);return;}const bad=rowsData.find(vals=>vals.length!==t.cols.length);if(bad){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}rowsData.forEach(vals=>{const obj={};t.cols.forEach((c,ci)=>{obj[c]=vals[ci];});t.pending.ins.push(obj);});renderGrid(id);log('Pasted '+rowsData.length+' row(s) as new rows. Review and click Apply to commit.');}
+// Mirror image of singleRowClipboard() above: "Copy row" (singular) only ever fills
+// _rowClipboard, so pasting-as-new after copying exactly one row that way needs the same
+// fallback the single-row overwrite paste already got, or it wrongly says nothing was copied.
+function rowsClipboard(){if(window._rowsClipboard&&window._rowsClipboard.length)return window._rowsClipboard;if(window._rowClipboard&&window._rowClipboard.length)return [window._rowClipboard];return null;}
+function pasteRowsAsNew(id){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}const rowsData=rowsClipboard();if(!rowsData||!rowsData.length){toast('Copy some rows first (Copy rows (selected)), then paste them as new rows.',true);return;}const bad=rowsData.find(vals=>vals.length!==t.cols.length);if(bad){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}rowsData.forEach(vals=>{const obj={};t.cols.forEach((c,ci)=>{obj[c]=vals[ci];});t.pending.ins.push(obj);});renderGrid(id);log('Pasted '+rowsData.length+' row(s) as new rows. Review and click Apply to commit.');}
 function copyColumn(id,ci){const t=T(id);const vals=t.rows.map((row,ri)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:row[ci];});navigator.clipboard.writeText(vals.map(v=>v===null?'':v).join('\n')).then(()=>log('Copied '+vals.length+' value(s) from column "'+t.cols[ci]+'".'));}
 function qfSub(id,col,val){const q=qid(col);const lv=lit(val);const esc=s=>String(s).replace(/([%_\\])/g,'\\$1').replace(/'/g,"''");const sub=[];
  if(val===null){sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
@@ -4301,7 +4418,7 @@ function insCellMenu(e,id,ii,col){e.preventDefault();const t=T(id);const cur=t.p
   ['Set empty',()=>{t.pending.ins[ii][col]='';renderGrid(id);}],'-',
   ['Delete this new row',()=>delIns(id,ii)]];
  menu(e.clientX,e.clientY,items);}
-function pasteRowIntoIns(id,ii){const t=T(id);const vals=window._rowClipboard;if(!vals||!vals.length){toast('Copy a row first, then right-click a new row to paste it.',true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
+function pasteRowIntoIns(id,ii){const t=T(id);const vals=singleRowClipboard();if(!vals||!vals.length){toast(noSingleRowMsg('new'),true);return;}if(vals.length!==t.cols.length){toast('Copied row has '+vals.length+' column(s) but this table has '+t.cols.length+'. Cannot paste.',true);return;}
  t.cols.forEach((c,ci)=>{t.pending.ins[ii][c]=vals[ci];});
  renderGrid(id);log('Pasted copied row into new row. Review and click Apply to commit.');}
 function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]};renderGrid(id);}
@@ -4339,7 +4456,12 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
     +'(8 becomes 56), which MySQL accepts without an error.');
   return;
  }
- if(!S.length)return;log('APPLY:\n'+S.join('\n'));
+ // Reachable even though Apply is only enabled when something's pending: a +Row with every
+ // column left blank produces no INSERT (a deliberate no-op, not a bug - see the ins.forEach
+ // above), and if that's the ONLY thing pending, S ends up empty with nothing to tell the user
+ // apply didn't silently do something - say so instead of just doing nothing visibly.
+ if(!S.length){toast('Nothing to apply - new row(s) with no values are ignored. Fill in a column, or Revert to remove them.',true);return;}
+ log('APPLY:\n'+S.join('\n'));
  // Runs as one transaction, so a failure part-way leaves the table exactly as it was.
  // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
  // parent that does not exist and silently break referential integrity the schema was
@@ -4451,8 +4573,11 @@ function libRender(){const box=$('libList');const q=($('libSearch').value||'').t
  box.innerHTML='';if(!a.length){const e=document.createElement('div');e.className='muted';e.style.padding='10px';e.textContent=q?'No saved queries match.':'No saved queries yet. Type a name above and click Save current query.';box.appendChild(e);return;}
  a.forEach(x=>{const d=document.createElement('div');d.style.borderBottom='1px solid var(--bd2)';d.style.padding='6px 10px';
   const head=document.createElement('div');head.style.display='flex';head.style.justifyContent='space-between';head.style.alignItems='center';head.style.gap='8px';
-  const nm=document.createElement('div');const b=document.createElement('b');b.textContent=x.name;nm.appendChild(b);if(x.schema){const sp=document.createElement('span');sp.className='muted';sp.textContent=' ('+x.schema+')';nm.appendChild(sp);}
-  const btns=document.createElement('div');
+  // A saved query's name is free text with no length limit at the point of use (only a maxlength
+  // on #libName, as a soft cap) - min-width:0 + ellipsis keeps a long one from forcing this row
+  // wider than the modal and shoving Open/Edit/Delete out past its (clipped, unscrollable) edge.
+  const nm=document.createElement('div');nm.style.cssText='flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis';nm.title=x.name+(x.schema?' ('+x.schema+')':'');const b=document.createElement('b');b.textContent=x.name;nm.appendChild(b);if(x.schema){const sp=document.createElement('span');sp.className='muted';sp.textContent=' ('+x.schema+')';nm.appendChild(sp);}
+  const btns=document.createElement('div');btns.style.flex='none';
   const op=document.createElement('button');op.className='sm';op.textContent='Open';op.onclick=()=>{hide('mLib');openTab(x.name,x.sql,x.schema||curSchema,false,null);};
   const ed=document.createElement('button');ed.className='sm';ed.textContent='Edit';ed.style.marginLeft='6px';ed.onclick=()=>libEdit(x.name);
   const dl=document.createElement('button');dl.className='sm warn';dl.textContent='Delete';dl.style.marginLeft='6px';dl.onclick=async()=>{if(await ask('Delete saved query "'+x.name+'"?')){await api('/api/lib-delete',{name:x.name});await libLoad();libRender();}};
@@ -5663,7 +5788,7 @@ setInterval(_ping, 5000);
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) _ping(); });
 document.body.classList.add('disconnected');
 window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.preventDefault();e.returnValue='';return '';}});
-(function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=180)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(200,window.innerWidth-320);w=Math.max(180,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
+(function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=280)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(280,window.innerWidth-320);w=Math.max(280,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
 </script></body></html>
 '@
 $Html = $Html.Replace('__TOKEN__', $Token)
