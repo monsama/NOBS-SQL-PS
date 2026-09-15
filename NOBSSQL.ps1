@@ -3077,14 +3077,15 @@ function togglePin(db,name){const p=pinnedTables(db);const i=p.indexOf(name);if(
 
 function fmtCount(n){n=Math.round(+n||0);return String(n).replace(/\B(?=(\d{3})+(?!\d))/g,"'");}
 function fmtMs(ms){ms=+ms||0;if(ms>=10000)return Math.round(ms/1000)+'s';if(ms>=1000)return (ms/1000).toFixed(1)+'s';return Math.round(ms)+'ms';}
-function viewRangeLabel(id){const t=T(id);if(!t)return '';const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total)return '0 shown';const ps=t.limit||1000;const off=Math.min(t.offset||0,Math.max(0,total-1));const shown=Math.min(ps,Math.max(0,total-off));return (off+1)+'-'+(off+shown);}
 function updateStatusLine(id){const t=T(id);if(!t||!t.rows)return;const st=$('st_'+id);if(!st)return;
   const rowLabel=(t.table&&t.estRows!=null)?(t.rows.length+' row(s) of '+fmtCount(t.estRows)+' rows.'):(t.rows.length+' row(s).');
-  const viewLabel=(t.rows.length>0)?(' View shows '+viewRangeLabel(id)+'.'):'';
   const ms=(t.lastElapsedMs!=null)?(' '+t.lastElapsedMs+' ms'):'';
-  const moreLabel=t.hasMore?('  |  more rows available - Fetch next '+PAGE_BATCH+' rows'):'';
   st.className='status';
-  st.textContent=rowLabel+viewLabel+ms+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'')+moreLabel;
+  // The grid itself is a single continuous virtualized list over everything loaded so far - no
+  // "page" to move to - so this just says more is available; scrolling near the bottom (see
+  // maybePrefetchNextBatch) is what actually goes and gets it, automatically.
+  const moreLabel=t.hasMore?'  |  more rows available - keep scrolling to load more':'';
+  st.textContent=rowLabel+ms+moreLabel+(t.pk?('  |  editable PK: '+t.pk.join(', ')):'');
 }
 let objData=null;
 async function loadObjects(db) {
@@ -3541,7 +3542,6 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<span class="tbsep"></span>'+
   '<span id="resultActions_'+id+'" style="display:none;gap:9px;align-items:center" class="tbgroup">'+
   '<button title="Copy the grid to the clipboard, as CSV or Markdown, all rows or just the selected (checked) ones (binary/control-character values are copied as 0x... hex text, not the literal bytes)" onclick="event.stopPropagation();toggleCopyMenu(\''+id+'\',this)">Copy \u25BE</button>'+'<button class="sm" id="wrapbtn_'+id+'" title="Toggle text wrapping in the grid" onclick="toggleWrap(\''+id+'\')">Wrap: Off</button>'+'<button class="sm" id="colsbtn_'+id+'" title="Show or hide columns" onclick="event.stopPropagation();toggleColPicker(\''+id+'\',this)">Columns</button>'+
-  '<button class="sm" id="fetchmore_'+id+'" style="display:none" title="The result set was too large to load in one go - pull the next '+PAGE_BATCH+' rows from the still-open query" onclick="fetchNextBatch(\''+id+'\')">Fetch next '+PAGE_BATCH+' rows</button>'+
   '<span class="tbsep"></span></span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
@@ -3875,7 +3875,6 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
  t.abortCtrl=new AbortController();t.runningReqId=reqId;setRunning(id,true);
  try{
   if(isSelect){
-    if(!paging)t.offset=0;
     if(needsScriptStep){
       // Each leading statement was already correctly, individually extracted by splitStmts()
       // above - including correctly handling any DELIMITER directive within it (a procedure's
@@ -3911,9 +3910,8 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     // rebuilt at all, even though this new table has a PK and should show +Row/Apply/etc.
     {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
-    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';updateFetchMoreBtn(id);return;}
+    if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
-    updateFetchMoreBtn(id);
     refreshRunTableBinding(id,lastStmt);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
@@ -3991,39 +3989,38 @@ async function cancelQuery(id){const t=T(id);if(!t)return;if(t.abortCtrl){try{t.
 // on "fetch next" independently of whether a query is actively "running" (t.runningReqId).
 function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;
  try{api('/api/close-cursor',{cursorId:cid});}catch(e){}}
-function updateFetchMoreBtn(id){const b=$('fetchmore_'+id);if(!b)return;const t=T(id);b.style.display=(t&&t.hasMore)?'':'none';}
 // fetchNextBatch(): pulls the next page of rows from the SAME still-open server-side cursor (not
 // a re-run with a growing OFFSET) and appends them to the tab's already-loaded rows. Reuses the
 // same t.runningReqId/setRunning toggle the initial run uses - and keeps t.cursorReqId (the SAME
 // requestId the cursor was originally registered under) as the id sent to /api/cancel-query - so
 // the existing Cancel button/cancelQuery(id) plumbing keeps working unmodified during a slow
 // "fetch next" too, not just on the very first page.
-async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId)return;
+// t.fetchingMore makes an overlapping call (e.g. two scroll events firing close together) a no-op.
+async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId||t.fetchingMore)return;
  const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
- t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
+ t.fetchingMore=true;t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
  if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows\u2026';}
  try{
   const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
   if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
   if(!T(id))return;
-  if(!r.ok){if(st){st.className='status err';st.textContent=r.error;}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;updateFetchMoreBtn(id);return;}
+  if(!r.ok){if(st){st.className='status err';st.textContent=r.error;}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;return;}
   t.rows=t.rows.concat(r.rows);
   t.hasMore=!!r.hasMore;t.cursorId=r.hasMore?(r.cursorId||t.cursorId):null;t.cursorReqId=t.hasMore?t.cursorReqId:null;
   if(st){st.className=wasClassName;st.textContent=wasText;}
-  renderGrid(id);updatePager(id);updateStatusLine(id);updateFetchMoreBtn(id);
+  // renderBody (not renderGrid) deliberately: it only rewrites tbody's own innerHTML, not the
+  // scrollable wrap element's - renderGrid replacing wrap's innerHTML resets scrollTop to 0,
+  // which would yank the view back to the top on every background scroll-triggered prefetch.
+  renderBody(id);updatePager(id);updateStatusLine(id);
  } finally {
-  if(T(id)){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+  if(T(id)){t.fetchingMore=false;t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
  }
 }
 
 function updatePager(id){const t=T(id);const p=$('pager_'+id);if(!p)return;const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));if(!total){p.innerHTML='';return;}
- const ps=t.limit||1000;const off=t.offset||0;const shown=Math.min(ps,Math.max(0,total-off));const prevDis=off<=0?' disabled':'';const nextDis=(off+ps>=total)?' disabled':'';
- const label=(total===0)?'0 rows':((off+1)+'-'+(off+shown)+' of '+total);
- p.innerHTML='<span>Limit</span><input id="lim_'+id+'" type="number" min="1" value="'+t.limit+'" title="Rows per page (Enter to apply)" onchange="setLimit(\''+id+'\')" onkeydown="if(event.key===\'Enter\')setLimit(\''+id+'\')" style="width:70px"><button'+prevDis+' onclick="pg(\''+id+'\',-1)">Previous</button><button'+nextDis+' onclick="pg(\''+id+'\',1)">Next</button><span class="muted">'+label+'</span>';}
-function setLimit(id){const t=T(id);const v=Math.max(1,parseInt($('lim_'+id).value)||1000);if(v===t.limit)return;t.limit=v;t.offset=0;pageShow(id);}
-function pg(id,dir){const t=T(id);t.limit=Math.max(1,parseInt($('lim_'+id).value)||1000);const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));let no=(t.offset||0)+dir*t.limit;if(no<0)no=0;if(no>=total)no=Math.max(0,(t.offset||0));t.offset=no;pageShow(id);}
+ p.innerHTML='<span class="muted">'+fmtCount(total)+(t.hasMore?'+':'')+' row(s) loaded</span>';}
 function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}ta.value=t.prevRun;if(typeof syncHl==='function')syncHl(id);runSql(id,t.prevRun);}
-function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+' LIMIT '+(t.limit||1000)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
+function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
 function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">\u21C4 Show all</button>':'';}
 // t.table (and thus row-edit capability, export-as-table, quick filter, ...) used to be fixed
 // at whatever the tab was opened with and never revisited - so a tab opened as a non-editable
@@ -4062,8 +4059,7 @@ function parseSingleEditableTable(sql,fallbackDb){
  const unq=s=>s.startsWith('`')?s.slice(1,-1).replace(/``/g,'`'):s;
  return m[2]?{db:unq(m[1]),table:unq(m[2])}:{db:fallbackDb,table:unq(m[1])};
 }
-async function openRun(id){const t=T(id);const wh=t.filter?(' WHERE '+t.filter):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+' LIMIT 1000;';$('ed_'+id).value=sql;syncHl(id);t.offset=0;await runSql(id,sql);updateFilterBar(id);}
-function pageShow(id){renderBody(id);updatePager(id);updateStatusLine(id);}
+async function openRun(id){const t=T(id);const wh=t.filter?(' WHERE '+t.filter):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';$('ed_'+id).value=sql;syncHl(id);await runSql(id,sql);updateFilterBar(id);}
 
 // ---- editable grid with pending changes ----
 function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
@@ -4167,8 +4163,18 @@ function renderGrid(id){const t=T(id);const ed=!!t.pk;if(!t.filters)t.filters={}
  h+='</tr></thead><tbody id="tbody_'+id+'"></tbody></table>';
  $('res_'+id).innerHTML=h;renderBody(id);syncFilterRowTop(id);requestAnimationFrame(()=>autofitAll(id));wireColResize(id);updateStatusLine(id);refreshTabDirty(id);
  const wrap=$('res_'+id);if(wrap&&!wrap.dataset.kbWired){wrap.tabIndex=-1;wrap.addEventListener('keydown',e=>gridKeyNav(id,e));wrap.addEventListener('mousedown',e=>{const td=e.target.closest('td.editable');if(td){const tr=td.closest('tr[data-r]');if(tr){const ri=+tr.getAttribute('data-r');const t2=T(id);const off=(!!t2.pk)?2:1;const ci=[...tr.children].indexOf(td)-off;if(ci>=0)gridSetFocus(id,ri,ci,false);}}});
-  let _vraf=null;wrap.addEventListener('scroll',()=>{if(_vraf)return;_vraf=requestAnimationFrame(()=>{_vraf=null;renderBody(id);});});
+  let _vraf=null;wrap.addEventListener('scroll',()=>{if(_vraf)return;_vraf=requestAnimationFrame(()=>{_vraf=null;renderBody(id);maybePrefetchNextBatch(id,wrap);});});
   wrap.dataset.kbWired='1';}}
+// Silently tops up a tab's loaded rows once the user scrolls near the bottom of the grid's own
+// scrollable area (true infinite scroll - the grid is one continuous virtualized list over
+// everything loaded, see renderBody, not a fixed-size page) - mirrors how DBeaver/DataGrip
+// transparently extend a result set near the end of what's loaded, with no "load more" click
+// and no page boundary to hit. Safe no-op mid-fetch (fetchNextBatch's own t.fetchingMore guard)
+// or once the cursor is exhausted (t.hasMore false).
+function maybePrefetchNextBatch(id,wrap){
+ const t=T(id);if(!t||!t.hasMore||t.fetchingMore||!wrap)return;
+ if((wrap.scrollTop+wrap.clientHeight)>=(wrap.scrollHeight-200))fetchNextBatch(id);
+}
 function toggleWrap(id){const t=T(id);t.wrap=!t.wrap;const wrap=$('res_'+id);if(wrap)wrap.classList.toggle('wraptext',t.wrap);const btn=$('wrapbtn_'+id);if(btn)btn.textContent='Wrap: '+(t.wrap?'On':'Off');}
 // The filter row's sticky "top" offset needs to sit at exactly the main header row's actual
 // height, or a gap opens up between them that the first scrolled-past data row peeks through -
@@ -4202,7 +4208,7 @@ function viewIndices(id){const t=T(id);let view=t.rows.map((r,ri)=>ri);
    if(!isNaN(na)&&!isNaN(nb)&&String(na)===String(va).trim()&&String(nb)===String(vb).trim())return na-nb;
    return String(va).localeCompare(String(vb));});if(t.sortDir<0)view.reverse();}
  return view;}
-function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=new Set();const _full=viewIndices(id);t._total=_full.length;const _ps=t.limit||1000;const _off=Math.min(t.offset||0,Math.max(0,_full.length-1));const view=_full.slice(_off,_off+_ps);
+function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=new Set();const view=viewIndices(id);t._total=view.length;
  const wrap=$('res_'+id);const rowH=t._rowH||23;const VIRT_THRESHOLD=300;const BUFFER=15;
  let startIdx=0,endIdx=view.length,topH=0,botH=0;
  if(view.length>VIRT_THRESHOLD&&wrap){
@@ -4323,16 +4329,16 @@ function gridSetFocus(id,ri,ci,scroll){const t=T(id);if(!t)return;const view=vie
  gridFocus[id]={ri,ci};const el=gridCellEl(id,ri,ci);if(el){el.classList.add('kbfocus');if(scroll!==false)el.scrollIntoView({block:'nearest',inline:'nearest'});el.focus({preventScroll:true});}}
 function gridClearFocus(id){const old=gridFocus[id];if(old){const oe=gridCellEl(id,old.ri,old.ci);if(oe)oe.classList.remove('kbfocus');}delete gridFocus[id];}
 function gridKeyNav(id,e){const t=T(id);if(!t||!t.pk)return;const f=gridFocus[id];
- const view=viewIndices(id);const _ps=t.limit||1000;const _off=Math.min(t.offset||0,Math.max(0,view.length-1));const pageView=view.slice(_off,_off+_ps);
- if(!f){ if(['ArrowDown','ArrowUp','ArrowLeft','ArrowRight','Tab'].includes(e.key) && pageView.length){e.preventDefault();gridSetFocus(id,pageView[0],0);} return; }
- let {ri,ci}=f; const rowPos=pageView.indexOf(ri); if(rowPos<0)return;
+ const view=viewIndices(id);
+ if(!f){ if(['ArrowDown','ArrowUp','ArrowLeft','ArrowRight','Tab'].includes(e.key) && view.length){e.preventDefault();gridSetFocus(id,view[0],0);} return; }
+ let {ri,ci}=f; const rowPos=view.indexOf(ri); if(rowPos<0)return;
  const nCols=t.cols.length;
- if(e.key==='ArrowDown'){e.preventDefault();if(rowPos<pageView.length-1)gridSetFocus(id,pageView[rowPos+1],ci);}
- else if(e.key==='ArrowUp'){e.preventDefault();if(rowPos>0)gridSetFocus(id,pageView[rowPos-1],ci);}
+ if(e.key==='ArrowDown'){e.preventDefault();if(rowPos<view.length-1)gridSetFocus(id,view[rowPos+1],ci);}
+ else if(e.key==='ArrowUp'){e.preventDefault();if(rowPos>0)gridSetFocus(id,view[rowPos-1],ci);}
  else if(e.key==='ArrowLeft'){e.preventDefault();if(ci>0)gridSetFocus(id,ri,ci-1);}
  else if(e.key==='ArrowRight'){e.preventDefault();if(ci<nCols-1)gridSetFocus(id,ri,ci+1);}
- else if(e.key==='Tab'){e.preventDefault();if(e.shiftKey){if(ci>0)gridSetFocus(id,ri,ci-1);else if(rowPos>0)gridSetFocus(id,pageView[rowPos-1],nCols-1);}
-   else{if(ci<nCols-1)gridSetFocus(id,ri,ci+1);else if(rowPos<pageView.length-1)gridSetFocus(id,pageView[rowPos+1],0);}}
+ else if(e.key==='Tab'){e.preventDefault();if(e.shiftKey){if(ci>0)gridSetFocus(id,ri,ci-1);else if(rowPos>0)gridSetFocus(id,view[rowPos-1],nCols-1);}
+   else{if(ci<nCols-1)gridSetFocus(id,ri,ci+1);else if(rowPos<view.length-1)gridSetFocus(id,view[rowPos+1],0);}}
  else if(e.key==='Enter'||e.key==='F2'){e.preventDefault();const el=gridCellEl(id,ri,ci);if(el)inlineEdit(el,id,ri,ci);}
  else if(e.key==='Escape'){gridClearFocus(id);}
 }
@@ -4396,7 +4402,7 @@ function qfSub(id,col,val){const q=qid(col);const lv=lit(val);const esc=s=>Strin
  if(isNum||isDate){sub.push('-');sub.push([q+' > '+dv,()=>setFilterWhere(id,q+' > '+lv)]);sub.push([q+' >= '+dv,()=>setFilterWhere(id,q+' >= '+lv)]);sub.push([q+' < '+dv,()=>setFilterWhere(id,q+' < '+lv)]);sub.push([q+' <= '+dv,()=>setFilterWhere(id,q+' <= '+lv)]);}
  if(!isNum){sub.push('-');sub.push([q+" LIKE '%"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"%'")]);sub.push([q+" LIKE '"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '"+esc(like)+"%'")]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"'")]);}
  sub.push('-');sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
-async function setFilterWhere(id,where){const t=T(id);t.filter=where;t.offset=0;await openRun(id);if(where)log('Filter: '+where);else log('Filter cleared.');}
+async function setFilterWhere(id,where){const t=T(id);t.filter=where;await openRun(id);if(where)log('Filter: '+where);else log('Filter cleared.');}
 function updateFilterBar(id){const t=T(id);const st=$('st_'+id);if(!st)return;st.title=t.filter?('WHERE '+t.filter):'';}
 let _rf=null;
 function rowForm(id,ri){const t=T(id);_rf={id:id,ri:ri};$('rfTitle').textContent='Edit row'+(t.table?(' - '+t.table):'');const box=$('rfFields');box.innerHTML='';
