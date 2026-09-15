@@ -2350,7 +2350,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked onchange="expSyncFilenameField()"> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer" onchange="expSyncFilenameField()"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle" onchange="expSyncFilenameField()"> single file</label>
   <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked> timestamp</label>
   <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label>
-  <label id="expFilenameRow" title="Only applies to “single file” mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none">filename <input id="expFilename" placeholder="all_selected" style="width:120px"></label></div>
+  <label id="expFilenameRow" title="Only applies to \u201Csingle file\u201D mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none">filename <input id="expFilename" placeholder="all_selected" style="width:120px"></label></div>
  <div class="row">Folder <input id="expFolder" style="flex:1" value="C:\temp"><button onclick="browse({title:'Select export folder',mode:'folder',start:$('expFolder').value,onPick:pp=>$('expFolder').value=pp})">Browse...</button></div>
  <div class="row"><button class="go" id="expGoBtn" onclick="runExport()">Start Export</button><button class="warn" id="expCancelBtn" disabled onclick="cancelJob('exp')">Cancel</button><button onclick="hide('mExport')">Close</button></div>
  <div id="expProgress" style="display:none;margin-top:8px">
@@ -2385,8 +2385,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div id="cmpTablesBox" style="display:none;max-height:140px;overflow:auto;border:1px solid var(--bd2);border-radius:4px;padding:4px 8px;margin-bottom:6px"></div>
 <div class="row"><button class="go" onclick="runCompare()">Run comparison</button><span id="cmpRoNote" class="muted" style="font-size:11px;margin-left:8px;display:none;color:var(--del)">Target is read-only / safe mode - apply will be blocked.</span></div>
  <div class="row" id="cmpTallyRow" style="display:none"><span id="cmpTally" class="muted" style="font-size:11px"></span></div>
- <div class="row" id="cmpRowScanRow" style="display:none"><button id="cmpRowScanBtn" onclick="cmpScanRowDiffs()" title="For every table marked structure identical, run the same missing-rows + content check that clicking rows… on it does - just automatically, one table at a time, so you know which ones are worth opening. If &quot;Choose specific tables&quot; has checked tables, only those are scanned.">Check row differences</button><span id="cmpRowScanStatus" class="muted" style="font-size:11px;margin-left:8px"></span></div>
- <div class="row" id="cmpResultsSearchRow" style="display:none"><input id="cmpResultSearch" type="text" placeholder="filter results by table name…" oninput="cmpFilterResults()" style="width:100%;font-size:12px"></div>
+ <div class="row" id="cmpRowScanRow" style="display:none"><button id="cmpRowScanBtn" onclick="cmpScanRowDiffs()" title="For every table marked structure identical, run the same missing-rows + content check that clicking rows\u2026 on it does - just automatically, one table at a time, so you know which ones are worth opening. If &quot;Choose specific tables&quot; has checked tables, only those are scanned.">Check row differences</button><span id="cmpRowScanStatus" class="muted" style="font-size:11px;margin-left:8px"></span></div>
+ <div class="row" id="cmpResultsSearchRow" style="display:none"><input id="cmpResultSearch" type="text" placeholder="filter results by table name\u2026" oninput="cmpFilterResults()" style="width:100%;font-size:12px"></div>
  <div id="cmpResults" style="max-height:320px;overflow:auto;margin-top:6px"></div>
  <div class="row" style="display:flex;justify-content:space-between;align-items:center">
    <span id="cmpSummary" class="muted" style="font-size:11px"></span>
@@ -2660,7 +2660,7 @@ function floatRenderTray(){
  // ones off the left edge of the tray (the tray itself wraps to a new row once it runs out of
  // room - see its max-width/flex-wrap above).
  tray.innerHTML=ids.map(id=>{const lbl=floatTrayLabel(id);return '<span class="chip" style="background:var(--panel);border-color:var(--bd2);color:var(--fg);gap:8px;cursor:default">'
-  +'<span onclick="floatRestore(\''+id+'\')" style="cursor:pointer;display:inline-block;max-width:160px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;vertical-align:middle" title="'+esc(lbl)+' — Restore">'+esc(lbl)+'</span>'
+  +'<span onclick="floatRestore(\''+id+'\')" style="cursor:pointer;display:inline-block;max-width:160px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;vertical-align:middle" title="'+esc(lbl)+' \u2014 Restore">'+esc(lbl)+'</span>'
   +'<span onclick="modalClose(\''+id+'\')" style="cursor:pointer;font-weight:700;padding:0 1px" title="Close">&times;</span>'
   +'</span>';}
  ).join('');
@@ -3698,9 +3698,9 @@ document.addEventListener('keydown',e=>{const mod=e.ctrlKey||e.metaKey;if(!mod)r
 // directly and skip all of that, so it behaved differently from clicking Close on the exact same
 // window - this map lets Escape reuse each modal's own close function where one exists.
 const MODAL_CLOSE_OVERRIDES={mCompare:cmpCloseAndCancel,mCompareRows:cmprCloseAndCancel,mBrowse:brClose,mInput:inpCancel};
-// Shared by the Escape handler below AND the minimized-window tray's own × (floatRenderTray) -
+// Shared by the Escape handler below AND the minimized-window tray's own x (floatRenderTray) -
 // both are ways to close a modal that DON'T go through its own Close button, so both need the
-// same override lookup. Missing this on the tray's × specifically would have been a real
+// same override lookup. Missing this on the tray's x specifically would have been a real
 // regression from making Compare Databases minimizable: minimize it mid-scan, then close it from
 // the tray, and a plain hide() would leave the scan running in the background uncancelled -
 // exactly the bug Escape already had before this existed.
@@ -4001,7 +4001,7 @@ function updateFetchMoreBtn(id){const b=$('fetchmore_'+id);if(!b)return;const t=
 async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId)return;
  const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
  t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
- if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows…';}
+ if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows\u2026';}
  try{
   const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
   if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
@@ -4024,7 +4024,7 @@ function setLimit(id){const t=T(id);const v=Math.max(1,parseInt($('lim_'+id).val
 function pg(id,dir){const t=T(id);t.limit=Math.max(1,parseInt($('lim_'+id).value)||1000);const total=(t._total!=null?t._total:(t.rows?t.rows.length:0));let no=(t.offset||0)+dir*t.limit;if(no<0)no=0;if(no>=total)no=Math.max(0,(t.offset||0));t.offset=no;pageShow(id);}
 function toggleLast(id){const t=T(id);const ta=$('ed_'+id);if(t.prevRun==null){log('No previous query to toggle to yet.');return;}ta.value=t.prevRun;if(typeof syncHl==='function')syncHl(id);runSql(id,t.prevRun);}
 function toggleAll(id){const t=T(id);if(!t.table)return;const ta=$('ed_'+id);const base='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+' LIMIT '+(t.limit||1000)+';';const cur=(ta.value||'').trim();if(cur!==base.trim()){t.beforeAll=ta.value;ta.value=base;}else if(t.beforeAll!=null){ta.value=t.beforeAll;}else{ta.value=base;}if(typeof syncHl==='function')syncHl(id);runSql(id,ta.value);}
-function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">⇄ Show all</button>':'';}
+function selBtnHtml(id,table){return table?'<button title="Toggle between your query and SELECT * (the whole table)" onclick="toggleAll(\''+id+'\')">\u21C4 Show all</button>':'';}
 // t.table (and thus row-edit capability, export-as-table, quick filter, ...) used to be fixed
 // at whatever the tab was opened with and never revisited - so a tab opened as a non-editable
 // "SELECT COUNT(*)" stayed permanently non-editable even after retyping it into a plain
@@ -5172,8 +5172,8 @@ function expSyncFilenameField(){const row=$('expFilenameRow');if(row)row.style.d
 // mid-export - the backend also has a friendlier error message as a fallback for anything this
 // doesn't catch (an unusual custom mysqldump path, a version too old for a flag, etc).
 const MYSQL_ONLY_EXPOPTS={
- gtid:'set-gtid-purged is MySQL 5.6+ only - not supported by MariaDB’s mysqldump.',
- colstats:'column-statistics is MySQL 8+ only - not supported by MariaDB’s mysqldump.'
+ gtid:'set-gtid-purged is MySQL 5.6+ only - not supported by MariaDB\u2019s mysqldump.',
+ colstats:'column-statistics is MySQL 8+ only - not supported by MariaDB\u2019s mysqldump.'
 };
 async function expApplyDumpFlavor(){
  let r; try{ r=await api('/api/tools-status'); }catch(e){ return; }
@@ -5304,7 +5304,7 @@ function cmpTally(){const tr=$('cmpTallyRow'),t=$('cmpTally');if(!tr||!t)return;
  if(c.diff)parts.push(c.diff+' differ'+(c.diff===1?'s':'')+' in structure');
  if(c.missing_target)parts.push(c.missing_target+' missing on target');
  if(c.missing_source)parts.push(c.missing_source+' missing on source');
- t.textContent=parts.join(' — ')+(differing?'':' (structure identical)');
+ t.textContent=parts.join(' \u2014 ')+(differing?'':' (structure identical)');
  tr.style.display='block';}
 function cmpRenderResults(){const box=$('cmpResults');const sr=$('cmpResultsSearchRow');const rsr=$('cmpRowScanRow');
  if(!_cmpTables||!_cmpTables.length){box.innerHTML='<div class="muted">No tables found on either side.</div>';if(sr)sr.style.display='none';if(rsr)rsr.style.display='none';cmpTally();return;}
@@ -5389,17 +5389,17 @@ async function cmprCancelCurrent(){
 async function cmprCloseAndCancel(){await cmprCancelCurrent();hide('mCompareRows');}
 // Bulk row-differences scan: for every "structure identical" table, runs exactly the same two
 // calls cmpCompareRows() makes for one table (missing rows, then content diffs on the rest) -
-// just automatically, table by table, so you don't have to click "rows…" on each one to find out
+// just automatically, table by table, so you don't have to click "rows\u2026" on each one to find out
 // which are worth opening. Shares _cmprRequestId/_cmprAbortCtrl with the single-table flow so
 // the two can never run concurrently (that guard already existed; this just also checks it).
 let _cmpRowScanRunning=false;
 let _cmpRowScanCancelled=false;
 function cmpRowScanSetStatus(checked,total,differ,done){
  const el=$('cmpRowScanStatus');if(!el)return;
- if(done){el.textContent=(_cmpRowScanCancelled?'Stopped after ':'Checked ')+checked+' of '+total+' table(s) — '+differ+' have row differences.';return;}
+ if(done){el.textContent=(_cmpRowScanCancelled?'Stopped after ':'Checked ')+checked+' of '+total+' table(s) \u2014 '+differ+' have row differences.';return;}
  // On fast tables, the loop can finish the table currently in flight and re-render this same
  // status (for the NEXT table) within milliseconds of Stop being clicked - overwriting the
- // "Stopping…" message before it's even visible, so Stop looked like it silently did nothing
+ // "Stopping\u2026" message before it's even visible, so Stop looked like it silently did nothing
  // most of the time. Once cancellation has been requested, leave that message alone; the loop's
  // own done=true call right after will show the real "Stopped after N of M" result.
  if(_cmpRowScanCancelled)return;
@@ -5421,7 +5421,7 @@ function cmpRowScanSetStatus(checked,total,differ,done){
  } else {
   txt=el.firstChild;
  }
- txt.textContent='Checking table '+checked+' of '+total+'… '+differ+' so far have row differences. ';
+ txt.textContent='Checking table '+checked+' of '+total+'\u2026 '+differ+' so far have row differences. ';
 }
 function cmpRowScanCancel(){
  _cmpRowScanCancelled=true;
@@ -5429,8 +5429,8 @@ function cmpRowScanCancel(){
  // doesn't depend on cmpRowScanStatus's current state or position, so it's a clean, unmissable
  // signal that the click itself was received - useful for telling "the click never reached this
  // handler" apart from "it reached the handler but the scan didn't actually stop".
- toast('Stopping the row-diff scan…');
- const el=$('cmpRowScanStatus');if(el)el.textContent='Stopping… (finishing the table currently being checked)';
+ toast('Stopping the row-diff scan\u2026');
+ const el=$('cmpRowScanStatus');if(el)el.textContent='Stopping\u2026 (finishing the table currently being checked)';
  cmprCancelCurrent();
 }
 async function cmpScanRowDiffs(){
