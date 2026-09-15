@@ -5788,22 +5788,45 @@ function cmprDiffRender(){
  const box=$('cmprDiffGrid');
  if(!_cmprDiffState||!_cmprDiffState.rows.length){box.innerHTML='<div class="muted" style="padding:8px">No column differences - every row that shares an id on both sides currently has matching content.</div>';$('cmprDiffSummary').textContent='';return;}
  // Rows are matched purely by having the SAME id (primary key) on both sides; for each matched
- // pair, every column is compared and only the columns that actually differ are outlined below -
- // as real Column/Source/Target rows, not a single run-on line of text.
+ // pair, every column is compared and only the columns that actually differ are outlined below.
+ // Every row is tinted with the "changed" color (same var(--dirty) used elsewhere for edited
+ // cells) so differing rows stand out at a glance, and the whole row is clickable to toggle its
+ // checkbox (not just the tiny box itself) - selected rows switch to the hover-accent tint so
+ // it's obvious which ones are queued for the update. The Column/Source/Target table itself is
+ // collapsed behind "Show details" by default and only rendered on demand, so a long list of
+ // differing rows stays scannable instead of every row unfolding into a full table at once.
  let h='';
  _cmprDiffState.rows.forEach((r,ri)=>{
-  h+='<div style="border-top:1px solid var(--bd2);padding:6px">';
-  h+='<label style="display:flex;align-items:center;gap:6px;font-weight:600"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprDiffState.rows['+ri+'].checked=this.checked;cmprDiffUpdateSummary()"> id = '+esc(r.pk.join(', '))+' <span class="muted" style="font-weight:400">('+r.colDiffs.length+' column'+(r.colDiffs.length===1?'':'s')+' differ)</span></label>';
-  h+='<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px"><tr class="muted" style="text-align:left"><th style="padding:2px 6px;width:25%">Column</th><th style="padding:2px 6px;width:37%">Source</th><th style="padding:2px 6px;width:37%">Target (current)</th></tr>';
-  r.colDiffs.forEach(cd=>{
-   const isPk=(_cmprDiffState.pkCols||[]).indexOf(cd.col)>=0;const isFk=(_cmprDiffState.fkCols||[]).indexOf(cd.col)>=0;
-   const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');
-   h+='<tr><td style="padding:2px 6px;font-weight:600">'+esc(cd.col)+kb+'</td><td style="padding:2px 6px;color:var(--erd-pk,#5dcaa5)">'+(cd.src===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.src),80)))+'</td><td style="padding:2px 6px;color:var(--diff-tgt,#f0997b)">'+(cd.tgt===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.tgt),80)))+'</td></tr>';
-  });
-  h+='</table></div>';
+  const expanded=!!r._expanded;
+  h+='<div data-ri="'+ri+'" style="border-top:1px solid var(--bd2);padding:6px;cursor:pointer;background:'+(r.checked?'var(--hover)':'var(--dirty)')+'" onclick="cmprDiffToggleRow('+ri+')">';
+  h+='<label onclick="event.stopPropagation()" style="display:flex;align-items:center;gap:6px;font-weight:600;cursor:pointer"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprDiffState.rows['+ri+'].checked=this.checked;cmprDiffRowRestyle('+ri+');cmprDiffUpdateSummary()"> id = '+esc(r.pk.join(', '))+' <span class="muted" style="font-weight:400">('+r.colDiffs.length+' column'+(r.colDiffs.length===1?'':'s')+' differ)</span> <a href="#" onclick="event.preventDefault();event.stopPropagation();cmprDiffToggleDetails('+ri+')" style="font-size:11px;color:var(--accent);font-weight:400;margin-left:auto">'+(expanded?'Hide details \u25B4':'Show details \u25BE')+'</a></label>';
+  if(expanded){
+   h+='<table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:4px"><tr class="muted" style="text-align:left"><th style="padding:2px 6px;width:25%">Column</th><th style="padding:2px 6px;width:37%">Source</th><th style="padding:2px 6px;width:37%">Target (current)</th></tr>';
+   r.colDiffs.forEach((cd,ci)=>{
+    const isPk=(_cmprDiffState.pkCols||[]).indexOf(cd.col)>=0;const isFk=(_cmprDiffState.fkCols||[]).indexOf(cd.col)>=0;
+    const kb=(isPk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-pk,#5dcaa5)" title="Primary key">PK</span>':'')+(isFk?' <span class="muted" style="font-size:9px;font-weight:700;line-height:1;vertical-align:middle;color:var(--erd-line,#7aa8d8)" title="Foreign key">FK</span>':'');
+    // Every cell here opens the viewer, not just the ones long enough to be visibly clipped -
+    // consistent "click to inspect" affordance across the whole grid beats a mix of clickable and
+    // non-clickable cells that looks identical until you try clicking one. stopPropagation keeps
+    // the click from also toggling the row's checkbox via the row-level handler above.
+    h+='<tr><td style="padding:2px 6px;font-weight:600;cursor:pointer" title="Click to view" onclick="event.stopPropagation();cmprDiffViewCell('+ri+','+ci+',\'col\')">'+esc(cd.col)+kb+'</td>'
+     +'<td style="padding:2px 6px;color:var(--erd-pk,#5dcaa5);cursor:pointer" title="Click to view full value" onclick="event.stopPropagation();cmprDiffViewCell('+ri+','+ci+',\'src\')">'+(cd.src===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.src),80)))+'</td>'
+     +'<td style="padding:2px 6px;color:var(--diff-tgt,#f0997b);cursor:pointer" title="Click to view full value" onclick="event.stopPropagation();cmprDiffViewCell('+ri+','+ci+',\'tgt\')">'+(cd.tgt===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(String(cd.tgt),80)))+'</td></tr>';
+   });
+   h+='</table>';
+  }
+  h+='</div>';
  });
  box.innerHTML=h;cmprDiffUpdateSummary();
 }
+// Same reasoning as cmprViewCell below: reopens the shared read-only cell-viewer rather than a
+// one-off for this grid.
+function cmprDiffViewCell(ri,ci,which){const cd=_cmprDiffState.rows[ri].colDiffs[ci];
+ if(which==='col'){viewText('Column name',cd.col,{readonly:true});return;}
+ const v=which==='src'?cd.src:cd.tgt;viewText(cd.col+' ('+(which==='src'?'Source':'Target')+')',v,{readonly:true});}
+function cmprDiffToggleDetails(ri){_cmprDiffState.rows[ri]._expanded=!_cmprDiffState.rows[ri]._expanded;cmprDiffRender();}
+function cmprDiffToggleRow(ri){_cmprDiffState.rows[ri].checked=!_cmprDiffState.rows[ri].checked;cmprDiffRowRestyle(ri);cmprDiffUpdateSummary();}
+function cmprDiffRowRestyle(ri){const r=_cmprDiffState.rows[ri];const el=$('cmprDiffGrid').querySelector('div[data-ri="'+ri+'"]');if(!el)return;el.style.background=r.checked?'var(--hover)':'var(--dirty)';const cb=el.querySelector('input[type=checkbox]');if(cb)cb.checked=r.checked;}
 function cmprDiffUpdateSummary(){if(!_cmprDiffState){$('cmprDiffSummary').textContent='';return;}const n=_cmprDiffState.rows.filter(r=>r.checked).length;$('cmprDiffSummary').textContent=n+' of '+_cmprDiffState.rows.length+' selected';}
 function cmprDiffSetAll(on){if(!_cmprDiffState)return;_cmprDiffState.rows.forEach(r=>r.checked=on);cmprDiffRender();}
 async function cmprDiffApply(){
@@ -5825,13 +5848,26 @@ function cmprRender(){
  let h='<table style="width:100%;border-collapse:collapse;font-size:11px"><tr class="muted" style="text-align:left"><th style="padding:3px 6px"></th>';
  _cmprState.columns.forEach(c=>{h+='<th style="padding:3px 6px">'+esc(c)+'</th>';});
  h+='</tr>';
+ // Every row is tinted with the "missing" color (same var(--del) used elsewhere for deleted rows
+ // and the missing-on-target schema badge) so they stand out as a block, and the whole row is
+ // clickable to toggle its checkbox rather than just the small box itself - selected rows switch
+ // to the hover-accent tint so it's clear which ones are queued for insert.
  _cmprState.rows.forEach((r,ri)=>{
-  h+='<tr style="border-top:1px solid var(--bd2)"><td style="padding:3px 6px"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprState.rows['+ri+'].checked=this.checked;cmprUpdateSummary()"></td>';
-  r.data.forEach(v=>{h+='<td style="padding:3px 6px;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis" title="'+esc(v===null?'NULL':v)+'">'+(v===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(v,120)))+'</td>';});
+  h+='<tr data-ri="'+ri+'" style="border-top:1px solid var(--bd2);cursor:pointer;background:'+(r.checked?'':'var(--del)')+'" onclick="cmprToggleRow('+ri+')"><td style="padding:3px 6px" onclick="event.stopPropagation()"><input type="checkbox" '+(r.checked?'checked':'')+' onclick="_cmprState.rows['+ri+'].checked=this.checked;cmprRowRestyle('+ri+');cmprUpdateSummary()"></td>';
+  // Every non-NULL field opens the viewer, not just ones long enough to be visibly clipped - a
+  // consistent click-to-inspect affordance across the whole grid, matching the column-diff table.
+  // stopPropagation keeps a value click from also toggling the row's checkbox.
+  r.data.forEach((v,ci)=>{h+='<td style="padding:3px 6px;white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis'+(v===null?'':';cursor:pointer')+'" title="'+esc(v===null?'NULL':'Click to view full value')+'"'+(v===null?'':' onclick="event.stopPropagation();cmprViewCell('+ri+','+ci+')"')+'>'+(v===null?'<span class="muted" style="font-style:italic">NULL</span>':esc(clip(v,120)))+'</td>';});
   h+='</tr>';
  });
  h+='</table>';box.innerHTML=h;cmprUpdateSummary();
 }
+// Only wired up on cells long enough to actually be clipped (see cmprRender above) - reopens the
+// same read-only cell-viewer modal used throughout the app, rather than a bespoke one just for
+// this grid, so it gets Copy/full-size/Ctrl+wheel zoom for free.
+function cmprViewCell(ri,ci){const r=_cmprState.rows[ri];const v=r.data[ci];const col=_cmprState.columns[ci];viewText('Missing row - '+col,v,{readonly:true});}
+function cmprToggleRow(ri){_cmprState.rows[ri].checked=!_cmprState.rows[ri].checked;cmprRowRestyle(ri);cmprUpdateSummary();}
+function cmprRowRestyle(ri){const r=_cmprState.rows[ri];const tr=$('cmprGrid').querySelector('tr[data-ri="'+ri+'"]');if(!tr)return;tr.style.background=r.checked?'':'var(--del)';const cb=tr.querySelector('input[type=checkbox]');if(cb)cb.checked=r.checked;}
 function cmprUpdateSummary(){if(!_cmprState){$('cmprSummary').textContent='';return;}const n=_cmprState.rows.filter(r=>r.checked).length;$('cmprSummary').textContent=n+' of '+_cmprState.rows.length+' selected';}
 function cmprSetAll(on){if(!_cmprState)return;_cmprState.rows.forEach(r=>r.checked=on);cmprRender();}
 async function cmprInsertAll(){
