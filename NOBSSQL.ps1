@@ -6325,7 +6325,18 @@ function Start-AppWindow {
         Disable-BrowserAutofill $profile
         $w=1280; $h=860
         try { Add-Type -AssemblyName System.Windows.Forms; $wa=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; $w=$wa.Width; $h=$wa.Height } catch {}
-        Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") | Out-Null
+        # -PassThru + a dedicated --user-data-dir (not shared with any other Chrome/Edge instance)
+        # means the process handle we get back here really is the app window's own browser process
+        # - not a short-lived launcher stub that hands off to an existing instance and exits
+        # immediately, which is what happens WITHOUT a dedicated profile. That's what lets the main
+        # server loop below actually notice when the app window closes (see $script:BrowserProcess),
+        # instead of only ever finding out via the 6-hour idle-ping timeout - otherwise, closing the
+        # app window without clicking its own Quit button (the only other thing that stops the
+        # server today) leaves the server - and the fixed port it's holding - alive for up to 6
+        # hours, and enough of those in a row exhausts all 8 fallback ports and forces a random one,
+        # silently resetting every localStorage-based setting (pinned tables, hidden columns, accent
+        # colors, session tabs) the next time the app is opened.
+        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
         return $true
     }
     return $false
@@ -6500,8 +6511,11 @@ $RequestHandler = {
 # ============================================================================
 #  MAIN SERVER LOOP
 #  Accept one browser request at a time, handle it, respond, repeat.
-#  The browser pings /api/ping every few seconds; if pings stop for 6 hours
-#  the server assumes the app was closed and shuts itself down.
+#  Shuts itself down (freeing the fixed port for next launch) on any of: the
+#  in-app Quit button, the app window's own browser process exiting (checked
+#  every ~200ms - see $script:BrowserProcess), or - as a last-resort fallback
+#  for anything that misses both of those - 6 hours with no /api/ping (the
+#  browser pings every few seconds while any tab is open).
 # ============================================================================
 $run=$true
 while ($run) {
@@ -6551,6 +6565,11 @@ while ($run) {
     }
 
     if ($SharedState.Quit) { $run = $false }
+    # Closing the app window itself (its own X, Alt+F4, etc.) doesn't call /api/quit - only the
+    # in-app Quit button does - so without this, that's indistinguishable from a tab just sitting
+    # idle, and the server would only ever notice via the 6-hour ping-timeout fallback below. This
+    # notices the instant the window actually closes instead, freeing the fixed port right away.
+    elseif ($script:BrowserProcess -and $script:BrowserProcess.HasExited) { $run = $false }
     elseif (((Get-Date) - $SharedState.LastPing).TotalSeconds -gt 21600) { $run = $false }
 }
 
