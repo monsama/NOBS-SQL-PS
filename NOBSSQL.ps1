@@ -6322,12 +6322,60 @@ function Start-AppWindow {
     if ($exe) {
         $profile = Join-Path $env:LOCALAPPDATA 'NOBSSQL\browser'
         if (-not (Test-Path $profile)) { New-Item -ItemType Directory -Path $profile -Force | Out-Null }
+        Disable-BrowserAutofill $profile
         $w=1280; $h=860
         try { Add-Type -AssemblyName System.Windows.Forms; $wa=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; $w=$wa.Width; $h=$wa.Height } catch {}
-        Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--start-maximized","--window-position=0,0","--window-size=$w,$h") | Out-Null
+        Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") | Out-Null
         return $true
     }
     return $false
+}
+# --disable-save-password-bubble (above) only hides the post-submit "save password?" popup - it
+# doesn't stop Chrome/Edge from actually autofilling a PREVIOUSLY saved credential into a field
+# (see the Chrome-autofill password-clobbering bug this fixed), and there's no single command-line
+# flag that turns the password manager and form-autofill off outright. The real, documented way is
+# this profile's own Preferences file - the same JSON file Chrome/Edge itself writes settings into,
+# just pre-set here before the browser ever starts. Since $profile (above) is a dedicated, NOBSSQL-
+# only browser profile - never the user's actual everyday Chrome/Edge profile - this can't affect
+# their normal browsing; it only ever touches this one private, single-purpose profile.
+# Runs on every launch (not just the first) so it keeps winning even if a browser update, an
+# extension, or a stray "Save password?" click that slipped through ever re-enables either setting.
+function Disable-BrowserAutofill {
+    param([string]$ProfileDir)
+    try {
+        $prefsDir = Join-Path $ProfileDir 'Default'
+        if (-not (Test-Path $prefsDir)) { New-Item -ItemType Directory -Path $prefsDir -Force | Out-Null }
+        $prefsPath = Join-Path $prefsDir 'Preferences'
+        $prefs = $null
+        if (Test-Path $prefsPath) {
+            try { $raw = [IO.File]::ReadAllText($prefsPath); if ($raw.Trim()) { $prefs = $raw | ConvertFrom-Json } } catch { $prefs = $null }
+        }
+        if (-not $prefs) { $prefs = [pscustomobject]@{} }
+        # credentials_enable_service is the actual master switch (save prompts AND autofill of
+        # already-saved passwords); autosignin and the legacy profile.password_manager_enabled key
+        # are set alongside it since older/newer Chromium builds have looked in different places for
+        # essentially the same setting. autofill.profile_enabled/credit_card_enabled cover the
+        # separate address/payment-info autofill the user also asked to have off.
+        $setPath = {
+            param($obj, $path, $value)
+            $parts = $path -split '\.'
+            $cur = $obj
+            for ($i = 0; $i -lt $parts.Length - 1; $i++) {
+                $p = $parts[$i]
+                if (-not ($cur.PSObject.Properties[$p])) { $cur | Add-Member -MemberType NoteProperty -Name $p -Value ([pscustomobject]@{}) }
+                elseif ($cur.$p -isnot [System.Management.Automation.PSCustomObject]) { $cur.$p = [pscustomobject]@{} }
+                $cur = $cur.$p
+            }
+            $last = $parts[-1]
+            if ($cur.PSObject.Properties[$last]) { $cur.$last = $value } else { $cur | Add-Member -MemberType NoteProperty -Name $last -Value $value }
+        }
+        & $setPath $prefs 'credentials_enable_service' $false
+        & $setPath $prefs 'credentials_enable_autosignin' $false
+        & $setPath $prefs 'profile.password_manager_enabled' $false
+        & $setPath $prefs 'autofill.profile_enabled' $false
+        & $setPath $prefs 'autofill.credit_card_enabled' $false
+        [IO.File]::WriteAllText($prefsPath, ($prefs | ConvertTo-Json -Depth 10 -Compress), (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
 }
 if (-not $NoBrowser){ if (-not (Start-AppWindow $url)) { Start-Process $url | Out-Null } }
 
