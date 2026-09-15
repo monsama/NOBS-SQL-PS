@@ -2155,8 +2155,8 @@ $Html = @'
    current theme's panel color is, so they need their OWN theme-appropriate variant to keep
    working WCAG-reasonable contrast in both themes rather than just the one they were originally
    picked to look good on. */
-:root{--bg:#fff;--fg:#1c1c1c;--panel:#eef0f3;--panel2:#e6e6e6;--bd:#ccc;--bd2:#e2e2e2;--hover:#eaf2fb;--accent:#1565c0;--muted:#777;--gridh:#f0f0f0;--even:#fafafa;--dirty:#fff6cc;--del:#ffdede;--btn:#fafafa;--log:#1e1e1e;--logfg:#d4d4d4;--str:#a31515;--kw:#0000c0;--com:#008000;--num:#098658;--in:#fff;--sb:rgba(0,0,0,.28);--sbh:rgba(0,0,0,.48);--erd-pk:#1a7a5e;--erd-fk:#2a5a9e;--erd-line:#2a5a9e;--diff-tgt:#a8442a}
- body.dark{--bg:#1e1e1e;--fg:#e0e0e0;--panel:#2a2d31;--panel2:#333;--bd:#444;--bd2:#3a3a3a;--hover:#33404d;--accent:#3b82f6;--muted:#999;--gridh:#2d2d2d;--even:#262626;--dirty:#4a4526;--del:#4a2626;--btn:#333;--log:#141414;--logfg:#d4d4d4;--str:#ce9178;--kw:#569cd6;--com:#6a9955;--num:#b5cea8;--in:#2a2a2a;--sb:rgba(255,255,255,.24);--sbh:rgba(255,255,255,.42);--erd-pk:#5dcaa5;--erd-fk:#8fb8e8;--erd-line:#7aa8d8;--diff-tgt:#f0997b}
+:root{--bg:#fff;--fg:#1c1c1c;--panel:#eef0f3;--panel2:#e6e6e6;--bd:#ccc;--bd2:#e2e2e2;--hover:#eaf2fb;--accent:#1565c0;--muted:#777;--gridh:#f0f0f0;--even:#fafafa;--dirty:#fff6cc;--del:#ffdede;--btn:#fafafa;--log:#1e1e1e;--logfg:#d4d4d4;--str:#a31515;--kw:#0000c0;--com:#008000;--num:#098658;--in:#fff;--sb:rgba(0,0,0,.28);--sbh:rgba(0,0,0,.48);--erd-pk:#1a7a5e;--erd-fk:#2a5a9e;--erd-line:#2a5a9e;--diff-tgt:#a8442a;--err-line:#d6373a;--log-warn:#d19a1f}
+ body.dark{--bg:#1e1e1e;--fg:#e0e0e0;--panel:#2a2d31;--panel2:#333;--bd:#444;--bd2:#3a3a3a;--hover:#33404d;--accent:#3b82f6;--muted:#999;--gridh:#2d2d2d;--even:#262626;--dirty:#4a4526;--del:#4a2626;--btn:#333;--log:#141414;--logfg:#d4d4d4;--str:#ce9178;--kw:#569cd6;--com:#6a9955;--num:#b5cea8;--in:#2a2a2a;--sb:rgba(255,255,255,.24);--sbh:rgba(255,255,255,.42);--erd-pk:#5dcaa5;--erd-fk:#8fb8e8;--erd-line:#7aa8d8;--diff-tgt:#f0997b;--err-line:#e5484d;--log-warn:#e0a828}
  *{box-sizing:border-box}
 *{scrollbar-width:thin;scrollbar-color:var(--sb) transparent}
 ::-webkit-scrollbar{width:11px;height:11px}
@@ -2223,7 +2223,28 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  table.grid tr.insrow td.delcell{color:#7ee0a0}
  table.grid td.kbfocus{outline:2px solid var(--accent);outline-offset:-2px}
  td.dirty{background:var(--dirty)!important} tr.del td{background:var(--del)!important;text-decoration:line-through}
- table.grid td input{width:100%;border:1px solid var(--accent);font:inherit;padding:1px 3px;background:var(--in);color:var(--fg)} input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
+ /* Inline cell-edit input: kept visually close to the plain cell text it replaces - the td's own
+    padding is zeroed while editing (.cellEditing) and moved onto the input itself instead, so the
+    input fills the cell exactly (no inset "box" look, no row growth from stacking both paddings)
+    with just a faint tint on focus rather than a distinct form control's border. */
+ table.grid td.cellEditing{padding:0}
+ table.grid td input,table.grid td textarea{width:100%;height:100%;box-sizing:border-box;border:none;font:inherit;padding:2px 8px;background:transparent;color:var(--fg);vertical-align:middle}
+ table.grid td textarea{display:block;resize:vertical;white-space:pre-wrap}
+ /* The "Set NULL" button next to the input is a regular <button> (height:28px by default) - taller
+    than a grid row, which was what was actually forcing the row to grow while editing. Shrunk to
+    match the cell instead. */
+ table.grid td button{height:19px;min-width:0;padding:0 4px;border:1px solid var(--bd2);vertical-align:middle}
+ table.grid td input:focus,table.grid td textarea:focus{background:var(--hover);outline:none}
+ input:focus,select:focus,textarea:focus{border-color:var(--accent);outline:none}
+ /* Every textarea in the app is natively resizable by the browser (resize:both by default) with no
+    built-in ceiling - dragging one's corner past the window's own bounds could grow it to an
+    enormous size and make the window unresponsive while it repainted. This caps growth to the
+    element's own container width and the viewport height, everywhere, so no textarea - the cell
+    editor, the generated-SQL boxes, a plain prompt field, the transfer-script output - can ever be
+    dragged wider than the space it already has or taller than the visible window. table.grid td
+    textarea already has its own explicit height:100%/max sizing (see above) and is unaffected.
+    */
+ textarea{max-width:100%;max-height:calc(100vh - 40px)}
  .delcell{color:#c00;cursor:pointer;text-align:center;width:22px}
  .status{padding:3px 8px;font-size:12px;color:var(--fg);border-top:1px solid var(--bd2);background:var(--panel)} .status.err{color:#e06}
  #loghdr{background:#333;color:#ddd;padding:2px 8px;font-size:11px;display:flex;justify-content:space-between}
@@ -2243,10 +2264,17 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  #vHexTabs button{border:1px solid var(--bd);background:var(--btn);color:var(--fg);border-radius:4px;padding:4px 12px;cursor:pointer;font:inherit}
  #vHexTabs button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
  #ctx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:180px}
- #colPicker{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
+ #colPicker,#objTypePicker,#impDbPicker{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
  #copyMenu{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
  .cphdr{display:flex;justify-content:space-between;align-items:center;padding:4px 12px 6px;font-size:11px;color:var(--muted);border-bottom:1px solid var(--bd2);margin-bottom:4px}
  .cplink{color:var(--accent);cursor:pointer}
+ .cplink.disabled{pointer-events:none;opacity:.6}
+ .logpanel{background:var(--log);color:var(--logfg);border:1px solid var(--bd);border-radius:4px;padding:8px 8px 8px 2px}
+ .logpanel:empty{display:none;border:none;padding:0}
+ .logpanel .ln{border-left:3px solid transparent;padding-left:8px}
+ .logpanel .ln.ok{border-left-color:var(--erd-pk)}
+ .logpanel .ln.warn{border-left-color:var(--log-warn)}
+ .logpanel .ln.err{border-left-color:var(--err-line)}
  .cpitem{display:flex;align-items:center;gap:6px;padding:3px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
  .cpitem:hover{background:var(--hover,rgba(127,127,127,.12))}
  #ctx .item{padding:5px 12px} #ctx .sep{height:1px;background:var(--bd2);margin:3px 0}
@@ -2313,6 +2341,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <div class="hdr" style="flex-direction:column;align-items:flex-start;justify-content:center;gap:2px"><span>OBJECTS</span><span id="objdb" class="muted" style="width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span></div>
 <div style="display:flex;gap:4px;margin:4px 6px;align-items:center">
 <input id="objFilter" placeholder="filter objects..." oninput="renderObjects()" onkeydown="if(event.key==='ArrowDown'){event.preventDefault();focusList($('objects'));}" style="flex:1;min-width:0;font-size:12px">
+<button class="sm" id="objTypeBtn" title="Show or hide object types (tables, views, procedures...)" onclick="event.stopPropagation();toggleObjTypePicker(this)" style="padding:2px 6px;font-size:11px">Types &#9662;</button>
 <button class="sm" id="allSchemasBtn" title="Search this name across all schemas" onclick="searchAllSchemas()" style="padding:2px 6px;font-size:11px">All DBs</button>
 </div>
   <div id="objects" tabindex="0"></div>
@@ -2324,6 +2353,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div id="ctx"></div>
 <div id="minimizedTray" style="display:none;position:fixed;bottom:10px;right:10px;gap:8px;z-index:9500;max-width:70vw;flex-wrap:wrap;justify-content:flex-end"></div>
 <div id="colPicker"></div>
+<div id="objTypePicker"></div>
+<div id="impDbPicker"></div>
 <div id="copyMenu"></div>
 <div id="acx"></div>
 <div class="modal floating" id="mBrowse"><div class="box" style="max-width:660px;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mBrowse')" title="Drag to move"><h3 id="brTitle" style="margin:0">Browse</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mBrowse')" title="Maximize" id="maxBtn_mBrowse" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mBrowse')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
@@ -2356,16 +2387,19 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row"><b>Options</b></div><div class="grid2" id="expOpts"></div>
  <div class="row"><label title="How a NULL is written to CSV. \N is what LOAD DATA reads back; blank makes NULL and an empty string indistinguishable in the file.">NULL value <input id="expNullVal" value="\N" style="width:52px;font-family:Consolas,monospace"></label> Charset <select id="expCharset"><option>utf8mb4</option><option>utf8</option><option>latin1</option><option>binary</option></select>
   <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked onchange="expSyncFilenameField()"> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer" onchange="expSyncFilenameField()"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle" onchange="expSyncFilenameField()"> single file</label>
-  <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked> timestamp</label>
+  <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked onchange="expUpdateFilenamePreview()"> timestamp</label>
   <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label>
-  <label id="expFilenameRow" title="Only applies to \u201Csingle file\u201D mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none">filename <input id="expFilename" placeholder="all_selected" style="width:120px"></label></div>
+  <div id="expFilenameRow" title="Only applies to \u201Csingle file\u201D mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none;flex-direction:column;gap:2px">
+  <div class="row" style="flex:none">Filename <input id="expFilename" placeholder="all_selected" maxlength="100" style="flex:1" oninput="expUpdateFilenamePreview()"><span id="expFilenameCount" class="muted" style="font-size:10px;white-space:nowrap;display:none"></span></div>
+  <div id="expFilenamePreview" class="muted" style="font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></div>
+ </div></div>
  <div class="row">Folder <input id="expFolder" style="flex:1" value="C:\temp"><button onclick="browse({title:'Select export folder',mode:'folder',start:$('expFolder').value,onPick:pp=>$('expFolder').value=pp})">Browse...</button></div>
  <div class="row"><button class="go" id="expGoBtn" onclick="runExport()">Start Export</button><button class="warn" id="expCancelBtn" disabled onclick="cancelJob('exp')">Cancel</button><button onclick="hide('mExport')">Close</button></div>
  <div id="expProgress" style="display:none;margin-top:8px">
    <div style="height:6px;border-radius:3px;background:var(--panel2);overflow:hidden"><div id="expBar" style="height:100%;width:40%;background:var(--accent);animation:expmove 1.1s ease-in-out infinite"></div></div>
    <div id="expProgLabel" class="muted" style="font-size:11px;margin-top:4px"></div>
  </div>
- <div id="expLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
+ <div id="expLog" class="logpanel" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
 
 <div class="modal floating" id="mImport"><div class="box" style="top:80px;left:200px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mImport')" title="Drag to move"><h3 style="margin:0">Data Import</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mImport')" title="Maximize" id="maxBtn_mImport" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mImport')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div><div class="row">SQL file paths (one per line):</div>
  <textarea id="impFiles" style="width:100%;height:90px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;white-space:pre;overflow:auto"></textarea>
@@ -2377,7 +2411,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
    <div style="height:6px;border-radius:3px;background:var(--panel2);overflow:hidden"><div id="impBar" style="height:100%;width:40%;background:var(--accent);animation:expmove 1.1s ease-in-out infinite"></div></div>
    <div id="impProgLabel" class="muted" style="font-size:11px;margin-top:4px"></div>
  </div>
- <div id="impLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
+ <div id="impLog" class="logpanel" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
 
 <div class="modal floating" id="mCompare"><div class="box" style="width:820px;max-width:94vw;top:50px;left:90px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompare')" title="Drag to move"><h3 style="margin:0">Compare Databases <span class="muted" style="font-size:13px;cursor:help;font-weight:400" title="Connects to both sides independently of whatever's currently active, using each saved connection's stored password - so both the source and target connection need &quot;Save password&quot; checked (Edit... on the connection) or this will fail to log in.">&#9432;</span></h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mCompare')" title="Maximize" id="maxBtn_mCompare" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompare')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row" style="display:flex;gap:10px">
@@ -2400,7 +2434,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
    <span id="cmpSummary" class="muted" style="font-size:11px"></span>
    <span style="display:inline-flex;gap:6px"><button onclick="previewCompareSql()">Preview SQL</button><button class="go write" onclick="applyCompare()">Apply to target</button><button onclick="cmpCloseAndCancel()">Close</button></span>
  </div>
- <div id="cmpLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:140px;overflow:auto;margin-top:6px"></div>
+ <div id="cmpLog" class="logpanel" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:140px;overflow:auto;margin-top:6px"></div>
 </div></div>
 
 <div class="modal floating" id="mCompareRows"><div class="box" style="width:900px;max-width:96vw;top:50px;left:110px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompareRows')" title="Drag to move"><h3 id="cmprTitle" style="margin:0">Row comparison</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mCompareRows')" title="Maximize" id="maxBtn_mCompareRows" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompareRows')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
@@ -2572,6 +2606,14 @@ function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.spl
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
 function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value};}
+function logLineCls(l){
+ if(/^OK\s+with\s+\d+\s+error/i.test(l))return 'warn';
+ if(/^OK\b/.test(l))return 'ok';
+ if(/^FAILED\b/.test(l))return 'err';
+ if(/^(SKIP\b|CANCELLED\b|\(excluded\)|\(no tables\))/.test(l))return 'warn';
+ return '';
+}
+function logLinesHtml(lines){return lines.map(l=>{const c=logLineCls(l);return '<div class="ln'+(c?' '+c:'')+'">'+esc(l)+'</div>';}).join('');}
 function log(s){const l=$('log');l.textContent+=s+"\n";l.scrollTop=l.scrollHeight;}
 // kind: true (legacy) or 'err' -> red, 6s; 'ok' -> green success, 3.5s; omitted/falsy -> neutral
 // info, 3.5s. The boolean form is kept working so none of this function's many existing callers
@@ -2863,9 +2905,27 @@ function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').t
   // real problem, even in a local, developer-facing tool. inpOk()'s extraction needs no changes
   // for this: it already just reads .value off any non-checkbox input regardless of its type.
   if(f.type==='password'){const wrap=document.createElement('div');wrap.style.position='relative';const inp=document.createElement('input');inp.id='inp_'+f.key;inp.type='password';inp.style.width='100%';inp.style.paddingRight='28px';inp.style.boxSizing='border-box';if(f.value!=null)inp.value=f.value;inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};const eye=document.createElement('span');eye.textContent='\u{1F441}';eye.title='Show/hide password';eye.style.cssText='position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:13px;user-select:none;opacity:.7';eye.onclick=()=>{inp.type=(inp.type==='password')?'text':'password';};wrap.appendChild(inp);wrap.appendChild(eye);w.appendChild(lb);w.appendChild(wrap);box.appendChild(w);return;}
-  const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';}if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;if(f.maxlength)inp.maxLength=f.maxlength;
+  const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';inp.style.boxSizing='border-box';
+   // A textarea field fills whatever room the dialog actually has (both directions) instead of
+   // sitting at a small fixed row-count with dead space below it - #inpFields is a flex column
+   // (see its own style), so making this field's wrapper flex:1 and the textarea itself flex:1
+   // lets it claim that space; the dialog is given a real default height below specifically so
+   // there's space to claim in the first place.
+   w.style.cssText+=';display:flex;flex-direction:column;flex:1;min-height:0';lb.style.flex='none';inp.style.flex='1';inp.style.minHeight='0';
+  }if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;if(f.maxlength)inp.maxLength=f.maxlength;
   inp.onkeydown=e=>{if(e.key==='Enter'&&!isTa){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(lb);w.appendChild(inp);box.appendChild(w);});
- $('inpOk').textContent=opts.okText||'OK';show('mInput');setTimeout(()=>{const f0=box.querySelector('input');if(f0){f0.focus();f0.select();}},40);});}
+ // A textarea field (e.g. editing a saved query's SQL) already resizes both ways like any browser
+ // textarea, but the dialog's normal 460px width cramps that - widen it so there's real room to
+ // drag into, matching the cell-edit modal's more generous default size.
+ // opts.width lets a caller with a denser form (several selects, not just one textarea) ask for
+ // more room directly, instead of every such case needing its own heuristic here.
+ const hasTa=(opts.fields||[]).some(f=>f.type==='textarea');
+ const mbox=$('mInput').querySelector('.box');mbox.style.width=opts.width||(hasTa?'700px':'460px');mbox.style.maxWidth=opts.maxWidth||(hasTa?'95vw':'92vw');
+ // A textarea field's flex:1 (above) has nothing to grow into without the dialog itself having a
+ // real height - it's normally auto/content-sized, which is exactly the flex-basis-collapse trap
+ // hit elsewhere in this app (see mView/mCompare) if left unset here.
+ mbox.style.height=hasTa?(opts.height||'560px'):'';mbox.style.maxHeight=hasTa?'85vh':'';
+ $('inpOk').textContent=opts.okText||'OK';show('mInput');setTimeout(()=>{const f0=box.querySelector('input,textarea,select');if(f0){f0.focus();f0.select&&f0.select();}},40);});}
 function inpOk(){const out={};$('inpFields').querySelectorAll('input,textarea,select').forEach(i=>{out[i.id.slice(4)]=(i.type==='checkbox')?i.checked:i.value;});hide('mInput');const r=_inpResolve;_inpResolve=null;if(r)r(out);}
 function inpCancel(){hide('mInput');const r=_inpResolve;_inpResolve=null;if(r)r(null);}
 async function ask(msg){const d=(window.__TAURI__&&window.__TAURI__.dialog);if(d&&d.confirm){try{return await d.confirm(msg,{title:'Confirm',kind:'warning'});}catch(e){}}return window.confirm(msg);}
@@ -3241,8 +3301,25 @@ async function cancelJob(prefix){
   try{await fetch('/api/cancel-job',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,jobId})});}catch(e){}
   log('Cancel requested for '+prefix+' job.');
 }
-function renderObjects(){const box=$('objects');box.innerHTML='';if(!objData)return;const db=objData.db,r=objData.r;const f=($('objFilter').value||'').toLowerCase();
- const pinned=pinnedTables(db);
+const OBJ_TYPES=[['table','Tables'],['view','Views'],['procedure','Procedures'],['function','Functions'],['trigger','Triggers'],['event','Events']];
+window._objTypeFilter=window._objTypeFilter||new Set(OBJ_TYPES.map(t=>t[0]));
+function setObjTypeVis(type,visible){const s=window._objTypeFilter;if(visible)s.add(type);else s.delete(type);renderObjects();}
+function showAllObjTypes(){window._objTypeFilter=new Set(OBJ_TYPES.map(t=>t[0]));renderObjects();const btn=$('objTypeBtn');if(btn)openObjTypePicker(btn);}
+function hideAllObjTypes(){window._objTypeFilter=new Set();renderObjects();const btn=$('objTypeBtn');if(btn)openObjTypePicker(btn);}
+// Same toggle-close behavior as the Columns picker - a second click on the Types button while
+// its own picker is already open closes it, instead of relying only on the outside-click listener.
+function toggleObjTypePicker(btn){const p=$('objTypePicker');if(p&&p.style.display==='block'){p.style.display='none';return;}openObjTypePicker(btn);}
+function openObjTypePicker(btn){const p=$('objTypePicker');const s=window._objTypeFilter;
+ let h='<div class="cphdr"><span>Show/hide object types</span><span><span class="cplink" onclick="event.stopPropagation();showAllObjTypes()">Show all</span> \u00b7 <span class="cplink" onclick="event.stopPropagation();hideAllObjTypes()">Hide all</span></span></div>';
+ OBJ_TYPES.forEach(([type,label])=>{h+='<label class="cpitem"><input type="checkbox" '+(s.has(type)?'checked':'')+' onchange="setObjTypeVis(\''+type+'\',this.checked)"> '+label+'</label>';});
+ p.innerHTML=h;
+ p.style.display='block';p.style.visibility='hidden';p.style.left='0';p.style.top='0';
+ const r=btn.getBoundingClientRect();const w=p.offsetWidth||200,hgt=p.offsetHeight||0;
+ let nx=Math.min(r.left,innerWidth-w-6);if(nx<6)nx=6;
+ let ny=r.bottom+2;if(ny+hgt>innerHeight-6)ny=Math.max(6,r.top-hgt-2);
+ p.style.left=nx+'px';p.style.top=ny+'px';p.style.visibility='visible';}
+function renderObjects(){const box=$('objects');box.innerHTML='';if(!objData)return;const db=objData.db,r=objData.r;const f=($('objFilter').value||'').toLowerCase();const tf=window._objTypeFilter;
+ const pinned=tf.has('table')?pinnedTables(db):[];
  if(pinned.length){
    const fil=pinned.filter(n=>r.tables.includes(n)&&(!f||n.toLowerCase().includes(f)));
    if(fil.length){const h=document.createElement('div');h.className='ohdr';h.textContent='\u2605 Pinned ('+fil.length+')';box.appendChild(h);
@@ -3251,7 +3328,7 @@ function renderObjects(){const box=$('objects');box.innerHTML='';if(!objData)ret
       d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,'table',n);};box.appendChild(d);});}
  }
  const groups=[['Tables',r.tables,'table'],['Views',r.views,'view'],['Procedures',r.procedures,'procedure'],['Functions',r.functions,'function'],['Triggers',r.triggers,'trigger'],['Events',r.events,'event']];
- groups.forEach(([label,items,type])=>{const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;const h=document.createElement('div');h.className='ohdr';h.textContent=label+' ('+fil.length+(f?'/'+items.length:'')+')';box.appendChild(h);
+ groups.forEach(([label,items,type])=>{if(!tf.has(type))return;const fil=(items||[]).filter(n=>!f||n.toLowerCase().includes(f));if(!fil.length)return;const h=document.createElement('div');h.className='ohdr';h.textContent=label+' ('+fil.length+(f?'/'+items.length:'')+')';box.appendChild(h);
   fil.forEach(n=>{const d=document.createElement('div');d.className='item';d.title=n;if(type==='table'&&objData.sizes&&(n in objData.sizes)){const a=document.createElement('span');a.className='onm';a.textContent=n;const b=document.createElement('span');b.className='osz';b.textContent=fmtBytes(objData.sizes[n]);d.appendChild(a);d.appendChild(b);}else{d.textContent=n;}
    d.onclick=()=>{[...box.querySelectorAll('.item')].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');objOpen(db,type,n);};
    d.oncontextmenu=e=>{e.preventDefault();objMenu(e,db,type,n);};box.appendChild(d);});});}
@@ -4138,7 +4215,7 @@ function parseSingleEditableTable(sql,fallbackDb){
  const unq=s=>s.startsWith('`')?s.slice(1,-1).replace(/``/g,'`'):s;
  return m[2]?{db:unq(m[1]),table:unq(m[2])}:{db:fallbackDb,table:unq(m[1])};
 }
-async function openRun(id){const t=T(id);const wh=t.filter?(' WHERE '+t.filter):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';$('ed_'+id).value=sql;syncHl(id);await runSql(id,sql);updateFilterBar(id);}
+async function openRun(id){const t=T(id);const where=combinedFilterWhere(t);const wh=where?(' WHERE '+where):'';const sql='SELECT * FROM '+qid(t.db)+'.'+qid(t.table)+wh+';';$('ed_'+id).value=sql;syncHl(id);await runSql(id,sql);updateFilterBar(id);}
 
 // ---- editable grid with pending changes ----
 function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
@@ -4192,13 +4269,14 @@ function autofitAll(id,retries){const t=T(id);if(!t.cols||!t.cols.length)return;
 function applyColVis(id){const t=T(id);const ed=!!t.pk;const off=ed?2:1;const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const hidden=t.hiddenCols||new Set();t.cols.forEach((c,ci)=>{const col=cg.children[ci+off];if(col)col.style.display=hidden.has(ci)?'none':'';});autofitAll(id);}
 function setColVis(id,ci,visible){const t=T(id);if(!t.hiddenCols)t.hiddenCols=new Set();if(visible)t.hiddenCols.delete(ci);else t.hiddenCols.add(ci);applyColVis(id);}
 function showAllCols(id){const t=T(id);t.hiddenCols=new Set();applyColVis(id);const btn=$('colsbtn_'+id);if(btn)openColPicker(id,btn);}
+function hideAllCols(id){const t=T(id);t.hiddenCols=new Set(t.cols.map((_,ci)=>ci));applyColVis(id);const btn=$('colsbtn_'+id);if(btn)openColPicker(id,btn);}
 // Toggles: a second click on the SAME Columns button while its picker is already open closes
 // it, instead of only closing via the document-level "click outside" listener (which never even
 // sees this click, since the button's own onclick calls stopPropagation() first).
 function toggleColPicker(id,btn){const p=$('colPicker');if(p&&p.style.display==='block'&&p.dataset.forId===id){p.style.display='none';return;}openColPicker(id,btn);}
 function openColPicker(id,btn){const t=T(id);if(!t||!t.cols)return;if(!t.hiddenCols)t.hiddenCols=new Set();
  const p=$('colPicker');p.dataset.forId=id;
- let h='<div class="cphdr"><span>Show/hide columns</span><span class="cplink" onclick="showAllCols(\''+id+'\')">Show all</span></div>';
+ let h='<div class="cphdr"><span>Show/hide columns</span><span><span class="cplink" onclick="event.stopPropagation();showAllCols(\''+id+'\')">Show all</span> \u00B7 <span class="cplink" onclick="event.stopPropagation();hideAllCols(\''+id+'\')">Hide all</span></span></div>';
  t.cols.forEach((c,ci)=>{h+='<label class="cpitem"><input type="checkbox" '+(t.hiddenCols.has(ci)?'':'checked')+' onchange="setColVis(\''+id+'\','+ci+',this.checked)"> '+esc(c)+'</label>';});
  p.innerHTML=h;
  p.style.display='block';p.style.visibility='hidden';p.style.left='0';p.style.top='0';
@@ -4600,29 +4678,57 @@ function gridKeyNav(id,e){const t=T(id);if(!t||!t.pk)return;const f=gridFocus[id
  else if(e.key==='Enter'||e.key==='F2'){e.preventDefault();const el=gridCellEl(id,ri,ci);if(el)inlineEdit(el,id,ri,ci);}
  else if(e.key==='Escape'){gridClearFocus(id);}
 }
-function cellClick(td,id,ri,ci){if(td.querySelector('input'))return;clearTimeout(clickTimer);clickTimer=setTimeout(()=>inlineEdit(td,id,ri,ci),200);}
-function insClick(td,id,ii,col){if(td.querySelector('input'))return;clearTimeout(clickTimer);clickTimer=setTimeout(()=>inlineEditIns(td,id,ii,col),200);}
+// No delay/timer here to disambiguate a single click from the first click of a double-click - the
+// "if input already present" guard already makes a second click a no-op, and a genuine
+// double-click's dblclick handler (editCell/editIns) opens the full modal regardless of whether an
+// inline edit is mid-flight, so waiting around just made the tint feel laggy for no real benefit.
+function cellClick(td,id,ri,ci){if(td.querySelector('input'))return;inlineEdit(td,id,ri,ci);}
+function insClick(td,id,ii,col){if(td.querySelector('input'))return;inlineEditIns(td,id,ii,col);}
+// Reverts a single cell back to its plain display markup - same output renderBody would have
+// produced for it, but touching only this one <td> instead of tearing down and rebuilding the
+// entire grid. Discarding an inline edit (Escape, or blur with nothing typed) used to call the
+// full renderGrid(id), and its blur path in particular runs after a 120ms delay - long enough that
+// clicking straight into a DIFFERENT cell to start editing it, then having this cell's delayed
+// "nothing changed" cleanup fire afterward, would wipe out that other cell's fresh inline editor
+// out from under the user (intermittently, depending on exact timing) since a full grid rebuild
+// regenerates every cell from persisted state, and a not-yet-committed inline edit isn't part of
+// that state. Reverting only the one cell that actually needs reverting avoids the whole class of
+// race entirely.
+function cellRevert(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const pend=t.pending&&(key in t.pending.upd);const val=pend?t.pending.upd[key]:t.rows[ri][ci];
+ td.className='editable'+(pend?' dirty':'');td.title=String(clip(val,300));td.innerHTML=cellHtml(val,t.bitCols&&t.bitCols[ci]);}
+function insCellRevert(td,id,ii,col){const t=T(id);const v=t.pending.ins[ii][col];const ci=t.cols.indexOf(col);
+ td.className='editable';td.title=(v===undefined?'undefined':String(v));td.innerHTML=cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci]);}
 async function inlineEdit(td,id,ri,ci){const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
- if(cur!=null&&/[\r\n]/.test(String(cur))){editCell(td,id,ri,ci);return;}
  // Enum/boolean columns always go through editCell's dropdown - a plain inline text input would
  // let you type a value the column can't actually hold, which the double-click path already avoids.
  const colType=await getColType(id,t.cols[ci]);
  if(colType&&(/^enum\(/i.test(colType)||/^tinyint\(1\)/i.test(colType))){editCell(td,id,ri,ci);return;}
- td.innerHTML='<input><button tabindex="-1" title="Set NULL" style="padding:0 4px">&empty;</button>';const inp=td.querySelector('input');const nb=td.querySelector('button');inp.value=(cur===null?'':cur);inp.focus();inp.select();let done=false,dirty=false;
+ // A value with embedded newlines used to jump straight to the big modal on a single click, which
+ // read as "one click opened the double-click editor" - it's a plain multi-line <textarea> inline
+ // instead now, sized to roughly fit the existing line count; the big modal is still one
+ // double-click away for anything that genuinely needs more room.
+ const isMulti=cur!=null&&/[\r\n]/.test(String(cur));
+ // No inp.select() here on purpose - auto-selecting the whole value made entering edit mode look
+ // like a big blue highlight box instead of just dropping into the text, so the cursor is placed
+ // at the end of the existing value instead (still lets you type to replace via Home+shift, etc).
+ td.classList.add('cellEditing');td.innerHTML=(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+'<button tabindex="-1" title="Set NULL" style="padding:0 4px">&empty;</button>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('button');inp.value=(cur===null?'':cur);inp.focus();const vlen=inp.value.length;inp.setSelectionRange(vlen,vlen);let done=false,dirty=false;
  const set=v=>{done=true;setUpd(id,ri,ci,v);};
  inp.addEventListener('input',()=>dirty=true);
  nb.addEventListener('mousedown',e=>{e.preventDefault();set(null);});
- inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(dirty)set(inp.value);else{done=true;renderGrid(id);}}else if(e.key==='Escape'){done=true;renderGrid(id);}});
- inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else renderGrid(id);}},120));}
+ // A plain Enter commits for a single-line input, but inserts a newline (as it always does in a
+ // textarea) for the multi-line case - Ctrl/Cmd+Enter commits there instead, same convention as
+ // "Run Query Selection" elsewhere in the app.
+ inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&(!isMulti||e.ctrlKey||e.metaKey)){e.preventDefault();if(dirty)set(inp.value);else{done=true;cellRevert(td,id,ri,ci);}}else if(e.key==='Escape'){done=true;cellRevert(td,id,ri,ci);}});
+ inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else cellRevert(td,id,ri,ci);}},120));}
 function inlineEditIns(td,id,ii,col){const t=T(id);const cur=t.pending.ins[ii][col];
- if(cur!=null&&/[\r\n]/.test(String(cur))){editIns(td,id,ii,col);return;}
- td.innerHTML='<input><button tabindex="-1" style="padding:0 4px" title="Set NULL">&empty;</button>';const inp=td.querySelector('input');const nb=td.querySelector('button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
+ const isMulti=cur!=null&&/[\r\n]/.test(String(cur));
+ td.classList.add('cellEditing');td.innerHTML=(isMulti?'<textarea rows="'+Math.min(8,Math.max(2,String(cur).split(/\r\n|\r|\n/).length))+'"></textarea>':'<input>')+'<button tabindex="-1" style="padding:0 4px" title="Set NULL">&empty;</button>';const inp=td.querySelector(isMulti?'textarea':'input');const nb=td.querySelector('button');inp.value=(cur==null?'':cur);inp.focus();let done=false,dirty=false;
  const set=v=>{done=true;t.pending.ins[ii][col]=v;renderGrid(id);};
  inp.addEventListener('input',()=>dirty=true);
  nb.addEventListener('mousedown',e=>{e.preventDefault();set(null);});
- inp.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();if(dirty)set(inp.value);else{done=true;renderGrid(id);}}else if(e.key==='Escape'){done=true;renderGrid(id);}});
- inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else renderGrid(id);}},120));}
-function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=ri+':'+ci;const cur=(t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];const items=[['Copy value',()=>{navigator.clipboard.writeText(cur===null?'':String(cur));log('Copied cell value.');}],['Copy row',()=>copyRow(id,ri)],['Copy rows (selected)',()=>copySelRows(id)],['Paste row here (overwrite)',()=>pasteRowInto(id,ri)],['Paste rows as new',()=>pasteRowsAsNew(id)],['Copy column: '+t.cols[ci],()=>copyColumn(id,ci)],['Edit full row (form)...',()=>rowForm(id,ri)],'-'];if(t.table){const col=t.cols[ci];items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filter)items.push(['Clear filter',()=>setFilterWhere(id,null)]);
+ inp.addEventListener('keydown',e=>{if(e.key==='Enter'&&(!isMulti||e.ctrlKey||e.metaKey)){e.preventDefault();if(dirty)set(inp.value);else{done=true;insCellRevert(td,id,ii,col);}}else if(e.key==='Escape'){done=true;insCellRevert(td,id,ii,col);}});
+ inp.addEventListener('blur',()=>setTimeout(()=>{if(!done){if(dirty)set(inp.value);else insCellRevert(td,id,ii,col);}},120));}
+function cellMenu(e,id,ri,ci){e.preventDefault();const t=T(id);const key=ri+':'+ci;const cur=(t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];const items=[['Copy value',()=>{navigator.clipboard.writeText(cur===null?'':String(cur));log('Copied cell value.');}],['Copy row',()=>copyRow(id,ri)],['Copy rows (selected)',()=>copySelRows(id)],['Paste row here (overwrite)',()=>pasteRowInto(id,ri)],['Paste rows as new',()=>pasteRowsAsNew(id)],['Copy column: '+t.cols[ci],()=>copyColumn(id,ci)],['Edit full row (form)...',()=>rowForm(id,ri)],'-'];if(t.table){const col=t.cols[ci];items.push(['Quick filter',qfSub(id,col,cur)]);if(t.filterClauses&&t.filterClauses.length)items.push(['Clear filter ('+t.filterClauses.length+')',()=>clearFilters(id)]);
   const fkd=(t.fkDetails||[]).find(f=>f[0]===col);
   if(fkd&&cur!=null){items.push(['Go to referenced row ('+fkd[1]+'.'+fkd[2]+')',()=>goToFkRow(t.db,fkd[1],fkd[2],cur)]);}
   items.push('-');}items.push(['Export to CSV (all rows)...',()=>csvGrid(id)],['Export to CSV (selected rows)...',()=>csvSel(id)],['Export to INSERTs (all rows)...',()=>insGrid(id)],['Export to INSERTs (selected rows)...',()=>insSel(id)],'-',['Set NULL',()=>setUpd(id,ri,ci,null)],['Set empty',()=>setUpd(id,ri,ci,'')]);menu(e.clientX,e.clientY,items);}
@@ -4651,17 +4757,22 @@ function rowsClipboard(){if(window._rowsClipboard&&window._rowsClipboard.length)
 function pasteRowsAsNew(id){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}const rowsData=rowsClipboard();if(!rowsData||!rowsData.length){toast('Copy some rows first (Copy rows (selected)), then paste them as new rows.',true);return;}const bad=rowsData.find(vals=>vals.length!==t.cols.length);if(bad){toast('Copied row(s) have a different number of columns than this table. Cannot paste.',true);return;}rowsData.forEach(vals=>{const obj={};t.cols.forEach((c,ci)=>{obj[c]=vals[ci];});t.pending.ins.push(obj);});renderGrid(id);log('Pasted '+rowsData.length+' row(s) as new rows. Review and click Apply to commit.');}
 function copyColumn(id,ci){const t=T(id);const vals=t.rows.map((row,ri)=>{const key=ri+':'+ci;return (t.pending&&(key in t.pending.upd))?t.pending.upd[key]:row[ci];});navigator.clipboard.writeText(vals.map(v=>v===null?'':v).join('\n')).then(()=>log('Copied '+vals.length+' value(s) from column "'+t.cols[ci]+'".'));}
 function qfSub(id,col,val){const q=qid(col);const lv=lit(val);const esc=s=>String(s).replace(/([%_\\])/g,'\\$1').replace(/'/g,"''");const sub=[];
- if(val===null){sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
+ if(val===null){sub.push([q+' IS NULL',()=>addFilterClause(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>addFilterClause(id,q+' IS NOT NULL')]);return sub;}
  const sv=String(val).trim();const isNum=/^-?\d+(\.\d+)?$/.test(sv);const isDate=/^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$/.test(sv);
  const like=String(val);const ld=(like.length>16?like.slice(0,16)+'\u2026':like);
  // display value for =/!= labels: truncated for readability; the actual filter still uses the full value (lv)
  const lvd="'"+(sv.length>16?sv.slice(0,16)+'\u2026':sv)+"'";const dv=isNum?lv:lvd;
- sub.push([q+' = '+dv,()=>setFilterWhere(id,q+' = '+lv)]);sub.push([q+' != '+dv,()=>setFilterWhere(id,q+' <> '+lv)]);
- if(isNum||isDate){sub.push('-');sub.push([q+' > '+dv,()=>setFilterWhere(id,q+' > '+lv)]);sub.push([q+' >= '+dv,()=>setFilterWhere(id,q+' >= '+lv)]);sub.push([q+' < '+dv,()=>setFilterWhere(id,q+' < '+lv)]);sub.push([q+' <= '+dv,()=>setFilterWhere(id,q+' <= '+lv)]);}
- if(!isNum){sub.push('-');sub.push([q+" LIKE '%"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"%'")]);sub.push([q+" LIKE '"+ld+"%'",()=>setFilterWhere(id,q+" LIKE '"+esc(like)+"%'")]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>setFilterWhere(id,q+" LIKE '%"+esc(like)+"'")]);}
- sub.push('-');sub.push([q+' IS NULL',()=>setFilterWhere(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>setFilterWhere(id,q+' IS NOT NULL')]);return sub;}
-async function setFilterWhere(id,where){const t=T(id);t.filter=where;await openRun(id);if(where)log('Filter: '+where);else log('Filter cleared.');}
-function updateFilterBar(id){const t=T(id);const st=$('st_'+id);if(!st)return;st.title=t.filter?('WHERE '+t.filter):'';}
+ sub.push([q+' = '+dv,()=>addFilterClause(id,q+' = '+lv)]);sub.push([q+' != '+dv,()=>addFilterClause(id,q+' <> '+lv)]);
+ if(isNum||isDate){sub.push('-');sub.push([q+' > '+dv,()=>addFilterClause(id,q+' > '+lv)]);sub.push([q+' >= '+dv,()=>addFilterClause(id,q+' >= '+lv)]);sub.push([q+' < '+dv,()=>addFilterClause(id,q+' < '+lv)]);sub.push([q+' <= '+dv,()=>addFilterClause(id,q+' <= '+lv)]);}
+ if(!isNum){sub.push('-');sub.push([q+" LIKE '%"+ld+"%'",()=>addFilterClause(id,q+" LIKE '%"+esc(like)+"%'")]);sub.push([q+" LIKE '"+ld+"%'",()=>addFilterClause(id,q+" LIKE '"+esc(like)+"%'")]);if(!isDate)sub.push([q+" LIKE '%"+ld+"'",()=>addFilterClause(id,q+" LIKE '%"+esc(like)+"'")]);}
+ sub.push('-');sub.push([q+' IS NULL',()=>addFilterClause(id,q+' IS NULL')]);sub.push([q+' IS NOT NULL',()=>addFilterClause(id,q+' IS NOT NULL')]);return sub;}
+// Adds one more ANDed condition to the table tab's active quick filter (does not replace the
+// existing ones) - lets right-clicking two different cells build up a compound WHERE, matching
+// how Heidi's quick-filter stacking works. Re-picking the exact same condition is a no-op.
+async function addFilterClause(id,clause){const t=T(id);if(!t.filterClauses)t.filterClauses=[];if(t.filterClauses.includes(clause))return;t.filterClauses.push(clause);await openRun(id);log('Filter: '+t.filterClauses.join(' AND '));}
+async function clearFilters(id){const t=T(id);t.filterClauses=[];await openRun(id);log('Filter cleared.');}
+function combinedFilterWhere(t){return (t.filterClauses&&t.filterClauses.length)?t.filterClauses.join(' AND '):null;}
+function updateFilterBar(id){const t=T(id);const st=$('st_'+id);if(!st)return;const w=combinedFilterWhere(t);st.title=w?('WHERE '+w):'';}
 let _rf=null;
 function rowForm(id,ri){const t=T(id);_rf={id:id,ri:ri};$('rfTitle').textContent='Edit row'+(t.table?(' - '+t.table):'');const box=$('rfFields');box.innerHTML='';
  t.cols.forEach((c,ci)=>{const key=ri+':'+ci;const cur=(t.pending&&(key in t.pending.upd))?t.pending.upd[key]:t.rows[ri][ci];
@@ -4817,7 +4928,14 @@ async function dlBinary(blob,name){
 // ---- history ----
 function hist(){try{return JSON.parse(localStorage.getItem('history')||'[]');}catch(e){return[];}}
 function addHistory(sql){sql=sql.trim();if(!sql)return;let h=hist().filter(x=>x!==sql);h.unshift(sql);h=h.slice(0,200);localStorage.setItem('history',JSON.stringify(h));}
-function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="muted">No history yet.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='item';d.style.borderBottom='1px solid var(--bd2)';d.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';d.style.whiteSpace='pre-wrap';d.textContent=sql.slice(0,300);d.onclick=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};box.appendChild(d);});show('mHist');}
+function codeBlockStartHeight(text){const lines=String(text||'').split('\n').length;return Math.min(140,Math.max(40,lines*17+13))+'px';}
+// max-width:100% keeps a drag-resize from ever growing wider than the box it's already filling
+// (effectively horizontal-only-if-there-was-room-to-begin-with, i.e. no overstretch past the
+// window's own edge), and max-height clamps to the viewport itself so dragging can never grow the
+// block past the visible window - without both, an unbounded resize:both could be dragged to an
+// enormous size and made the whole window unresponsive while it repainted.
+function codeBlockStyle(text){return "display:block;background:var(--log);color:var(--logfg);font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;line-height:1.5;padding:6px 8px;border-radius:4px;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;overflow:auto;resize:both;max-width:100%;max-height:calc(100vh - 40px);height:"+codeBlockStartHeight(text);}
+function openHistory(){const box=$('histList');const h=hist();box.innerHTML=h.length?'':'<div class="muted">No history yet.</div>';h.forEach(sql=>{const d=document.createElement('div');d.className='item';d.style.cssText='border-bottom:1px solid var(--bd2);padding:6px 4px';const code=document.createElement('code');code.style.cssText=codeBlockStyle(sql);code.textContent=sql;d.appendChild(code);d.onclick=()=>{hide('mHist');openTab('history',sql,curSchema,false,null);};box.appendChild(d);});show('mHist');}
 async function clearHistory(){if(await ask('Clear query history?')){localStorage.removeItem('history');openHistory();}}
 let _libCache=[];
 function libAll(){return _libCache.slice();}
@@ -4852,7 +4970,7 @@ function libRender(){const box=$('libList');const q=($('libSearch').value||'').t
   const ed=document.createElement('button');ed.className='sm';ed.textContent='Edit';ed.style.marginLeft='6px';ed.onclick=()=>libEdit(x.name);
   const dl=document.createElement('button');dl.className='sm warn';dl.textContent='Delete';dl.style.marginLeft='6px';dl.onclick=async()=>{if(await ask('Delete saved query "'+x.name+'"?')){await api('/api/lib-delete',{name:x.name});await libLoad();libRender();}};
   btns.appendChild(op);btns.appendChild(ed);btns.appendChild(dl);head.appendChild(nm);head.appendChild(btns);
-  const pre=document.createElement('div');pre.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';pre.style.fontSize='11px';pre.style.color='var(--muted)';pre.style.whiteSpace='pre-wrap';pre.style.marginTop='3px';pre.textContent=(x.sql||'').slice(0,200);
+  const pre=document.createElement('code');pre.style.cssText=codeBlockStyle(x.sql)+';margin-top:4px';pre.textContent=x.sql||'';
   d.appendChild(head);d.appendChild(pre);box.appendChild(d);});}
 
 // ---- users ----
@@ -5323,7 +5441,55 @@ async function openUsers(){const r=await api('/api/query',{sql:"SELECT User,Host
  if(!r.ok){toast(r.error,true);return;}r.rows.forEach(u=>{const d=document.createElement('div');d.className='uitem';d.textContent=u[0]+'@'+u[1];d.dataset.v=u[0]+'\x01'+u[1];d.onclick=()=>{[...sel.children].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');window._selUser=d.dataset.v;showGrants();};sel.appendChild(d);});show('mUsers');}
 async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+lit(u)+"@"+lit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
 async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw),'Created user'))openUsers();}
-async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Revoke privileges',okText:'Revoke',fields:[{key:'g',label:'Privileges to revoke (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
+// Common privilege combos, similar to what Workbench's own privilege list offers - not exhaustive
+// (there's dozens of individual MySQL privileges), just the handful actually reached for often. The
+// free-text field underneath stays the source of truth: picking a preset/schema/table just (re)writes
+// it for you, and it's still hand-editable for anything these pickers don't cover.
+const GRANT_PRESETS=[
+ {value:'__custom__',label:'Custom (type below)'},
+ {value:'ALL PRIVILEGES',label:'ALL PRIVILEGES'},
+ {value:'SELECT',label:'SELECT (read-only)'},
+ {value:'SELECT, INSERT, UPDATE, DELETE',label:'SELECT, INSERT, UPDATE, DELETE'},
+ {value:'SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES',label:'SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, INDEX, REFERENCES'},
+ {value:'EXECUTE',label:'EXECUTE (procedures/functions)'},
+ {value:'PROCESS, RELOAD',label:'PROCESS, RELOAD'},
+ {value:'REPLICATION SLAVE, REPLICATION CLIENT',label:'REPLICATION SLAVE, REPLICATION CLIENT'},
+ {value:'USAGE',label:'USAGE (no privileges)'},
+];
+// Shared by grantUser()/revokeUser() - the dialog itself doesn't know or care which one it's for
+// beyond the title/button text; the caller still does the actual GRANT/REVOKE + FLUSH PRIVILEGES.
+async function grantRevokeDialog(mode){
+ const isGrant=mode==='grant';
+ const sr=await api('/api/schemas');const schemas=sr.ok?sr.schemas.map(s=>s.name):[];
+ const fields=[
+  {key:'preset',label:'Common privileges',type:'select',options:GRANT_PRESETS,value:'__custom__'},
+  {key:'schema',label:'Schema',type:'select',options:[{value:'*',label:'* (all databases)'},...schemas.map(s=>({value:s,label:s}))],value:'*'},
+  {key:'table',label:'Table',type:'select',options:[{value:'*',label:'* (all tables)'}],value:'*'},
+ ];
+ if(isGrant)fields.push({key:'wgo',label:'With grant option',type:'checkbox',value:false});
+ fields.push({key:'g',label:'Privileges'+(isGrant?' to grant':' to revoke')+' (e.g. ALL PRIVILEGES ON db.*) - editable directly, or built from the pickers above',value:'ALL PRIVILEGES ON *.*'});
+ const p=inputBox({title:isGrant?'Grant privileges':'Revoke privileges',okText:isGrant?'Grant':'Revoke',width:'560px',fields});
+ const presetSel=$('inp_preset'),schemaSel=$('inp_schema'),tableSel=$('inp_table'),gInput=$('inp_g'),wgoCk=isGrant?$('inp_wgo'):null;
+ // WITH GRANT OPTION is a suffix on the whole GRANT statement (after "TO user@host"), not part of
+ // the privilege/target list this field holds - grantUser() appends it separately at exec time, in
+ // the right place, based on the checkbox state rather than baking it into this text.
+ function rebuild(){
+  const on=(schemaSel.value==='*'?'*':qid(schemaSel.value))+'.'+(tableSel.value==='*'?'*':qid(tableSel.value));
+  const priv=presetSel.value==='__custom__'?(gInput.value.replace(/\s+ON\s+\S+\.\S+.*$/i,'').trim()||'SELECT'):presetSel.value;
+  gInput.value=priv+' ON '+on;
+ }
+ async function refreshTables(){
+  if(schemaSel.value==='*'){tableSel.innerHTML='<option value="*">* (all tables)</option>';tableSel.disabled=true;return;}
+  tableSel.disabled=false;tableSel.innerHTML='<option value="*">* (all tables)</option>';
+  const tr=await api('/api/query',{sql:'SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA='+lit(schemaSel.value)+' ORDER BY TABLE_NAME'});
+  if(tr.ok)tr.rows.forEach(r=>{const o=document.createElement('option');o.value=r[0];o.textContent=r[0];tableSel.appendChild(o);});
+ }
+ presetSel.onchange=rebuild;tableSel.onchange=rebuild;if(wgoCk)wgoCk.onchange=rebuild;
+ schemaSel.onchange=async()=>{await refreshTables();rebuild();};
+ await refreshTables();
+ return await p;
+}
+async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await grantRevokeDialog('revoke');if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
 async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+lit(u)+"@"+lit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
 async function changePassword(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const parts=v.split('\x01');const u=parts[0],h=parts[1];
  const res=await inputBox({title:'Change password for '+u+'@'+h,okText:'Change',fields:[{key:'pw',label:'New password',type:'password',value:''},{key:'pw2',label:'Confirm new password',type:'password',value:''}]});
@@ -5336,7 +5502,9 @@ async function changePassword(){const v=window._selUser;if(!v){toast('Select a u
  const r=await api('/api/exec',{sql:sql});
  if(r.ok){log('Password changed for '+u+'@'+h+'.');toast('Password changed for '+u+'@'+h+'.','ok');}else{toast('Failed: '+(r.error||'unknown'),true);}}
 async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+lit(u)+"@"+lit(h),'Dropped user'))openUsers();}
-async function grantUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await inputBox({title:'Grant privileges',okText:'Grant',fields:[{key:'g',label:'Privileges (e.g. ALL PRIVILEGES ON db.*)',value:'ALL PRIVILEGES ON *.*'}]});if(!res||!res.g.trim())return;if(await exec("GRANT "+res.g.trim()+" TO "+lit(u)+"@"+lit(h),'Granted')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
+async function grantUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await grantRevokeDialog('grant');if(!res||!res.g.trim())return;
+ const sql="GRANT "+res.g.trim()+" TO "+lit(u)+"@"+lit(h)+(res.wgo?' WITH GRANT OPTION':'');
+ if(await exec(sql,'Granted')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
 
 // ---- table designer ----
 const DTYPES=['INT','BIGINT','TINYINT','SMALLINT','MEDIUMINT','DECIMAL','FLOAT','DOUBLE','BIT','BOOLEAN','CHAR','VARCHAR','TEXT','MEDIUMTEXT','LONGTEXT','DATE','DATETIME','TIMESTAMP','TIME','YEAR','JSON','BLOB','LONGBLOB','ENUM','BINARY','VARBINARY'];
@@ -5429,7 +5597,18 @@ if(preselect&&preselect.db){
 }
 show('mExport');}
 function expAll(v){[...document.querySelectorAll('.expdb')].forEach(c=>c.checked=v);}
-function expSyncFilenameField(){const row=$('expFilenameRow');if(row)row.style.display=$('expSingle').checked?'inline-flex':'none';}
+function expSyncFilenameField(){const row=$('expFilenameRow');if(row)row.style.display=$('expSingle').checked?'flex':'none';expUpdateFilenamePreview();}
+// Its own row (matching Folder's label/width/casing) instead of squeezed into the dense options
+// row above at 120px wide - plus a live preview of the actual resulting file name, since
+// "timestamp" silently changes what gets written and a plain text box alone doesn't show that.
+function expUpdateFilenamePreview(){const el=$('expFilenamePreview');if(!el)return;const inp=$('expFilename');const base=(inp.value||'').trim()||'all_selected';const stamp=$('expStamp').checked?'_'+expTimestampSample():'';const text='\u2192 '+base+stamp+'.sql';el.textContent=text;el.title=text;
+ // Quiet unless you're actually closing in on the limit - a short, everyday filename shouldn't
+ // have to share the row with a running character count.
+ const cnt=$('expFilenameCount');if(cnt){const len=inp.value.length,max=inp.maxLength;
+  if(len>=max-20){cnt.style.display='';cnt.textContent=len+'/'+max;cnt.style.color=(len>=max)?'var(--log-warn)':'';}
+  else{cnt.style.display='none';}
+ }}
+function expTimestampSample(){const d=new Date();const p=n=>String(n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'_'+p(d.getHours())+p(d.getMinutes())+p(d.getSeconds());}
 // A few export options only exist on one mysqldump flavor: --set-gtid-purged is MySQL 5.6+
 // only, --column-statistics is MySQL 8+ only - MariaDB's mysqldump has neither, and checking
 // either against it aborts the WHOLE export with "unknown variable". Grey them out up front
@@ -5490,7 +5669,7 @@ if(!dbs.length && tables.length){
  progStop('exp');
  if(r.cancelled){log('Export cancelled.');}
  if(!r.ok){showToolError('expLog','mExport',r.error);log('Export error: '+r.error);return;}
- $('expLog').textContent=r.log.join('\n');r.log.forEach(l=>log('EXPORT: '+l));}
+ $('expLog').innerHTML=logLinesHtml(r.log);r.log.forEach(l=>log('EXPORT: '+l));}
 let _cmpTables=null;
 async function cmpFillConnSelect(sel){sel.innerHTML='';const r=await api('/api/conn-list');if(r.ok)r.items.forEach(c=>{const o=document.createElement('option');o.value=c.name;o.textContent=c.name;sel.appendChild(o);});}
 function cmpResetTablePicker(){const box=$('cmpTablesBox');if(box){box.innerHTML='';box.style.display='none';}}
@@ -5635,7 +5814,7 @@ async function applyCompare(){const stmts=cmpSelectedStatements();if(!stmts.leng
  $('cmpLog').textContent='Applying\u2026';
  const r=await api('/api/compare-apply',{targetConnName:$('cmpTgtConn').value,targetDb:$('cmpTgtDb').value,statements:stmts});
  if(!r.ok){$('cmpLog').textContent='';toast(r.error||'Apply failed',true);return;}
- $('cmpLog').textContent=r.log.join('\n');
+ $('cmpLog').innerHTML=logLinesHtml(r.log);
  log('Compare: applied '+stmts.length+' statement(s) to '+$('cmpTgtConn').value+'.');
  await runCompare();}
 let _cmprState=null;
@@ -5943,7 +6122,7 @@ async function runImport(){const files=$('impFiles').value.split(/\r?\n/).map(s=
  progStop('imp');
  if(r.cancelled){log('Import cancelled.');}
  if(!r.ok){showToolError('impLog','mImport',r.error);log('Import error: '+r.error);return;}
- $('impLog').textContent=r.log.join('\n');r.log.forEach(l=>log('IMPORT: '+l));}
+ $('impLog').innerHTML=logLinesHtml(r.log);r.log.forEach(l=>log('IMPORT: '+l));}
 async function quit(){
  const activeJobs=Object.keys(_progJobIds||{}).filter(k=>_progJobIds[k]);
  const runningQueryTabs=tabs.filter(t=>t.runningReqId);
