@@ -2240,6 +2240,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  .modal.show{display:flex} .box{background:var(--bg);color:var(--fg);border-radius:6px;padding:16px;max-width:900px;width:94%;max-height:92%;overflow:auto;box-shadow:0 10px 40px rgba(0,0,0,.4)}
  .box h3{margin:0 0 10px} .grid2{display:grid;grid-template-columns:1fr 1fr;gap:4px 18px}
  label.ck{display:block;padding:2px 0} .row{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap} .muted{color:var(--muted);font-size:12px}
+ #vHexTabs button{border:1px solid var(--bd);background:var(--btn);color:var(--fg);border-radius:4px;padding:4px 12px;cursor:pointer;font:inherit}
+ #vHexTabs button.on{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
  #ctx{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:180px}
  #colPicker{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
  #copyMenu{position:fixed;background:var(--bg);border:1px solid var(--bd);box-shadow:0 4px 14px rgba(0,0,0,.3);z-index:9500;display:none;min-width:200px;max-height:320px;overflow:auto;padding:6px 0}
@@ -2324,16 +2326,22 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div id="colPicker"></div>
 <div id="copyMenu"></div>
 <div id="acx"></div>
-<div class="modal floating" id="mBrowse"><div class="box" style="max-width:660px;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mBrowse')" title="Drag to move"><h3 id="brTitle" style="margin:0">Browse</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mBrowse')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mBrowse"><div class="box" style="max-width:660px;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mBrowse')" title="Drag to move"><h3 id="brTitle" style="margin:0">Browse</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mBrowse')" title="Maximize" id="maxBtn_mBrowse" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mBrowse')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row"><button class="sm" onclick="brUp()">&#8593; Up</button> <b id="brPath" style="font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></b></div>
  <div id="brList" style="height:340px;overflow:auto;border:1px solid var(--bd2);padding:2px"></div>
  <div class="row"><span id="brActions"></span><span style="flex:1"></span><button onclick="brClose()">Cancel</button></div></div></div>
 
-<div class="modal floating" id="mView"><div class="box" style="max-width:780px;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mView')" title="Drag to move"><h3 id="vTitle" style="margin:0">Value</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mView')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
- <textarea id="vText" style="width:100%;height:340px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></textarea>
- <select id="vSelect" style="width:100%;display:none;padding:8px;font-size:13px"></select>
- <div class="row" id="vActions"></div></div></div>
-<div class="modal floating" id="mCsv"><div class="box" style="top:70px;left:140px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCsv')" title="Drag to move"><h3 id="csvTitle" style="margin:0">Import CSV into table</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCsv')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mView"><div class="box" style="width:1000px;max-width:95vw;display:flex;flex-direction:column;overflow:hidden;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mView')" title="Drag to move"><h3 id="vTitle" style="margin:0 0 10px">Value</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mView')" title="Maximize" id="maxBtn_mView" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mView')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
+ <img id="vImg" style="display:none;max-width:100%;max-height:340px;margin-bottom:6px;border:1px solid var(--bd);border-radius:3px;flex:none">
+ <textarea id="vText" style="width:100%;height:520px;flex:1;min-height:0;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></textarea>
+ <select id="vSelect" style="width:100%;display:none;padding:8px;font-size:13px;flex:none"></select>
+ <div id="vMulti" style="width:100%;display:none;max-height:520px;overflow:auto;padding:8px;border:1px solid var(--bd);border-radius:3px;background:var(--in);box-sizing:border-box;font-size:13px;flex:1;min-height:0"></div>
+ <input id="vDate" style="width:100%;display:none;padding:8px;font-size:13px;box-sizing:border-box;flex:none">
+ <div class="row" style="justify-content:flex-end;align-items:center;flex:none">
+  <div id="vHexTabs" style="display:none;gap:6px;margin-right:auto"><button id="vTabText" onclick="switchHexTab('text')">Text</button><button id="vTabHex" onclick="switchHexTab('hex')">Hex</button></div>
+  <div class="row" id="vActions"></div>
+ </div></div></div>
+<div class="modal floating" id="mCsv"><div class="box" style="top:70px;left:140px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCsv')" title="Drag to move"><h3 id="csvTitle" style="margin:0">Import CSV into table</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mCsv')" title="Maximize" id="maxBtn_mCsv" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCsv')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row">CSV file <input id="csvFile" style="flex:1"><button onclick="browse({title:'Select CSV file',filter:'*.csv',mode:'file',onPick:pp=>$('csvFile').value=pp})">Browse...</button></div>
  <div class="row"><label title="The first row of the CSV contains the column names"><input type="checkbox" id="csvHeader" checked> first row is header</label>
   <span style="margin-left:12px">Mode:</span>
@@ -2342,7 +2350,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="muted" style="font-size:11px">Columns are matched to the table by header name; unmatched CSV columns are ignored. A cell equal to the NULL value below is imported as NULL; an empty cell is imported as an empty string. Clear the NULL value to import empty cells as NULL instead, which is usually what a spreadsheet means. For an exact restore of a whole database, prefer Export/Import (mysqldump).</div>
  <div class="row"><button class="go" onclick="runCsvImport()">Import</button><button onclick="hide('mCsv')">Close</button></div>
  <div id="csvLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:200px;overflow:auto;margin-top:6px"></div></div></div>
-<div class="modal floating" id="mExport"><div class="box" style="top:80px;left:120px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mExport')" title="Drag to move"><h3 style="margin:0">Data Export</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mExport')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mExport"><div class="box" style="top:80px;left:120px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mExport')" title="Drag to move"><h3 style="margin:0">Data Export</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mExport')" title="Maximize" id="maxBtn_mExport" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mExport')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row"><b>Databases</b> <button onclick="expAll(true)">All</button><button onclick="expAll(false)">None</button></div>
  <div id="expDbs" style="max-height:150px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div>
  <div class="row"><b>Options</b></div><div class="grid2" id="expOpts"></div>
@@ -2359,7 +2367,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  </div>
  <div id="expLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
 
-<div class="modal floating" id="mImport"><div class="box" style="top:80px;left:200px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mImport')" title="Drag to move"><h3 style="margin:0">Data Import</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mImport')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div><div class="row">SQL file paths (one per line):</div>
+<div class="modal floating" id="mImport"><div class="box" style="top:80px;left:200px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mImport')" title="Drag to move"><h3 style="margin:0">Data Import</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mImport')" title="Maximize" id="maxBtn_mImport" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mImport')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div><div class="row">SQL file paths (one per line):</div>
  <textarea id="impFiles" style="width:100%;height:90px;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;white-space:pre;overflow:auto"></textarea>
  <div class="row"><button onclick="impAddFiles()">Add files...</button><button onclick="impAddFolder()">Add folder (all .sql)...</button><button class="sm" onclick="$('impFiles').value=''">Clear</button></div>
  <div class="row">Target DB <input id="impDb" list="impDbList" placeholder="(blank if dump has CREATE DATABASE)" style="width:320px"><datalist id="impDbList"></datalist></div>
@@ -2371,7 +2379,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  </div>
  <div id="impLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:220px;overflow:auto;margin-top:6px"></div></div></div>
 
-<div class="modal floating" id="mCompare"><div class="box" style="width:820px;max-width:94vw;top:50px;left:90px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompare')" title="Drag to move"><h3 style="margin:0">Compare Databases <span class="muted" style="font-size:13px;cursor:help;font-weight:400" title="Connects to both sides independently of whatever's currently active, using each saved connection's stored password - so both the source and target connection need &quot;Save password&quot; checked (Edit... on the connection) or this will fail to log in.">&#9432;</span></h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompare')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mCompare"><div class="box" style="width:820px;max-width:94vw;top:50px;left:90px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompare')" title="Drag to move"><h3 style="margin:0">Compare Databases <span class="muted" style="font-size:13px;cursor:help;font-weight:400" title="Connects to both sides independently of whatever's currently active, using each saved connection's stored password - so both the source and target connection need &quot;Save password&quot; checked (Edit... on the connection) or this will fail to log in.">&#9432;</span></h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mCompare')" title="Maximize" id="maxBtn_mCompare" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompare')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row" style="display:flex;gap:10px">
    <div style="flex:1"><div class="muted" style="font-size:11px;margin-bottom:3px">Source</div>
      <select id="cmpSrcConn" style="width:100%" onchange="cmpResetResults();cmpLoadDbs('src')"></select>
@@ -2395,7 +2403,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="cmpLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:140px;overflow:auto;margin-top:6px"></div>
 </div></div>
 
-<div class="modal floating" id="mCompareRows"><div class="box" style="width:900px;max-width:96vw;top:50px;left:110px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompareRows')" title="Drag to move"><h3 id="cmprTitle" style="margin:0">Row comparison</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompareRows')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mCompareRows"><div class="box" style="width:900px;max-width:96vw;top:50px;left:110px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mCompareRows')" title="Drag to move"><h3 id="cmprTitle" style="margin:0">Row comparison</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mCompareRows')" title="Maximize" id="maxBtn_mCompareRows" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mCompareRows')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
 
  <div class="muted" style="font-size:12px;font-weight:600;margin-top:4px">Missing on target</div>
  <div id="cmprNote" class="muted" style="font-size:11px;margin-bottom:6px"></div>
@@ -2420,12 +2428,12 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="cmprLog" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
 </div></div>
 
-<div class="modal floating" id="mUsers"><div class="box" style="width:1050px;max-width:96vw;top:40px;left:70px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mUsers')" title="Drag to move"><h3 style="margin:0">Users &amp; Privileges</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUsers')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mUsers"><div class="box" style="width:1050px;max-width:96vw;top:40px;left:70px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mUsers')" title="Drag to move"><h3 style="margin:0">Users &amp; Privileges</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mUsers')" title="Maximize" id="maxBtn_mUsers" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUsers')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row" style="align-items:flex-start"><div id="userSel" style="min-width:240px;height:260px;overflow:auto;border:1px solid var(--bd2);border-radius:4px"></div>
   <div style="flex:1"><div id="grantsBox" class="muted" style="white-space:pre-wrap;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;height:260px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div></div></div>
  <div class="row"><button onclick="newUser()">Create user...</button><span class="tbsep"></span><button onclick="grantUser()">Grant...</button><button onclick="revokeUser()">Revoke...</button><span class="tbsep"></span><button onclick="changePassword()">Change password...</button><button onclick="lockUser(true)" title="Disable this login (ACCOUNT LOCK)">Lock</button><button onclick="lockUser(false)" title="Re-enable this login (ACCOUNT UNLOCK)">Unlock</button><span class="tbsep"></span><button onclick="openUserTransfer()" title="Build CREATE USER + GRANT statements to migrate accounts to another server">Transfer script...</button><span class="tbsep"></span><button class="warn" onclick="dropUser()">Drop user</button><span style="flex:1"></span><button onclick="hide('mUsers')">Close</button></div></div></div>
 
-<div class="modal floating" id="mUserTransfer"><div class="box" style="width:820px;max-width:94vw;top:60px;left:130px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mUserTransfer')" title="Drag to move"><h3 style="margin:0">Generate User Transfer Script</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUserTransfer')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mUserTransfer"><div class="box" style="width:820px;max-width:94vw;top:60px;left:130px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mUserTransfer')" title="Drag to move"><h3 style="margin:0">Generate User Transfer Script</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mUserTransfer')" title="Maximize" id="maxBtn_mUserTransfer" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUserTransfer')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="muted" style="margin-bottom:8px">Uses SHOW CREATE USER and SHOW GRANTS FOR against this connection - the same statements the server itself would emit, so the correct auth plugin, password hash, column/routine grants, and grant options all come through correctly (works on MySQL and MariaDB alike). CREATE USER statements are listed first so the grants below can reference them. Copy or save the result and run it on the TARGET server.</div>
  <div class="row"><b>Exclude these accounts</b> <input id="utExclude" style="flex:1" value="mysql.sys,root,debian-sys-maint,mariadb.sys,healthcheck,mariabackup,galera,replica,PUBLIC"></div>
  <div class="row"><button class="go" onclick="genUserTransfer()">Generate</button><span id="utStatus" class="muted" style="margin-left:8px"></span></div>
@@ -2433,7 +2441,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row"><button onclick="copyUserTransfer()">Copy</button><button onclick="saveUserTransferFile()">Save to file...</button><button onclick="hide('mUserTransfer')">Close</button></div>
 </div></div>
 
-<div class="modal floating" id="mErd"><div class="box" style="width:96vw;max-width:1400px;height:92vh;display:flex;flex-direction:column;top:40px;left:60px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mErd')" title="Drag to move"><h3 id="erdTitle" style="margin:0">ER Diagram</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mErd')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mErd"><div class="box" style="width:96vw;max-width:1400px;height:92vh;display:flex;flex-direction:column;top:40px;left:60px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mErd')" title="Drag to move"><h3 id="erdTitle" style="margin:0">ER Diagram</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mErd')" title="Maximize" id="maxBtn_mErd" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mErd')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="muted" style="margin-bottom:6px">Foreign key relationships for this schema. Primary key columns are highlighted. Simple grid layout - not auto-arranged for minimal crossing lines, but functional for getting an overview.</div>
  <div id="erdStatus" class="muted" style="margin-bottom:6px;font-size:11px"></div>
  <div class="row" style="margin-bottom:6px"><input id="erdFind" placeholder="Find table..." style="width:240px" oninput="erdFindTable()"><label style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="erdOnlyRelated" checked onchange="erdRender()"> Only show tables with a relationship</label><button class="sm" onclick="erdExportPng()" title="Save the diagram as a PNG image, at its full size regardless of current zoom" style="margin-left:14px">Export PNG</button></div>
@@ -2449,13 +2457,13 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row" style="justify-content:flex-end"><button onclick="hide('mErd')">Close</button></div>
 </div></div>
 
-<div class="modal floating" id="mProcessList"><div class="box" style="width:900px;max-width:96vw;top:40px;left:140px" id="mProcessListBox"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mProcessList')" title="Drag to move"><h3 style="margin:0">Server Processes</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mProcessList')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mProcessList"><div class="box" style="width:900px;max-width:96vw;top:40px;left:140px" id="mProcessListBox"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mProcessList')" title="Drag to move"><h3 style="margin:0">Server Processes</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mProcessList')" title="Maximize" id="maxBtn_mProcessList" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mProcessList')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row"><button onclick="refreshProcessList()">Refresh</button><label title="This connection's own SHOW PROCESSLIST row is filtered out by default, since it's always present and can never actually be killed - check this to reveal it anyway." style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="plShowHidden" onchange="refreshProcessList()"> Show hidden</label><label style="display:inline-flex;align-items:center;gap:5px;margin-left:10px;font-size:12px;color:var(--muted)"><input type="checkbox" id="plAutoRefresh" onchange="plToggleAutoRefresh()"> Auto-refresh (3s)</label><span id="plStatus" class="muted" style="margin-left:8px"></span></div>
  <div id="plGrid" style="max-height:60vh;overflow:auto;border:1px solid var(--bd2);margin-top:8px"></div>
  <div class="row" style="justify-content:flex-end"><button onclick="hide('mProcessList')">Close</button></div>
 </div></div>
 
-<div class="modal floating" id="mHist"><div class="box" style="top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mHist')" title="Drag to move"><h3 style="margin:0">Query History</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mHist')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mHist"><div class="box" style="top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mHist')" title="Drag to move"><h3 style="margin:0">Query History</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mHist')" title="Maximize" id="maxBtn_mHist" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mHist')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div id="histList" style="max-height:400px;overflow:auto"></div>
  <div class="row"><button class="warn" onclick="clearHistory()">Clear history</button><button onclick="hide('mHist')">Close</button></div></div></div>
 <div class="modal floating" id="mRowForm"><div class="box" style="width:560px;max-width:94vw;top:70px;left:160px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mRowForm')" title="Drag to move"><h3 id="rfTitle" style="margin:0">Edit row</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mRowForm')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
@@ -2512,13 +2520,13 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div class="modal floating" id="mInput"><div class="box" style="width:460px;max-width:92vw;display:flex;flex-direction:column;overflow:hidden;top:90px;left:200px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mInput')" title="Drag to move"><h3 id="inpTitle" style="margin:0">Input</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mInput')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div id="inpFields" style="flex:1 1 auto;min-height:0;overflow:auto"></div>
  <div class="row" style="justify-content:flex-end;margin-top:6px;flex:none"><button class="go" id="inpOk" onclick="inpOk()">OK</button><button onclick="inpCancel()">Cancel</button></div></div></div>
-<div class="modal floating" id="mLib"><div class="box" style="width:640px;max-width:92vw;top:60px;left:180px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mLib')" title="Drag to move"><h3 style="margin:0">Query Library</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mLib')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mLib"><div class="box" style="width:640px;max-width:92vw;top:60px;left:180px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mLib')" title="Drag to move"><h3 style="margin:0">Query Library</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mLib')" title="Maximize" id="maxBtn_mLib" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mLib')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row"><input id="libName" placeholder="Name for the current query" maxlength="80" style="flex:1" onkeydown="if(event.key==='Enter')libSaveCurrent()"><button class="go" onclick="libSaveCurrent()">Save current query</button></div>
  <div class="row"><input id="libSearch" placeholder="Search saved queries..." oninput="libRender()" style="flex:1"></div>
  <div id="libList" style="max-height:380px;overflow:auto;border:1px solid var(--bd);border-radius:4px"></div>
  <div class="row"><button class="warn" onclick="libClearAll()" title="Delete all saved queries">Clear all</button><button onclick="libExport()" title="Download the whole library as a JSON file">Export library</button><button onclick="$('libFile').click()" title="Load a query-library.json from another machine (merges)">Import library</button><input type="file" id="libFile" accept="application/json,.json" style="display:none" onchange="libImportFile(event)"><span style="flex:1"></span><button onclick="hide('mLib')">Close</button></div></div></div>
 
-<div class="modal floating" id="mDesign"><div class="box" style="max-width:960px;top:40px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mDesign')" title="Drag to move"><h3 id="dTitle" style="margin:0">Table designer</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mDesign')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mDesign"><div class="box" style="max-width:960px;top:40px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mDesign')" title="Drag to move"><h3 id="dTitle" style="margin:0">Table designer</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mDesign')" title="Maximize" id="maxBtn_mDesign" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mDesign')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="row">Schema <input id="dSchema" style="width:180px"> Table <input id="dName" style="width:220px"> <span id="dMode" class="muted"></span></div>
  <table class="dz"><thead><tr><th>Column</th><th>Type</th><th>Length</th><th title="NOT NULL">NN</th><th title="AUTO_INCREMENT">AI</th><th title="PRIMARY KEY">PK</th><th>Default</th><th>Comment</th><th></th></tr></thead><tbody id="dCols"></tbody></table>
  <div class="row"><button onclick="dAddCol()">+ Column</button></div>
@@ -2606,6 +2614,17 @@ function floatCenterX(id){
  const w=box.getBoundingClientRect().width;
  box.style.left=Math.max(0,Math.round((window.innerWidth-w)/2))+'px';
 }
+function floatCenterY(id){
+ const box=$(id).querySelector('.box');
+ if(!box)return;
+ const h=box.getBoundingClientRect().height;
+ // Biased a bit above dead-center (not a plain 50/50 split) - looks more natural than true
+ // centering, and keeps tall modals (e.g. Compare Databases) from crowding the bottom edge.
+ // Compare Databases grows tall once results load, so it gets a stronger upward bias than
+ // the rest so it doesn't visually creep back toward dead-center as it fills up.
+ const biasFrac=id==='mCompare'?0.12:0.06;
+ box.style.top=Math.max(0,Math.round((window.innerHeight-h)/2-window.innerHeight*biasFrac))+'px';
+}
 let _floatDrag=null;
 function floatDragStart(e,id){
  e.preventDefault();
@@ -2680,6 +2699,52 @@ function floatRestore(id){
  floatBringToFront(id);
  floatRenderTray();
 }
+// Captured once, right here at script load - before any user interaction has had a chance to
+// drag-resize anything - so hide() above always has the modal's true pristine size to snap back
+// to. Also captures any persistent inner textarea (the cell-edit box, generated-SQL boxes, etc. -
+// elements that live in the page permanently rather than being rebuilt fresh on every open, unlike
+// e.g. Query History's per-row code blocks) so a manually resized one of those resets too.
+window._floatingDefaultSize={};
+window._floatingInnerDefaults={};
+document.querySelectorAll('.modal.floating').forEach(m=>{
+ const box=m.querySelector('.box');
+ if(box)window._floatingDefaultSize[m.id]={width:box.style.width,height:box.style.height,maxWidth:box.style.maxWidth,maxHeight:box.style.maxHeight};
+ window._floatingInnerDefaults[m.id]=[...m.querySelectorAll('textarea[id]')].map(ta=>({id:ta.id,width:ta.style.width,height:ta.style.height}));
+});
+// Snapshotting the exact prior inline top/left/width/height (rather than re-deriving them) means
+// restore always lands back exactly where the window was, including a size/position from a
+// manual drag-resize - not just back to the modal's hardcoded default.
+window._floatingMaxState={};
+// Row comparison's two grids keep a compact default max-height (like before dynamic sizing was
+// added) so the modal's normal size stays small - but that same cap would stop them from actually
+// growing into the extra room once the modal is maximized, so their max-height is cleared here too
+// alongside the box's, and restored exactly on toggle-back.
+const FLOAT_MAX_EXTRA={mCompareRows:['cmprGrid','cmprDiffGrid']};
+function floatToggleMaximize(id){
+ const box=$(id).querySelector('.box');
+ if(!box)return;
+ const btn=$('maxBtn_'+id);
+ const extraIds=FLOAT_MAX_EXTRA[id]||[];
+ if(window._floatingMaxState[id]){
+  const s=window._floatingMaxState[id];
+  box.style.top=s.top;box.style.left=s.left;box.style.width=s.width;box.style.height=s.height;box.style.maxWidth=s.maxWidth;box.style.maxHeight=s.maxHeight;
+  extraIds.forEach(eid=>{const el=$(eid);if(el&&s.extra&&(eid in s.extra))el.style.maxHeight=s.extra[eid];});
+  delete window._floatingMaxState[id];
+  if(btn)btn.title='Maximize';
+ } else {
+  // Every modal has a max-width (95vw-ish, from the resize-ceiling fix) and the shared .box
+  // rule's max-height:92% - both still apply to an inline width/height set here, silently
+  // clamping the "full screen" size to something visibly short of the actual viewport (a bigger
+  // gap on the right/bottom than the 10px on top/left) unless overridden too.
+  const extra={};
+  extraIds.forEach(eid=>{const el=$(eid);if(el)extra[eid]=el.style.maxHeight;});
+  window._floatingMaxState[id]={top:box.style.top,left:box.style.left,width:box.style.width,height:box.style.height,maxWidth:box.style.maxWidth,maxHeight:box.style.maxHeight,extra};
+  box.style.top='10px';box.style.left='10px';box.style.width='calc(100vw - 20px)';box.style.height='calc(100vh - 20px)';box.style.maxWidth='none';box.style.maxHeight='none';
+  extraIds.forEach(eid=>{const el=$(eid);if(el)el.style.maxHeight='none';});
+  if(btn)btn.title='Restore';
+ }
+ floatBringToFront(id);
+}
 function show(id){
  const el=$(id);
  document.body.appendChild(el);
@@ -2690,17 +2755,24 @@ function show(id){
   // looking state that would otherwise occur since neither classList.add('show') above nor the
   // position-apply below touches box.style.display at all.
   if(window._floatingMinimized[id]) floatRestore(id);
-  else { floatBringToFront(id); if(!window._floatingPos[id]) floatCenterX(id); floatApplyPos(id); }
+  else { floatBringToFront(id); if(!window._floatingPos[id]){floatCenterX(id);floatCenterY(id);} floatApplyPos(id); }
  }
 }
 function hide(id){
  $(id).classList.remove('show');
+ const box=$(id).querySelector('.box');
  if(window._floatingMinimized[id]){
   delete window._floatingMinimized[id];
-  const box=$(id).querySelector('.box');
   if(box)box.style.display='';
   floatRenderTray();
  }
+ // Always reset back to default size on close - reopening a window later should start fresh at
+ // its normal size rather than carrying over whatever a manual drag-resize (or an un-restored
+ // Maximize) last left it at. Position is left alone; only size is reset.
+ delete window._floatingMaxState[id];
+ const d=window._floatingDefaultSize&&window._floatingDefaultSize[id];
+ if(box&&d){box.style.width=d.width;box.style.height=d.height;box.style.maxWidth=d.maxWidth;box.style.maxHeight=d.maxHeight;const btn=$('maxBtn_'+id);if(btn)btn.title='Maximize';}
+ (window._floatingInnerDefaults&&window._floatingInnerDefaults[id]||[]).forEach(dd=>{const ta=$(dd.id);if(ta){ta.style.width=dd.width;ta.style.height=dd.height;}});
 }
 const RESERVED=new Set(['accessible','add','all','alter','analyze','and','as','asc','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','current_date','current_time','current_timestamp','cursor','database','databases','default','delete','desc','describe','distinct','div','double','drop','dual','each','else','exists','explain','false','fetch','float','for','force','foreign','from','fulltext','function','group','having','if','ignore','in','index','inner','insert','int','integer','interval','into','is','join','key','keys','left','like','limit','lock','long','longblob','longtext','match','mediumblob','mediumint','mediumtext','natural','not','null','numeric','offset','on','optimize','option','or','order','outer','primary','procedure','references','rename','repeat','replace','restrict','return','revoke','right','rlike','schema','schemas','select','set','show','smallint','spatial','sql','table','then','tinyblob','tinyint','tinytext','to','trigger','true','union','unique','unlock','unsigned','update','usage','use','using','values','varbinary','varchar','varying','when','where','while','with','write','zerofill']);
 function qid(n){n=String(n);if(n===''||!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)||RESERVED.has(n.toLowerCase()))return '`'+n.replace(/`/g,'``')+'`';return n;}
@@ -3915,6 +3987,13 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     refreshRunTableBinding(id,lastStmt);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
+      // Prime column-type info (and derive which columns are BIT) right away, alongside pk/fk -
+      // this is what lets the grid show a BIT column's plain decimal value on first render (see
+      // cellHtml's isBit param) instead of only once the user starts editing, which is as far as
+      // getColType's own lazy caching (used by editWidgetFor) would otherwise get it for free.
+      try{const ct=await api('/api/query',{sql:"SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(t.db)+" AND TABLE_NAME="+lit(t.table)});
+        if(ct.ok){t.colTypes={};ct.rows.forEach(row=>{t.colTypes[row[0]]=row[1];});t.bitCols=t.cols.map(c=>!!(t.colTypes[c]&&/^bit\(/i.test(t.colTypes[c])));}
+      }catch(e){}
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
         t.estRows=+objData.rowCounts[t.table];
       } else {
@@ -4094,7 +4173,7 @@ function decodeCtrlCharCell(hexStr,maxChars){
  if(truncated)html+='\u2026';
  return html;
 }
-function cellHtml(v){if(v===null)return '<span style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return decodeCtrlCharCell(v,300);return esc(clip(v,300));}
+function cellHtml(v,isBit){if(v===null)return '<span style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return esc(clip(v,300));}
 function colgroupHtml(id){const t=T(id);const ed=!!t.pk;const hidden=t.hiddenCols||new Set();let h='<colgroup><col style="width:30px">'+(ed?'<col style="width:34px">':'');t.cols.forEach((c,ci)=>{h+='<col style="width:150px'+(hidden.has(ci)?';display:none':'')+'">';});return h+'<col></colgroup>';}
 // wireColResize(): drag a column edge to resize, double-click to auto-fit (widths saved per table).
 function wireColResize(id){const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const t=T(id);const off=(!!t.pk)?2:1;
@@ -4228,10 +4307,10 @@ function renderBody(id){const t=T(id);const ed=!!t.pk;if(!t.selected)t.selected=
   if(ed)h+='<td class="delcell" onclick="toggleDel(\''+id+'\','+ri+')">'+(del?'\u21A9':'\u00D7')+'</td>';
   row.forEach((v,ci)=>{const key=ri+':'+ci;const pend=t.pending&&(key in t.pending.upd);const val=pend?t.pending.upd[key]:v;
    const attr=(ed?'class="editable'+(pend?' dirty':'')+'" onclick="cellClick(this,\''+id+'\','+ri+','+ci+')" ondblclick="editCell(this,\''+id+'\','+ri+','+ci+')" ':'')+'oncontextmenu="cellMenu(event,\''+id+'\','+ri+','+ci+')"';
-   h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val)+'</td>';});h+='</tr>';});
+   h+='<td '+attr+' title="'+esc(clip(val,300))+'">'+cellHtml(val,t.bitCols&&t.bitCols[ci])+'</td>';});h+='</tr>';});
  if(botH>0)h+='<tr class="vpad" style="height:'+botH+'px"><td colspan="'+nCols+'" style="padding:0;border:none"></td></tr>';
  if(ed)t.pending.ins.forEach((row,ii)=>{h+='<tr class="insrow"><td></td><td class="delcell" onclick="delIns(\''+id+'\','+ii+')">\u00D7</td>';
-   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v)+'</td>';});h+='</tr>';});
+   t.cols.forEach((c,ci)=>{const v=row[c];const cAttr=esc(c).replace(/\x27/g,'\\x27');h+='<td class="editable" onclick="insClick(this,\''+id+'\','+ii+',\''+cAttr+'\')" ondblclick="editIns(this,\''+id+'\','+ii+',\''+cAttr+'\')" oncontextmenu="insCellMenu(event,\''+id+'\','+ii+',\''+cAttr+'\')" title="'+esc(v)+'">'+cellHtml(v===undefined?null:v,t.bitCols&&t.bitCols[ci])+'</td>';});h+='</tr>';});
  $('tbody_'+id).innerHTML=h;
  if(wrap&&slice.length){const sampleTr=wrap.querySelector('tbody tr[data-r]');if(sampleTr){const mh=sampleTr.getBoundingClientRect().height;if(mh>4)t._rowH=mh;}}
  updateEditBar(id);}
@@ -4248,32 +4327,173 @@ function updateEditBar(id){const t=T(id);const el=$('edit_'+id);if(!el)return;if
  if(el.dataset.sig===sig)return;
  el.dataset.sig=sig;
  el.innerHTML='<button class="write" onclick="addRow(\''+id+'\')">+ Row</button><button class="warn write" '+(hasSel?'':'disabled')+' title="Mark all checked rows for deletion (applied on Apply)" onclick="deleteSel(\''+id+'\')">Delete selected</button><span class="tbsep"></span><button class="go write" '+(n?'':'disabled')+' onclick="applyChanges(\''+id+'\')">Apply</button><button '+(n?'':'disabled')+' onclick="revertChanges(\''+id+'\')">Revert</button><span class="pill">'+n+' pending</span>';}
-function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;const ta=$('vText');const sel=$('vSelect');
+// MySQL's own DATE/DATETIME/TIME text format <-> what a native <input type="date"/"datetime-
+// local"/"time"> needs. Deliberately conservative: anything the native widget can't faithfully
+// round-trip - a zero-date ('0000-00-00'), a zero month/day, a TIME past the widget's 00:00:00-
+// 23:59:59 range (MySQL TIME can hold up to 838:59:59, and negative) - returns '' rather than a
+// silently-wrong guess, which the caller treats as "don't offer the picker for this value",
+// falling back to plain text so nothing gets discarded just by opening and closing the editor.
+function mysqlToNativeDate(v,dateType){
+ if(v==null)return '';
+ const s=String(v).trim();
+ if(dateType==='time'){
+  const m=s.match(/^(\d{1,2}):(\d{2}):(\d{2})/);
+  if(!m||+m[1]>23)return '';
+  return m[1].padStart(2,'0')+':'+m[2]+':'+m[3];
+ }
+ const m=s.match(dateType==='date' ? /^(\d{4})-(\d{2})-(\d{2})$/ : /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(:\d{2})?/);
+ if(!m)return '';
+ const mo=+m[2],da=+m[3];
+ if(mo<1||mo>12||da<1||da>31)return '';
+ return dateType==='date' ? s : (m[1]+'-'+m[2]+'-'+m[3]+'T'+m[4]+':'+m[5]+(m[6]||''));
+}
+function nativeDateToMysql(v,dateType){ return dateType==='datetime-local' ? v.replace('T',' ') : v; }
+// ---- Text/Hex toggle for binary/BLOB cells (not BIT - see is_bit_col) ----
+// A LOT of real-world binary columns hold plain ASCII/UTF-8 (bcrypt hashes, tokens, UUIDs stored
+// as bytes), and forcing hex-only entry for those is a real usability regression vs Heidi/
+// Workbench. So both Text and Hex are offered as explicit, user-picked EDIT modes here - but
+// Text is only ever offered when it is PROVABLY lossless: strict (fatal) UTF-8 decode, then
+// re-encoded and compared byte-for-byte against the original. Anything that doesn't round-trip
+// exactly (real binary data, legacy non-UTF8 text, malformed byte sequences) never gets offered
+// as Text at all, so there is no best-effort/lossy guess that could silently swap bytes on Save.
+const MAX_HEXTEXT_BYTES=2000000; // ~2MB - beyond this, skip the round-trip check and image
+                                  // preview (still fully editable as Hex) rather than risk UI jank
+function hexToBytes(hexStr){const hex=(hexStr||'').slice(2);const bytes=new Uint8Array(Math.floor(hex.length/2));for(let i=0;i<bytes.length;i++)bytes[i]=parseInt(hex.substr(i*2,2),16);return bytes;}
+function bytesToHex(bytes){let s='0x';for(let i=0;i<bytes.length;i++)s+=bytes[i].toString(16).padStart(2,'0');return s;}
+function bytesToBase64(bytes){let bin='';for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin);}
+function hexToStrictText(hexStr){
+ const hex=hexStr||'0x';if(hex.length>MAX_HEXTEXT_BYTES*2)return null;
+ try{
+  const bytes=hexToBytes(hex);
+  const text=new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+  if(bytesToHex(new TextEncoder().encode(text)).toLowerCase()!==hex.toLowerCase())return null; // paranoia: enforce an exact round-trip, not just "decodes without throwing"
+  return text;
+ }catch(e){return null;}
+}
+function textToHex(text){return bytesToHex(new TextEncoder().encode(text));}
+const IMAGE_SIGS=[[[0x89,0x50,0x4E,0x47],'image/png'],[[0xFF,0xD8,0xFF],'image/jpeg'],[[0x47,0x49,0x46,0x38],'image/gif'],[[0x42,0x4D],'image/bmp']];
+function detectImageMime(bytes){
+ for(const [sig,mime] of IMAGE_SIGS){if(bytes.length>=sig.length&&sig.every((b,i)=>bytes[i]===b))return mime;}
+ if(bytes.length>=12&&bytes[0]===0x52&&bytes[1]===0x49&&bytes[2]===0x46&&bytes[3]===0x46&&bytes[8]===0x57&&bytes[9]===0x45&&bytes[10]===0x42&&bytes[11]===0x50)return 'image/webp'; // 'RIFF'....'WEBP'
+ return null;
+}
+// BIT columns get the same Text/Hex-shaped toggle, but relabelled "Number"/Hex and converting
+// decimal<->hex instead of UTF8-text<->hex - matching how Heidi/Workbench display BIT values
+// (as their plain numeric value, not a byte dump), while still leaving Hex available for anyone
+// who wants to see/set the exact bit pattern. Unlike the binary Text/Hex case, this conversion
+// is ALWAYS lossless both ways (a fixed-width integer has exactly one hex and one decimal
+// representation), so there's no round-trip validity check needed here - only input validation.
+function hexToBitNumber(hexStr){const bytes=hexToBytes(hexStr||'0x0');let n=0n;for(let i=0;i<bytes.length;i++)n=(n<<8n)|BigInt(bytes[i]);return n.toString();}
+function bitNumberToHex(decStr){return '0x'+BigInt(decStr).toString(16);}
+let _vHexState=null; // {kind:'binText'|'bitNum', mode:'text'|'hex'} for the modal currently open on a binary/BIT cell - null otherwise
+function updateHexTabButtons(){
+ const bt=$('vTabText'),bh=$('vTabHex');if(!bt||!bh||!_vHexState)return;
+ bt.classList.toggle('on',_vHexState.mode==='text');bh.classList.toggle('on',_vHexState.mode==='hex');
+}
+function switchHexTab(mode){
+ if(!_vHexState||_vHexState.mode===mode)return;
+ const ta=$('vText');
+ if(_vHexState.kind==='bitNum'){
+  if(mode==='text'){
+   if(!/^0x[0-9A-Fa-f]*$/.test(ta.value.trim())){toast('Enter valid hex (0x...) first.',true);return;}
+   ta.value=hexToBitNumber(ta.value.trim());
+  } else {
+   if(!/^\d+$/.test(ta.value.trim())){toast('Enter a whole, non-negative number first.',true);return;}
+   ta.value=bitNumberToHex(ta.value.trim());
+  }
+ } else if(mode==='text'){
+  const decoded=hexToStrictText(ta.value); // leaving hex mode, so the box currently holds hex
+  if(decoded==null){toast('This value is not valid UTF-8 text - edit it as Hex instead.',true);return;}
+  ta.value=decoded;
+ } else {
+  ta.value=textToHex(ta.value); // leaving text mode, so the box currently holds text
+ }
+ _vHexState.mode=mode;updateHexTabButtons();
+}
+function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;const ta=$('vText');const sel=$('vSelect');const multi=$('vMulti');const dt=$('vDate');const hexTabs=$('vHexTabs');const img=$('vImg');
+ if(!window._floatingMaxState||!window._floatingMaxState.mView){const box=$('mView').querySelector('.box');box.style.width=opts.dateType?'380px':'1000px';box.style.maxWidth=opts.dateType?'600px':'95vw';const growable=!opts.options&&!opts.dateType;box.style.height=growable?'640px':'';
+  box.style.minHeight=opts.dateType?'0':'';
+  box.style.resize=opts.dateType?'none':'';
+ }
+ ta.style.display='none';sel.style.display='none';multi.style.display='none';dt.style.display='none';hexTabs.style.display='none';img.style.display='none';img.removeAttribute('src');_vHexState=null;
+ // Checkbox mode: SET columns, whose valid values are any comma-joined COMBINATION of the
+ // column's defined members - unlike ENUM (exactly one value), a single dropdown can't represent
+ // that, but a checkbox per member can, mirroring how Heidi/Workbench edit SET data.
+ if(opts.multiOptions&&opts.multiOptions.length){
+  multi.style.display='block';multi.innerHTML='';
+  const cur=new Set((text||'').split(',').filter(s=>s!==''));
+  opts.multiOptions.forEach(o=>{
+   const lbl=document.createElement('label');lbl.style.cssText='display:flex;align-items:center;gap:6px;padding:3px 2px';
+   const cb=document.createElement('input');cb.type='checkbox';cb.value=o;cb.checked=cur.has(o);
+   lbl.appendChild(cb);lbl.appendChild(document.createTextNode(o===''?'(empty string)':o));
+   multi.appendChild(lbl);
+  });
  // Dropdown mode: used for ENUM columns (their real defined values) and tinyint(1) "boolean"
  // columns (treated as a 2-value enum of '0'/'1') - picking from the actual valid values is
  // safer and faster than free-typing, and can't produce an out-of-range value by mistake.
- if(opts.options&&opts.options.length){
-  ta.style.display='none';sel.style.display='block';sel.innerHTML='';
+ } else if(opts.options&&opts.options.length){
+  sel.style.display='block';sel.innerHTML='';
   opts.options.forEach(o=>{const op=document.createElement('option');op.value=o;op.textContent=(o===''?'(empty string)':o);sel.appendChild(op);});
   sel.value=(text==null?opts.options[0]:text);
+ // Native date/datetime/time picker - a real calendar/clock widget instead of guessing at format
+ // order, matching Heidi/Workbench. Only reached when editWidgetFor() already confirmed the
+ // current value round-trips through it (or the cell is empty), so there's nothing to lose here.
+ } else if(opts.dateType){
+  dt.type=opts.dateType;dt.style.display='block';
+  dt.value=mysqlToNativeDate(text,opts.dateType);
+ // BIT column: offer Number/Hex, defaulting to Number (Heidi/Workbench-style) - see the block
+ // comment above hexToBitNumber for why this conversion needs no round-trip validity check.
+ } else if(opts.bitNumeric){
+  ta.style.display='block';hexTabs.style.display='flex';
+  $('vTabText').textContent='Number';
+  _vHexState={kind:'bitNum',mode:'text'};
+  ta.value=hexToBitNumber(text==null?'0x0':text);
+  updateHexTabButtons();
+ // Binary/BLOB column (not BIT): offer both Text and Hex as explicit edit modes - see the block
+ // comment above hexToStrictText for why Text is only ever offered when provably lossless.
+ } else if(opts.hexText){
+  ta.style.display='block';hexTabs.style.display='flex';
+  $('vTabText').textContent='Text';
+  const rawHex=(text==null?'0x':text);
+  const decoded=hexToStrictText(rawHex);
+  _vHexState={kind:'binText',mode:decoded!=null?'text':'hex'};
+  ta.value=decoded!=null?decoded:rawHex;
+  updateHexTabButtons();
+  const bytes=hexToBytes(rawHex);
+  if(bytes.length<=MAX_HEXTEXT_BYTES){
+   const mime=detectImageMime(bytes);
+   if(mime){img.src='data:'+mime+';base64,'+bytesToBase64(bytes);img.style.display='block';}
+  }
  } else {
-  ta.style.display='block';sel.style.display='none';
+  ta.style.display='block';
   ta.value=(text==null?'':text);ta.readOnly=!!opts.readonly;
  }
  const a=$('vActions');a.innerHTML='';const add=(label,cls,fn)=>{const b=document.createElement('button');b.textContent=label;if(cls)b.className=cls;b.onclick=fn;a.appendChild(b);};
- const getVal=()=>opts.options?sel.value:ta.value;
- if(!opts.options){
+ const getVal=()=>{
+  if(opts.multiOptions&&opts.multiOptions.length)return [...multi.querySelectorAll('input:checked')].map(cb=>cb.value).join(',');
+  if(opts.dateType)return nativeDateToMysql(dt.value,opts.dateType);
+  // bitNumeric: both tabs pass their box content straight through unconverted - a plain decimal
+  // string goes unquoted via litForCol's existing BIT-integer path, a "0x.." string goes unquoted
+  // via lit()'s existing hex-literal passthrough. Neither needs re-encoding here.
+  if(opts.bitNumeric)return ta.value;
+  if(opts.hexText)return _vHexState.mode==='text'?textToHex(ta.value):ta.value;
+  return opts.options?sel.value:ta.value;
+ };
+ if(!opts.options&&!opts.multiOptions&&!opts.dateType){
   add('Copy','',()=>{navigator.clipboard.writeText(ta.value);log('Copied to clipboard.');});
   // Offer to pretty-print, but only when the content genuinely parses as a JSON object/array -
   // a bare number or quoted string technically "parses" too, but reformatting those does nothing
-  // useful, so they're excluded.
-  let isJson=false;try{const p=JSON.parse(ta.value);isJson=(p!==null&&typeof p==='object');}catch(e){}
-  if(isJson&&!opts.readonly)add('Format JSON','',()=>{try{ta.value=JSON.stringify(JSON.parse(ta.value),null,2);}catch(e){}});
+  // useful, so they're excluded. Not offered for binary/BIT cells - decoded/hex/numeric content
+  // is never JSON.
+  if(!opts.hexText&&!opts.bitNumeric){
+   let isJson=false;try{const p=JSON.parse(ta.value);isJson=(p!==null&&typeof p==='object');}catch(e){}
+   if(isJson&&!opts.readonly)add('Format JSON','',()=>{try{ta.value=JSON.stringify(JSON.parse(ta.value),null,2);}catch(e){}});
+  }
  }
  if(opts.onNull)add('Set NULL','',()=>{opts.onNull();hide('mView');});
  if(opts.onSave)add('Save','go',()=>{opts.onSave(getVal());hide('mView');});
  add('Close','',()=>hide('mView'));
- show('mView');setTimeout(()=>{if(opts.options){sel.focus();}else if(!opts.readonly){ta.focus();}},60);}
+ show('mView');setTimeout(()=>{if(opts.multiOptions){}else if(opts.options){sel.focus();}else if(opts.dateType){dt.focus();}else if(!opts.readonly){ta.focus();}},60);}
 // Column type info, fetched once per table (lazily, only when the user actually starts editing
 // a cell there) and cached on the tab, so browsing/running queries never pays this extra cost -
 // only editing a table-backed result does.
@@ -4288,11 +4508,12 @@ async function getColType(id,colName){
  }
  return t.colTypes[colName]||null;
 }
-// Parses MySQL's enum('a','b','c') column-type text into the actual list of values. Enum values
-// can contain commas and escaped quotes (enum('a,b','c''d')), so this can't just split on ',' -
-// it walks the string tracking whether it's currently inside a quoted value.
-function parseEnumOptions(colType){
- const m=colType.match(/^enum\((.*)\)$/i);if(!m)return [];
+// Parses MySQL's enum('a','b','c') or set('a','b','c') column-type text into the actual list of
+// values - both share the exact same parenthesized-quoted-list syntax. Values can contain commas
+// and escaped quotes (enum('a,b','c''d')), so this can't just split on ',' - it walks the string
+// tracking whether it's currently inside a quoted value.
+function parseQuotedOptionList(colType){
+ const m=colType.match(/^(?:enum|set)\((.*)\)$/i);if(!m)return [];
  const out=[];let cur='',inQ=false;
  for(let i=0;i<m[1].length;i++){
   const c=m[1][i];
@@ -4308,12 +4529,49 @@ function parseEnumOptions(colType){
  out.push(cur);
  return out;
 }
+// Picks the right editing widget for a column - a single-select dropdown of its real defined
+// values for ENUM (typos aren't possible), a checkbox per member for SET (its value is any
+// comma-joined COMBINATION of members, which a single dropdown can't represent), the same
+// 2-value on/off dropdown as ENUM for tinyint(1)/BOOLEAN, a native date/time picker for DATE/
+// DATETIME/TIMESTAMP/TIME (matching Heidi/Workbench's calendar widget instead of guessing at
+// format order) - or nothing (plain free text) for everything else. Shared by editCell (existing
+// rows) and editIns (new rows) so both get the same picker instead of only already-saved rows.
+// curVal is needed only for the date/time case: the picker is offered exclusively when the
+// CURRENT value actually round-trips through it (see mysqlToNativeDate), so a legacy zero-date
+// or other value it can't represent falls back to plain text instead of risking Save silently
+// discarding it the moment the dialog opens.
+// Unlike the Editor (which has real per-column binary/BIT flags from the server's own result-set
+// metadata - see bitCols/binaryCols in main.rs), this PS backend shells out to mysql.exe and has
+// no equivalent metadata channel to hand back per query. So BIT/binary detection here goes
+// entirely through getColType()'s already-existing information_schema.COLUMNS lookup (same
+// mechanism ENUM/SET/tinyint(1)/date detection already uses) instead of a flag on the row data -
+// which works for exactly the case that matters (an editable, table-bound grid always has a real
+// column to look up), plus the same value-shape fallback ("looks like 0x...") the rest of this
+// app already uses for a column whose declared type doesn't say binary but whose value does.
+async function editWidgetFor(id,colName,curVal){
+ const colType=await getColType(id,colName);
+ if(colType&&/^enum\(/i.test(colType))return {options:parseQuotedOptionList(colType)};
+ if(colType&&/^set\(/i.test(colType))return {multiOptions:parseQuotedOptionList(colType)};
+ if(colType&&/^tinyint\(1\)/i.test(colType))return {options:['0','1']};
+ let dateType=null;
+ if(colType&&/^date$/i.test(colType))dateType='date';
+ else if(colType&&/^(datetime|timestamp)/i.test(colType))dateType='datetime-local';
+ else if(colType&&/^time/i.test(colType))dateType='time';
+ if(dateType&&(curVal==null||curVal===''||mysqlToNativeDate(curVal,dateType)))return {dateType};
+ // BIT columns get their own Number/Hex toggle (Heidi/Workbench show these as a plain numeric
+ // value, not a byte dump) - see the block comment above hexToBitNumber.
+ if(colType&&/^bit\(/i.test(colType))return {bitNumeric:true};
+ // True binary/BLOB columns (not BIT) always render as "0x.." hex; offering a Text tab too lets
+ // you type/read things like bcrypt hashes or tokens directly instead of hand-converting to hex,
+ // while Hex stays available (and is all that's offered) for genuinely non-text bytes like images.
+ const flaggedBinary=colType&&/^(binary|varbinary|(tiny|medium|long)?blob)\b/i.test(colType);
+ const looksHex=typeof curVal==='string'&&/^0x[0-9A-Fa-f]+$/.test(curVal);
+ if(flaggedBinary||looksHex)return {hexText:true};
+ return {};
+}
 async function editCell(td,id,ri,ci){clearTimeout(clickTimer);const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
- const colType=await getColType(id,t.cols[ci]);
- let options=null;
- if(colType&&/^enum\(/i.test(colType)){options=parseEnumOptions(colType);}
- else if(colType&&/^tinyint\(1\)/i.test(colType)){options=['0','1'];}
- viewText('Cell - '+t.cols[ci]+(cur===null?'  (currently NULL)':''),cur,{onSave:v=>setUpd(id,ri,ci,v),onNull:()=>setUpd(id,ri,ci,null),options});}
+ const ew=await editWidgetFor(id,t.cols[ci],cur);
+ viewText('Cell - '+t.cols[ci]+(cur===null?'  (currently NULL)':''),cur,{onSave:v=>setUpd(id,ri,ci,v),onNull:()=>setUpd(id,ri,ci,null),...ew});}
 function setUpd(id,ri,ci,v){const t=T(id);if(!t.pending){toast('This result is not editable (no primary key detected).',true);return;}if(v===null&&t.pk&&t.pk.indexOf(t.cols[ci])>=0){toast('Column "'+t.cols[ci]+'" is part of the primary key and cannot be set to NULL.',true);return;}const key=ri+':'+ci;if(v===t.rows[ri][ci])delete t.pending.upd[key];else t.pending.upd[key]=v;renderGrid(id);}
 let clickTimer=null;
 let gridFocus={}; // per-tab: {ri, ci} of the currently keyboard-focused cell
@@ -4419,8 +4677,9 @@ function toggleDel(id,ri){const t=T(id);if(t.pending.del.has(ri))t.pending.del.d
 function deleteSel(id){const t=T(id);if(!t.pk){toast('This result is not editable (no primary key).',true);return;}const ids=[...(t.selected||[])];if(!ids.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}ids.forEach(ri=>t.pending.del.add(ri));renderGrid(id);log(ids.length+' row(s) marked for deletion - click Apply to commit.');}
 function addRow(id){const t=T(id);t.pending.ins.push({});renderGrid(id);}
 function delIns(id,ii){const t=T(id);t.pending.ins.splice(ii,1);renderGrid(id);}
-function editIns(td,id,ii,col){clearTimeout(clickTimer);const t=T(id);const cur=t.pending.ins[ii][col];
- viewText('New row - '+col,(cur==null?'':cur),{onSave:v=>{t.pending.ins[ii][col]=v;renderGrid(id);},onNull:()=>{t.pending.ins[ii][col]=null;renderGrid(id);}});}
+async function editIns(td,id,ii,col){clearTimeout(clickTimer);const t=T(id);const cur=t.pending.ins[ii][col];
+ const ew=await editWidgetFor(id,col,cur);
+ viewText('New row - '+col,(cur==null?'':cur),{onSave:v=>{t.pending.ins[ii][col]=v;renderGrid(id);},onNull:()=>{t.pending.ins[ii][col]=null;renderGrid(id);},...ew});}
 function insCellMenu(e,id,ii,col){e.preventDefault();const t=T(id);const cur=t.pending.ins[ii][col];
  const items=[['Copy value',()=>{navigator.clipboard.writeText(cur==null?'':String(cur));log('Copied value.');}],
   ['Paste row into this new row',()=>pasteRowIntoIns(id,ii)],
