@@ -31,7 +31,7 @@ not — see below.
 | `PluginDir` | where the client looks for its authentication plugins | nothing |
 | `BatchFailureNote` | what a failed batch may honestly claim about rollback | nothing |
 | `DumpTarget` | restoring a dump into a chosen target database, not the one it came from | nothing |
-| `ResultRows` | cutting result rows out of `mysql --batch` output: CR in values, NULL vs text | nothing |
+| `ResultRows` | reading rows out of `mysql --xml` output, captured from both clients: NULL vs the text `'NULL'`, CR/LF, binary, empty results | nothing |
 | `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
 | `ConnSslCa` | that every save and load of a connection carries its CA certificate | `node` on PATH |
 | `TableDesigner` | that editing a column keeps everything the designer does not show | `node` on PATH |
@@ -98,6 +98,28 @@ pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
 
 The suite is expected to pass unchanged against MariaDB 12.x and MySQL 8.x alike.
 
+### And with MySQL's own `mysql.exe`
+
+The *client* matters as much as the server, because every query goes through it:
+
+- Without a character set it takes the console code page (cp850 here), so text written through
+  it was converted wrongly. The options file now sets `default-character-set=utf8mb4`.
+- On Windows it writes every LF as CRLF, value bytes included. The XML reader undoes that.
+
+The app takes the client from its `config.json`, so point it elsewhere with a scratch `APPDATA`
+rather than touching your own settings. The script prints which client the server is using.
+
+```powershell
+$scratch = "$env:TEMP\nobs-mysql-client"
+New-Item -ItemType Directory -Force "$scratch\NOBSSQL" | Out-Null
+'{"mysql_bin":"C:/Program Files/MySQL/MySQL Server 8.0/bin/mysql.exe","mysqldump_bin":"C:/Program Files/MySQL/MySQL Server 8.0/bin/mysqldump.exe"}' |
+    Set-Content "$scratch\NOBSSQL\config.json"
+$env:APPDATA = $scratch; pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
+```
+
+The CA and connection-loss checks use the downloaded client under the real `APPDATA` directly, so
+in this run they say they skipped.
+
 ### The CA certificate checks
 
 Set `NOBS_TEST_SERVER_CA` to the test server's own CA to run the one check that matters most:
@@ -137,7 +159,16 @@ Every check is a regression test for a bug that actually shipped:
 - **A cancelled export says `CANCELLED`**, never a `FAILED` line with no reason given.
 - **Compare reports rows that exist only on the target**, including when nothing is missing —
   the case that otherwise reads as "no row differences".
+- **Compare copies every value exactly**, through all three write paths (insert-all, apply,
+  apply-diff): the text `'NULL'` (which `--batch` output turned into NULL), text that looks like
+  hex (written as bytes when the value's shape decided), an empty binary value (written as the
+  characters `0x`), a binary key, CR/LF, a NUL inside text (which XML output turns into a space),
+  BIT, spatial, and a latin1 target. The diff also sees NULL against `''` and `'null'` against
+  `'NULL'`.
 - **Paging a cursor delivers every row exactly once**, with no row dropped at a page boundary.
+- **Result values arrive as themselves**: NULL vs `'NULL'`, CR/LF inside text, empty vs NULL
+  binary, markup characters, a 70,000-character value, column names of an empty result (asked for
+  again only when the statement is safe to repeat), and the first of several result sets.
 - **Every kind of input stores exactly the bytes it should.** The byte-fidelity matrix, below.
 
 ### The byte-fidelity matrix
@@ -151,11 +182,16 @@ back, and comparing bytes — so that comparison is a test now.
 
 It builds each statement with the **real** editor functions lifted out of `NOBSSQL.ps1`
 (`textToHex`, `normalizeHexInput`, `hexCellValueForSave`, `lit`), sends it through the app's own
-API, and compares `HEX(col)` against the bytes that went in. Twenty-two inputs: quotes,
+API, and compares `HEX(col)` against the bytes that went in. Twenty-four inputs: quotes,
 backslashes including a trailing one, four-byte emoji, CJK, RTL, embedded newlines and tabs,
-injection-shaped text, 64 KB, text that looks like hex, and on the hex side app-style,
-Workbench-spaced, line-wrapped, unprefixed, uppercase, a lone NUL byte, bytes that are not valid
-UTF-8, and empty.
+Windows line breaks, a lone CR, injection-shaped text, 64 KB, text that looks like hex, and on the
+hex side app-style, Workbench-spaced, line-wrapped, unprefixed, uppercase, a lone NUL byte, bytes
+that are not valid UTF-8, and empty.
+
+The statements go through `/api/script`, as the grid's Apply sends them, and the text cases are
+also written through `strLit` into a real utf8mb4 text column: a BLOB stores whatever bytes
+arrive, so on its own it cannot see a client converting from the wrong character set, and
+`mysql.exe` reading a script turns CR LF into LF unless the CR is escaped.
 
 Two of those cases guard specific fixes and are worth not weakening:
 

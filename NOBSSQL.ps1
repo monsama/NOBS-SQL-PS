@@ -57,7 +57,7 @@ $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string
 # /api/fetch-cursor-batch (possibly from a DIFFERENT pooled runspace than the one that opened
 # it - see the RUNSPACE POOL SETUP section near the bottom, which shares this dictionary the
 # same way it already shares $script:RunningQueries). Keyed by a generated cursorId; each value
-# is the pscustomobject built by Open-QueryCursor (Process/Reader/Headers/Pending/RequestId/
+# is the pscustomobject built by Open-QueryCursor (Process/Reader/Rows/Headers/RequestId/
 # Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
 $script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
@@ -264,6 +264,11 @@ function New-Cnf {
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
     if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
+    # Every statement this app sends is UTF-8. Without this MySQL's mysql.exe takes the console code
+    # page (cp850 here), so text written through it was converted as if it were cp850: an accented
+    # letter was refused by a latin1 column, and stored as other characters elsewhere. MariaDB's
+    # client happens to default to utf8mb4. A --default-character-set on the command line still takes precedence.
+    [void]$sb.AppendLine('default-character-set=utf8mb4')
     foreach ($l in (Get-SslLines $conn.ssl $null $conn.sslCa)) { [void]$sb.AppendLine($l) }
     $pluginDir = Get-PluginDir
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
@@ -353,35 +358,17 @@ function Run-Stdin {
     }
 }
 
-# Decode one field from the tab-separated output the mysql CLI produces.
-function ConvertFrom-BatchField {
-    param([string]$s)
-    if ($s.IndexOf('\') -lt 0) { return $s }
-    $sb=New-Object System.Text.StringBuilder
-    for($i=0;$i -lt $s.Length;$i++){ $c=$s[$i]
-        if($c -eq '\' -and $i -lt $s.Length-1){ $n=$s[$i+1]; $i++
-            switch($n){ 't'{[void]$sb.Append("`t")} 'n'{[void]$sb.Append("`n")} 'r'{[void]$sb.Append("`r")} '0'{[void]$sb.Append([char]0)} default{[void]$sb.Append($n)} }
-        } else { [void]$sb.Append($c) }
-    }
-    $sb.ToString()
-}
 $script:ReservedSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@('accessible','add','all','alter','analyze','and','as','asc','asensitive','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','cube','cume_dist','current_date','current_time','current_timestamp','current_user','cursor','database','databases','day_hour','day_microsecond','day_minute','day_second','dec','decimal','declare','default','delayed','delete','dense_rank','desc','describe','deterministic','distinct','distinctrow','div','double','drop','dual','each','else','elseif','empty','enclosed','escaped','except','exists','exit','explain','false','fetch','first_value','float','float4','float8','for','force','foreign','from','fulltext','function','generated','get','grant','group','grouping','groups','having','high_priority','hour_microsecond','hour_minute','hour_second','if','ignore','in','index','infile','inner','inout','insensitive','insert','int','int1','int2','int3','int4','int8','integer','intersect','interval','into','io_after_gtids','io_before_gtids','is','iterate','join','json_table','key','keys','kill','lag','last_value','lateral','lead','leading','leave','left','like','limit','linear','lines','load','localtime','localtimestamp','lock','long','longblob','longtext','loop','low_priority','master_bind','master_ssl_verify_server_cert','match','maxvalue','mediumblob','mediumint','mediumtext','middleint','minute_microsecond','minute_second','mod','modifies','natural','not','no_write_to_binlog','nth_value','ntile','null','numeric','of','on','optimize','optimizer_costs','option','optionally','or','order','out','outer','outfile','over','partition','percent_rank','precision','primary','procedure','purge','range','rank','read','reads','read_write','real','recursive','references','regexp','release','rename','repeat','replace','require','resignal','restrict','return','revoke','right','rlike','row','rows','row_number','schema','schemas','second_microsecond','select','sensitive','separator','set','show','signal','smallint','spatial','specific','sql','sqlexception','sqlstate','sqlwarning','sql_big_result','sql_calc_found_rows','sql_small_result','ssl','starting','stored','straight_join','system','table','terminated','then','tinyblob','tinyint','tinytext','to','trailing','trigger','true','undo','union','unique','unlock','unsigned','update','usage','use','using','utc_date','utc_time','utc_timestamp','values','varbinary','varchar','varcharacter','varying','virtual','when','where','while','window','with','write','xor','year_month','zerofill'))
 # True if a table/column name must be backtick-quoted (reserved word or odd characters).
 function Needs-Quote { param([string]$n) if ($n -eq '' -or $n -notmatch '^[A-Za-z_$][A-Za-z0-9_$]*$') { return $true } return $script:ReservedSet.Contains($n.ToLower()) }
-$script:CtrlChars = [char[]]@([char]0,[char]1,[char]2,[char]3,[char]4,[char]5,[char]6,[char]7,[char]8,[char]11,[char]12,[char]14,[char]15,[char]16,[char]17,[char]18,[char]19,[char]20,[char]21,[char]22,[char]23,[char]24,[char]25,[char]26,[char]27,[char]28,[char]29,[char]30,[char]31)
 # Result rows are read off mysql.exe's stdout with a byte-preserving Latin-1 reader (see
-# Open-QueryCursor), so every char in a raw field is exactly one byte the server sent. These two
-# encodings turn that back into either real text or an honest hex representation.
+# NobsXmlRows), so every char in a raw field is exactly one byte the server sent.
 #
 # Reading stdout as UTF-8 instead - which is what this did - silently destroyed every byte that
 # was not valid UTF-8: the .NET decoder replaced each one with U+FFFD before any of this code saw
 # it. A VARBINARY holding 00 FF 10 came back as 0x00EFBFBD10 (EFBFBD being U+FFFD re-encoded), and
 # because the grid writes a cell back exactly as it displays it, saving that row committed the
 # corruption to disk. Verified against a live server, before and after.
-#
-# --binary-as-hex on the client would have been the obvious fix and is not usable here: it renders
-# a NULL binary column and an empty one identically, both as "0x", losing the NULL/empty
-# distinction this app is careful about everywhere else.
 $script:RawEnc    = [System.Text.Encoding]::GetEncoding(28591)              # ISO-8859-1: byte <-> char, lossless
 $script:StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)     # throws rather than substituting
 
@@ -394,29 +381,13 @@ function ConvertFrom-RawText {
     try { return $script:StrictUtf8.GetString($script:RawEnc.GetBytes($s)) } catch { return $s }
 }
 
-# Turn a raw CLI cell value into a real value (the literal NULL marker becomes an actual null).
-function CellVal { param($raw)
-    # -ceq, not -eq: PowerShell's -eq ignores case, so the escaped newline \n matched \N and a value
-    # that was a single line feed came back as NULL - and so did the text 'null'.
-    if($raw -ceq '\N' -or $raw -ceq 'NULL'){ return $null }
-    $v=ConvertFrom-BatchField $raw
-    if($v.Length -eq 0){ return $v }
-    $b=$script:RawEnc.GetBytes($v)
-    # Valid UTF-8 means it is text the user should see as text - emoji, CJK, accents and all.
-    # Anything else is genuinely binary, and hex is this app's display encoding for binary (the
-    # same 0x.. form SqlValLit already knows how to send back unquoted).
-    $text=$null
-    try { $text=$script:StrictUtf8.GetString($b) } catch { $text=$null }
-    if($null -eq $text){ return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
-    # Valid UTF-8 can still be a byte the grid should not print - a BIT column's 0x01, say - so
-    # control characters keep going out as hex exactly as they did before.
-    if($text.IndexOfAny($script:CtrlChars) -ge 0){ return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
-    return $text
-}
 # Quote an identifier (table/column) with backticks when needed - prevents broken/injected SQL.
 function SqlId  { param($x) $s=[string]$x; if (Needs-Quote $s) { '`' + ($s -replace '`','``') + '`' } else { $s } }
 # Quote a value as a SQL string literal (single quotes, escaped) - or NULL.
-function SqlLit { param($x) if($null -eq $x){'NULL'} else { "'" + ((([string]$x) -replace '\\','\\') -replace "'","''") + "'" } }
+# CR and NUL are written as escapes. mysql.exe reading a script (stdin, or source) turns every CR LF
+# into LF, so a raw CR before a line feed was silently dropped - measured with both clients. A raw
+# NUL makes it refuse the whole statement unless --binary-mode is on.
+function SqlLit { param($x) if($null -eq $x){'NULL'} else { "'" + ((((([string]$x) -replace '\\','\\') -replace "'","''") -replace "`r",'\r') -replace "`0",'\0') + "'" } }
 # Run-Query2 represents binary/control-character values (e.g. a bit(1) byte, or blob content
 # with unprintable bytes) as hex text like "0x00" for safe display - that is NOT a real value,
 # it's our own display encoding. If we quote it with SqlLit as a string, MySQL tries to store
@@ -428,6 +399,77 @@ function SqlValLit { param($x)
     $s = [string]$x
     if($s -match '^0x[0-9A-Fa-f]+$'){ return $s }
     return (SqlLit $x)
+}
+# SqlValLit guesses from the value's shape, which is wrong both ways for data being copied: a text
+# column holding '0x41' was written as the byte A, and an empty binary value - read as the bare
+# 0x - was written as the two characters 0x. Where the table is known, ask it instead. $Binary is
+# whether the column is one mysql.exe --binary-as-hex prints as 0x.. (see Get-BinaryColumnSet).
+function SqlValFor { param($x, [bool]$Binary)
+    if($null -eq $x){ return 'NULL' }
+    $s = [string]$x
+    if($Binary -and $s -cmatch '^0x([0-9A-Fa-f]*)$'){ if($matches[1].Length -eq 0){ return "X''" } return $s }
+    return (SqlLit $s)
+}
+# The columns of a table whose values come back as 0x.. hex (binary strings, BIT, and spatial
+# types - checked against both clients). $null if the table cannot be read.
+function Get-BinaryColumnSet { param($conn,$db,$table)
+    $types = 'binary','varbinary','tinyblob','blob','mediumblob','longblob','bit',
+             'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection','geomcollection'
+    $r = Run-Query2 $conn ("SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table)) $null
+    if(-not $r.ok -or $r.rows.Count -eq 0){ return $null }
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach($row in $r.rows){ if($types -contains ([string]$row[1]).ToLower()){ [void]$set.Add([string]$row[0]) } }
+    return ,$set
+}
+# SELECT * for rows that are about to be copied, exactly. mysql.exe --xml writes a NUL byte inside
+# a text value as a space, so a copy made from that output would change the value. Each text
+# column therefore also comes back, in the same statement, as hex - but only where it holds a
+# NUL, which leaves the extra columns NULL (and cheap) everywhere else - and those values replace
+# the ones XML mangled.
+function Get-ExactRows { param($conn,$db,$table,$where,$RequestId)
+    $types = 'char','varchar','tinytext','text','mediumtext','longtext'
+    $cr = Run-Query2 $conn ("SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " ORDER BY ORDINAL_POSITION") $null
+    if(-not $cr.ok){ return $cr }
+    $textCols = @($cr.rows | Where-Object { $types -contains ([string]$_[1]).ToLower() } | ForEach-Object { [string]$_[0] })
+    $extra = ''
+    for($i=0; $i -lt $textCols.Count; $i++){
+        $c = SqlId $textCols[$i]
+        $extra += ", IF(LOCATE(0x00, CAST(CONVERT($c USING utf8mb4) AS BINARY)) > 0, HEX(CONVERT($c USING utf8mb4)), NULL) AS ``nobs_nul_$i``"
+    }
+    $r = Run-Query2 $conn ("SELECT *$extra FROM " + (SqlId $db) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $RequestId
+    if(-not $r.ok -or $textCols.Count -eq 0){ return $r }
+    $n = @($r.columns).Count - $textCols.Count
+    if($n -le 0){ return @{ ok=$true; columns=@(); rows=(New-Object System.Collections.ArrayList) } }
+    $cols = @(@($r.columns)[0..($n-1)])
+    $idx = @($textCols | ForEach-Object { [Array]::IndexOf($cols, $_) })
+    $rows = New-Object System.Collections.ArrayList
+    foreach($row in $r.rows){
+        $out = New-Object string[] $n
+        [Array]::Copy($row, $out, $n)
+        for($i=0; $i -lt $textCols.Count; $i++){
+            $hex = $row[$n + $i]
+            if($null -ne $hex -and $idx[$i] -ge 0){
+                $bytes = New-Object byte[] ($hex.Length / 2)
+                for($b=0; $b -lt $bytes.Length; $b++){ $bytes[$b] = [Convert]::ToByte($hex.Substring($b*2, 2), 16) }
+                $out[$idx[$i]] = [Text.Encoding]::UTF8.GetString($bytes)
+            }
+        }
+        [void]$rows.Add($out)
+    }
+    return @{ ok=$true; columns=$cols; rows=$rows }
+}
+# A WHERE clause matching a chunk of primary-key tuples, each value written for its column's type.
+function Get-PkWhere { param($pkCols, $chunk, $binSet)
+    $bin = @($pkCols | ForEach-Object { $binSet.Contains([string]$_) })
+    if($pkCols.Count -eq 1){
+        return (SqlId $pkCols[0]) + ' IN (' + (($chunk | ForEach-Object { SqlValFor $_[0] $bin[0] }) -join ',') + ')'
+    }
+    $tuples = ($chunk | ForEach-Object { $row = $_; '(' + ((0..($pkCols.Count-1) | ForEach-Object { SqlValFor $row[$_] $bin[$_] }) -join ',') + ')' }) -join ','
+    return '(' + (($pkCols | ForEach-Object { SqlId $_ }) -join ',') + ') IN (' + $tuples + ')'
+}
+# One VALUES tuple, each value written for its column's type.
+function Get-ValuesTuple { param($cols, $row, $binSet)
+    '(' + ((0..($cols.Count-1) | ForEach-Object { SqlValFor $row[$_] ($binSet.Contains([string]$cols[$_])) }) -join ',') + ')'
 }
 # Pull the first meaningful error line out of tool output.
 function FirstErr { param($e)
@@ -544,41 +586,104 @@ function J-RowsFast {
 }
 
 # --- run a query, return a hashtable with columns + row-arrays (or error) ---
+# Output options every result-reading mysql.exe call uses. See NobsXmlRows for why XML: it is the
+# only format in which NULL and the text 'NULL' differ. --binary-as-hex keeps binary and BIT values
+# exact (XML turns a NUL byte into a space) and renders them as 0x.., as the Tauri build does.
+function Get-ResultArgs {
+    if (-not (Test-ClientHasBinaryAsHex)) {
+        throw "This mysql.exe ($script:MysqlPath) does not support --binary-as-hex, which this app needs to read binary values without losing bytes. Open Settings and download the client tools, or select a newer MySQL (8.0.19 or later) or MariaDB client."
+    }
+    return @('--xml','--binary-as-hex','--default-character-set=utf8mb4')
+}
+# Cached against the path it probed, like Test-ClientIsMariaDB. MariaDB's client reports an unknown
+# option and still prints its version with exit code 0, so the text is what tells.
+function Test-ClientHasBinaryAsHex {
+    $path = [string]$script:MysqlPath
+    if ($script:ClientBinHex -and $script:ClientBinHex.Path -eq $path) { return $script:ClientBinHex.Ok }
+    $ok = $true
+    if ($path -and (Test-Path $path)) {
+        try { $ok = -not ((& $path --binary-as-hex --version 2>&1 | Out-String) -match '(?i)unknown (option|variable)') } catch { }
+    }
+    $script:ClientBinHex = @{ Path = $path; Ok = $ok }
+    return $ok
+}
+# Whether running $sql a second time is harmless: Test-SqlReadOnly, minus the statements that
+# allows but that change something outside this one session.
+function Test-SqlSafeToRerun { param([string]$sql)
+    if (-not (Test-SqlReadOnly $sql)) { return $false }
+    $s = [regex]::Replace($sql, '/\*.*?\*/', ' ', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+    foreach ($stmt in ($s -split ';')) {
+        $t = $stmt.Trim()
+        if (-not $t) { continue }
+        $w = (($t -split '\s+',2)[0]).ToUpper()
+        if ($w -in 'ANALYZE','CHECK','CHECKSUM') { return $false }
+        if ($w -eq 'SET' -and $t -match '(?i)\b(GLOBAL|PERSIST|PERSIST_ONLY|PASSWORD)\b|@@global') { return $false }
+    }
+    return $true
+}
+# The column names of a result that came back without rows, which XML output does not carry.
+# --quick --batch prints the header even for an empty result. This runs the statement again, so
+# only for one that is safe to repeat; otherwise the names are simply not known ($null).
+function Get-ResultHeaders { param($conn,$sql,$db)
+    if (-not (Test-SqlSafeToRerun $sql)) { return $null }
+    Initialize-DumpDb
+    $cnf = New-Cnf $conn
+    $sa = New-SqlArg $sql
+    $p = $null
+    try {
+        $a = @("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
+        if ($db) { $a += "--database=$db" }
+        $a += @("-e",$sa.arg)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $script:MysqlPath; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $psi.Arguments = Format-Args $a
+        $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
+        $et = $p.StandardError.ReadToEndAsync()
+        $line = $null
+        try { $line = [NobsLf]::ReadLine($p.StandardOutput) } catch { $line = $null }
+        # Only the header is wanted; if rows have appeared since, there is no need to read them.
+        try { if (-not $p.HasExited) { $p.Kill() } } catch { }
+        $p.WaitForExit()
+        if ($null -eq $line -or $line -eq '') { return $null }
+        # MySQL's client ends lines with CRLF on Windows (see NobsXmlRows).
+        if (-not (Test-ClientIsMariaDB) -and $line.EndsWith("`r")) { $line = $line.Substring(0, $line.Length - 1) }
+        return ,@($line.Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
+    } finally {
+        if ($p) { try { $p.Dispose() } catch { } }
+        Remove-Item $cnf -Force -ErrorAction SilentlyContinue
+        if ($sa.file) { Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
+    }
+}
+function Get-InnerMessage { param($err) $e = $err.Exception; while ($e.InnerException) { $e = $e.InnerException }; return $e.Message }
+$script:NoHeadersNote = "Query OK. The result was empty, and its column names are not available: mysql.exe only reports them alongside rows, and a statement that changes data is not run a second time to ask."
+
 # Core query runner: send SQL to mysql.exe and parse the result into columns + rows.
+# An empty result comes back without column names unless -WithColumns asks for them, since getting
+# them means running the statement again (see Get-ResultHeaders) and internal callers never need them.
 function Run-Query2 {
-    param($conn,$sql,$db,$RequestId)
+    param($conn,$sql,$db,$RequestId,[switch]$WithColumns)
+    Initialize-DumpDb
+    try { $ra = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf=New-Cnf $conn
     try {
-        $a=@("--defaults-extra-file=$cnf","--batch","--default-character-set=utf8mb4")
+        $a=@("--defaults-extra-file=$cnf") + $ra
         if($db){ $a+="--database=$db" }
         $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
-        # Read losslessly and decode each cell with CellVal, exactly as the editor's cursor path does.
-        # This used to decode the whole output as UTF-8 (destroying any binary value before it was
-        # looked at), split rows on CR as well as LF (mysql does not escape CR inside a value, so
-        # such a row broke in two and its columns shifted), drop empty lines (a row holding one
-        # empty string vanished), and match the NULL marker ignoring case (an escaped newline \n
-        # matched \N, so a value of one line feed read as NULL, as did the text 'null').
+        # Read losslessly, then parse (see NobsXmlRows). This used to parse --batch output, which
+        # cannot tell NULL from the text 'NULL' - so Compare copied such a value as a real NULL.
         $r=Run-Proc $script:MysqlPath $a $RequestId -RawOut
         if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
-        if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
-        $lines=$r.out.Split([char]10)
-        $n=$lines.Count
-        if($n -gt 0 -and $lines[$n-1] -eq ''){ $n-- }   # the output's own final line feed
-        if($n -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
-        $headers=@($lines[0].Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
-        $hCount=$headers.Count
-        $rows=New-Object System.Collections.ArrayList($n)
-        for($i=1;$i -lt $n;$i++){
-            $fields=$lines[$i].Split([char]9)
-            $fCount=$fields.Count
-            $cells=New-Object object[] $hCount
-            for($c=0;$c -lt $hCount;$c++){
-                $cells[$c] = if($c -lt $fCount){ CellVal $fields[$c] } else { $null }
-            }
-            [void]$rows.Add($cells)
-        }
-        return @{ ok=$true; columns=$headers; rows=$rows }
+        $x = New-Object NobsXmlRows (New-Object System.IO.StringReader ([string]$r.out))
+        try { $rows = $x.All() } catch { return @{ ok=$false; err=("Could not read the result from mysql.exe: " + (Get-InnerMessage $_)) } }
+        if(-not $x.HasResultSet){ return @{ ok=$true; columns=@(); rows=$rows } }
+        if($rows.Count -gt 0){ return @{ ok=$true; columns=@($x.Names); rows=$rows } }
+        if(-not $WithColumns){ return @{ ok=$true; columns=@(); rows=$rows } }
+        $h = Get-ResultHeaders $conn $sql $db
+        if($null -eq $h){ return @{ ok=$true; columns=@(); rows=$rows; note=$script:NoHeadersNote } }
+        return @{ ok=$true; columns=$h; rows=$rows }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
 
@@ -619,42 +724,19 @@ function Run-Query2 {
 #  server loop, or a Cancel-triggered kill) clears it, via Close-QueryCursorProc.
 # ============================================================================
 
-# Reads up to $PageSize more data rows from a cursor's stream, using the
-# shared cell-decoding logic (CellVal, defined above) rather than duplicating
-# it. Uses the classic "read one extra row, and hold onto it" trick to learn
-# whether more data remains without blocking on a row that isn't there yet:
-# if the (PageSize+1)th row is read successfully, it is stashed on
-# $cursorObj.Pending (NOT included in this call's returned rows) so the NEXT
-# call to this function starts by consuming it before reading anything new.
+# Reads up to $PageSize more data rows from a cursor's stream. NobsXmlRows reads one row past the
+# page and holds on to it, which is how hasMore is known without waiting on a row that may never
+# come. A result that cannot be parsed ends the page and is reported via ParseError.
 function Read-CursorRows {
     param($cursorObj, [int]$PageSize)
-    $hCount = $cursorObj.Headers.Count
-    $rows = New-Object System.Collections.ArrayList
-    $count = 0
-    if ($null -ne $cursorObj.Pending) {
-        $fields = $cursorObj.Pending.Split([char]9)
-        $cells = New-Object object[] $hCount
-        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
-        [void]$rows.Add($cells)
-        $cursorObj.Pending = $null
-        $count = 1
+    try {
+        $rows = $cursorObj.Rows.Page($PageSize)
+        return @{ rows=$rows; hasMore=$cursorObj.Rows.More }
+    } catch {
+        $cursorObj.ParseError = "Could not read the result from mysql.exe: " + (Get-InnerMessage $_)
+        try { if (-not $cursorObj.Process.HasExited) { $cursorObj.Process.Kill() } } catch {}
+        return @{ rows=(New-Object 'System.Collections.Generic.List[string[]]'); hasMore=$false }
     }
-    while ($count -lt $PageSize) {
-        $line = $null
-        try { $line = [NobsLf]::ReadLine($cursorObj.Reader) } catch { $line = $null }
-        if ($null -eq $line) { return @{ rows=$rows; hasMore=$false } }
-        $fields = $line.Split([char]9)
-        $cells = New-Object object[] $hCount
-        for ($c=0; $c -lt $hCount; $c++) { $cells[$c] = if ($c -lt $fields.Count) { CellVal $fields[$c] } else { $null } }
-        [void]$rows.Add($cells)
-        $count++
-    }
-    # Got a full page - peek one more line to learn whether more data remains.
-    $peek = $null
-    try { $peek = [NobsLf]::ReadLine($cursorObj.Reader) } catch { $peek = $null }
-    if ($null -eq $peek) { return @{ rows=$rows; hasMore=$false } }
-    $cursorObj.Pending = $peek
-    return @{ rows=$rows; hasMore=$true }
 }
 
 # Finishes a cursor: waits for the process to exit (it is expected to be at or
@@ -679,8 +761,8 @@ function Close-QueryCursorProc {
 }
 
 # Starts mysql.exe --quick for an editor query, registers it in RunningQueries
-# under $RequestId (the existing Api-CancelQuery kill path), reads the header
-# line, then reads up to $PageSize+1 rows. If the whole result fit in one page
+# under $RequestId (the existing Api-CancelQuery kill path), then reads up to
+# $PageSize+1 rows. If the whole result fit in one page
 # the process has already finished by the time this returns - it is closed
 # immediately and no cursor is registered. Otherwise a cursorId is generated
 # and the still-open process/reader is registered in $script:OpenCursors for
@@ -689,8 +771,9 @@ function Open-QueryCursor {
     param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
     if ($PageSize -lt 1) { $PageSize = 1000 }
     Initialize-DumpDb
+    try { $ra = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf = New-Cnf $conn
-    $a=@("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
+    $a=@("--defaults-extra-file=$cnf","--quick") + $ra
     if ($db) { $a += "--database=$db" }
     $sqlArg = New-SqlArg $sql
     $a += @("-e",$sqlArg.arg)
@@ -699,8 +782,8 @@ function Open-QueryCursor {
     $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
     # Result rows are parsed out of this stream, so it must not lose bytes. A UTF-8 reader
     # replaces every invalid byte with U+FFFD, which silently destroyed binary column values
-    # before CellVal ever saw them. Latin-1 maps each byte to one char untouched; CellVal then
-    # decides per field whether those bytes are text or binary. stderr stays UTF-8 - it carries
+    # before they were ever looked at. Latin-1 maps each byte to one char untouched; NobsXmlRows
+    # then decides per field whether those bytes are text. stderr stays UTF-8 - it carries
     # human-readable server messages, not row data.
     $psi.StandardOutputEncoding=$script:RawEnc; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
     $psi.Arguments=Format-Args $a
@@ -708,30 +791,28 @@ function Open-QueryCursor {
     $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
     if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
     $cursor=[pscustomobject]@{
-        Process=$p; Reader=$p.StandardOutput; ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry
-        Headers=$null; Pending=$null; RequestId=$RequestId; Cnf=$cnf; SqlFile=$sqlArg.file
+        Process=$p; Reader=$p.StandardOutput; Rows=(New-Object NobsXmlRows $p.StandardOutput)
+        ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry; ParseError=$null
+        Headers=$null; RequestId=$RequestId; Cnf=$cnf; SqlFile=$sqlArg.file
         LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
     }
-    $headerLine=$null
-    try { $headerLine = [NobsLf]::ReadLine($cursor.Reader) } catch { $headerLine = $null }
-    if ($null -eq $headerLine) {
-        # No stdout at all - either a real error, or a statement with no result set.
-        $r = Close-QueryCursorProc $cursor
-        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
-        if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
-        return @{ ok=$true; columns=@(); rows=@(); hasMore=$false }
-    }
-    $cursor.Headers = @($headerLine.Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
     $page = Read-CursorRows $cursor $PageSize
     if (-not $page.hasMore) {
         $r = Close-QueryCursorProc $cursor
         if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
-        # Rare: --quick already streamed some rows, then the connection/query failed partway
+        # --quick may already have streamed some rows before the connection/query failed partway
         # through (lost connection, deadlock victim, etc). Surface as an error rather than
         # silently showing a truncated result as if it were the complete one.
         if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
-        return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$false }
+        if ($cursor.ParseError) { return @{ ok=$false; err=$cursor.ParseError } }
+        # No result set at all: a statement that returns none.
+        if (-not $cursor.Rows.HasResultSet) { return @{ ok=$true; columns=@(); rows=$page.rows; hasMore=$false } }
+        if ($page.rows.Count -gt 0) { return @{ ok=$true; columns=@($cursor.Rows.Names); rows=$page.rows; hasMore=$false } }
+        $h = Get-ResultHeaders $conn $sql $db
+        if ($null -eq $h) { return @{ ok=$true; columns=@(); rows=$page.rows; hasMore=$false; note=$script:NoHeadersNote } }
+        return @{ ok=$true; columns=$h; rows=$page.rows; hasMore=$false }
     }
+    $cursor.Headers = @($cursor.Rows.Names)
     $cursorId = [guid]::NewGuid().ToString()
     $script:OpenCursors[$cursorId] = $cursor
     return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$true; cursorId=$cursorId }
@@ -748,12 +829,15 @@ function Open-QueryCursor {
 # A PK value containing an actual embedded tab/newline/backslash (exceedingly rare in practice)
 # could be mis-parsed here. This function is ONLY used to compute missing/matching id sets for
 # comparison - the real row data movement (insert/update) always goes through the fully general,
-# correctness-first Run-Query2/SqlValLit path, so the worst case here is a wrong verdict for one
+# correctness-first Run-Query2/SqlValFor path, so the worst case here is a wrong verdict for one
 # unusual row, never corrupted data.
+# --binary-as-hex makes a binary key read exactly as Run-Query2 reads it (0x..): as raw bytes it
+# went through a UTF-8 decode that replaced anything invalid, and no longer matched its own row.
 function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
+    try { $null = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf=New-Cnf $conn
     try {
-        $a=@("--defaults-extra-file=$cnf","--batch","--raw","--default-character-set=utf8mb4")
+        $a=@("--defaults-extra-file=$cnf","--batch","--raw","--binary-as-hex","--default-character-set=utf8mb4")
         if($db){ $a+="--database=$db" }
         $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
         $r=Run-Proc $script:MysqlPath $a $RequestId
@@ -1115,23 +1199,23 @@ function Api-Script { param($conn,$data)
 # Endpoint: apply grid edits (insert/update/delete rows) the user made in the results table.
 # NOTE: not currently called by the frontend (row edits are built and sent as plain SQL via
 # applyChanges()/`lit()` -> /api/script instead), but the endpoint is still registered, so it
-# uses the same hex-aware SqlValLit as everywhere else that touches real row data - a value
-# that LOOKS like a plain SqlLit-quoted string here could otherwise silently corrupt a
-# bit/binary column exactly like the bug already fixed in Compare's row apply.
+# writes each value for its column's type, as Compare does (see SqlValFor).
 function Api-RowOp { param($conn,$data)
     $obj=(SqlId $data.db)+'.'+(SqlId $data.table)
+    $binSet=Get-BinaryColumnSet $conn ([string]$data.db) ([string]$data.table)
+    if($null -eq $binSet){ return '{"ok":false,"error":"Could not read the column types of that table."}' }
     $op=[string]$data.op
     if($op -eq 'update'){
-        $sets=@(); foreach($p in $data.set.PSObject.Properties){ $sets+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
-        $whs=@();  foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
+        $sets=@(); foreach($p in $data.set.PSObject.Properties){ $sets+=(SqlId $p.Name)+'='+(SqlValFor $p.Value ($binSet.Contains([string]$p.Name))) }
+        $whs=@();  foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValFor $p.Value ($binSet.Contains([string]$p.Name))) }
         if($whs.Count -eq 0){ return '{"ok":false,"error":"no key columns; cannot update safely"}' }
         $sql="UPDATE $obj SET "+($sets -join ',')+" WHERE "+($whs -join ' AND ')+" LIMIT 1"
     } elseif($op -eq 'delete'){
-        $whs=@(); foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValLit $p.Value) }
+        $whs=@(); foreach($p in $data.where.PSObject.Properties){ $whs+=(SqlId $p.Name)+'='+(SqlValFor $p.Value ($binSet.Contains([string]$p.Name))) }
         if($whs.Count -eq 0){ return '{"ok":false,"error":"no key columns; cannot delete safely"}' }
         $sql="DELETE FROM $obj WHERE "+($whs -join ' AND ')+" LIMIT 1"
     } elseif($op -eq 'insert'){
-        $cols=@(); $vals=@(); foreach($p in $data.values.PSObject.Properties){ $cols+=(SqlId $p.Name); $vals+=(SqlValLit $p.Value) }
+        $cols=@(); $vals=@(); foreach($p in $data.values.PSObject.Properties){ $cols+=(SqlId $p.Name); $vals+=(SqlValFor $p.Value ($binSet.Contains([string]$p.Name))) }
         if($cols.Count -eq 0){ return '{"ok":false,"error":"no values"}' }
         $sql="INSERT INTO $obj ("+($cols -join ',')+") VALUES ("+($vals -join ',')+")"
     } else { return '{"ok":false,"error":"bad op"}' }
@@ -1153,7 +1237,7 @@ function Api-Query { param($conn,$sql,$db,$RequestId,$PageSize)
         if($r.cancelled){ return '{"ok":false,"error":'+(J-Str $r.err)+',"cancelled":true}' }
         return '{"ok":false,"error":'+(J-Str $r.err)+'}'
     }
-    if($r.columns.Count -eq 0){ return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":"Query OK. No result set."}' }
+    if($r.columns.Count -eq 0){ $msg = if($r.note){ $r.note } else { 'Query OK. No result set.' }; return '{"ok":true,"columns":[],"rows":[],"elapsedMs":'+$sw.ElapsedMilliseconds+',"message":'+(J-Str $msg)+'}' }
     $rowsJson = J-RowsFast $r.rows
     $tail = if($r.hasMore){ ',"hasMore":true,"cursorId":"'+$r.cursorId+'"' } else { '' }
     '{"ok":true,"columns":'+(J-Arr $r.columns)+',"rows":'+$rowsJson+',"elapsedMs":'+$sw.ElapsedMilliseconds+$tail+'}'
@@ -1179,6 +1263,7 @@ function Api-FetchCursorBatch { param($data)
             $r = Close-QueryCursorProc $cursor
             if ($cursor.Entry.Cancelled) { return '{"ok":false,"error":"Query cancelled.","cancelled":true}' }
             if ($r.exit -ne 0) { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
+            if ($cursor.ParseError) { return '{"ok":false,"error":'+(J-Str $cursor.ParseError)+'}' }
             return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":false}'
         }
         return '{"ok":true,"columns":'+(J-Arr $cursor.Headers)+',"rows":'+(J-RowsFast $page.rows)+',"hasMore":true,"cursorId":"'+$cid+'"}'
@@ -1262,7 +1347,7 @@ function Get-MySqlGeneratedTables { param($conn, $dbs, $excl)
     if (-not (Test-DumpIsMariaDB)) { return @() }
     $v = Run-Query2 $conn 'SELECT VERSION()' $null $null
     if (-not $v.ok -or ([string]$v.rows[0][0]) -match 'MariaDB') { return @() }
-    $list = (@($dbs) | ForEach-Object { SqlValLit $_ }) -join ','
+    $list = (@($dbs) | ForEach-Object { SqlLit $_ }) -join ','
     if (-not $list) { return @() }
     $r = Run-Query2 $conn ("SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA IN ($list) AND GENERATION_EXPRESSION IS NOT NULL AND GENERATION_EXPRESSION <> '' ORDER BY 1,2") $null $null
     if (-not $r.ok) { return @() }
@@ -1431,6 +1516,204 @@ public static class NobsLf {
         while ((c = r.Read()) >= 0) { any = true; if (c == 10) return sb.ToString(); sb.Append((char)c); }
         return any ? sb.ToString() : null;
     }
+}
+// Rows out of mysql --xml --binary-as-hex, read from a Latin-1 reader so each char is one byte.
+//
+// --xml is the only output mode of the command-line client that tells NULL apart from the text
+// 'NULL': --batch prints both as NULL, and no option changes that. So a 'NULL' string copied or
+// compared through this app became a real NULL. In XML a NULL is <field xsi:nil="true" />.
+//
+// What XML costs, and how each is dealt with:
+//  - the client writes a NUL byte as a space. --binary-as-hex writes binary and BIT columns as
+//    0x.. instead, so only a NUL inside a text column is lost (it reads as a space).
+//  - MySQL's own client on Windows writes every LF as CRLF, value bytes included. It does so for
+//    the XML declaration as well, which is how it is detected and undone here.
+//  - a result with no rows carries no column names; the caller asks for those separately.
+//  - several statements give several result sets; only the first is returned, and the rest is
+//    read and dropped so the process never blocks on a full pipe.
+public sealed class NobsXmlRows {
+    static readonly Encoding Latin1 = Encoding.GetEncoding(28591);
+    static readonly Encoding Strict = new UTF8Encoding(false, true);
+    readonly TextReader r;
+    readonly char[] buf = new char[1 << 16];
+    int pos, len;
+    bool eolKnown, crlf, firstClosed, pendingSet;
+    int sets;
+    string[] pending;
+    public readonly List<string> Names = new List<string>();
+    public bool HasResultSet { get { return sets > 0; } }
+    public bool More;
+    public NobsXmlRows(TextReader r) { this.r = r; }
+
+    int Peek() {
+        if (pos >= len) {
+            // A cursor whose process was killed ends here, the same as a finished one.
+            try { len = r.Read(buf, 0, buf.Length); } catch (IOException) { len = 0; } catch (ObjectDisposedException) { len = 0; }
+            pos = 0;
+            if (len <= 0) { len = 0; return -1; }
+        }
+        return buf[pos];
+    }
+    int Read() { int c = Peek(); if (c >= 0) pos++; return c; }
+
+    string TagName() {
+        var sb = new StringBuilder();
+        int c = Peek();
+        if (c == '/' || c == '?') sb.Append((char)Read());
+        while (true) {
+            c = Peek();
+            if (c < 0 || c == '>' || c == '/' || c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+            sb.Append((char)Read());
+        }
+        return sb.ToString();
+    }
+    // Reads the rest of a tag. Attribute values never hold a raw '>' - the client escapes it.
+    bool TagRest(StringBuilder attrs) {
+        int prev = 0, c;
+        while ((c = Read()) >= 0 && c != '>') { if (attrs != null) attrs.Append((char)c); prev = c; }
+        return prev == '/';
+    }
+    void AppendChar(StringBuilder sb, int c) {
+        if (c < 256) { sb.Append((char)c); return; }
+        foreach (byte b in Encoding.UTF8.GetBytes(char.ConvertFromUtf32(c))) sb.Append((char)b);
+    }
+    void Entity(StringBuilder sb, Func<int> next) {
+        var e = new StringBuilder();
+        int c;
+        while (e.Length < 12 && (c = next()) >= 0) { if (c == ';') break; e.Append((char)c); }
+        string s = e.ToString();
+        if (s == "lt") sb.Append('<');
+        else if (s == "gt") sb.Append('>');
+        else if (s == "amp") sb.Append('&');
+        else if (s == "quot") sb.Append('"');
+        else if (s == "apos") sb.Append('\'');
+        else if (s.StartsWith("#x") && s.Length > 2) AppendChar(sb, Convert.ToInt32(s.Substring(2), 16));
+        else if (s.StartsWith("#") && s.Length > 1) AppendChar(sb, int.Parse(s.Substring(1)));
+        else throw new InvalidDataException("Unexpected entity &" + s + "; in mysql --xml output.");
+    }
+    string Text() {
+        var sb = new StringBuilder();
+        while (true) {
+            int c = Peek();
+            if (c < 0 || c == '<') break;
+            pos++;
+            if (c == '&') { Entity(sb, Read); continue; }
+            if (c == '\r' && crlf && Peek() == '\n') continue;
+            sb.Append((char)c);
+        }
+        return sb.ToString();
+    }
+    string AttrValue(string attrs, string name, out bool found) {
+        found = false;
+        int i = 0;
+        while (i < attrs.Length) {
+            while (i < attrs.Length && (attrs[i] == ' ' || attrs[i] == '\t' || attrs[i] == '\r' || attrs[i] == '\n' || attrs[i] == '/')) i++;
+            int eq = attrs.IndexOf('=', i);
+            if (eq < 0 || eq + 1 >= attrs.Length || attrs[eq + 1] != '"') return null;
+            string key = attrs.Substring(i, eq - i).Trim();
+            int end = attrs.IndexOf('"', eq + 2);
+            if (end < 0) return null;
+            if (key == name) {
+                found = true;
+                var sb = new StringBuilder();
+                int j = eq + 2;
+                Func<int> next = () => j < end ? attrs[j++] : -1;
+                while (j < end) {
+                    char c = attrs[j++];
+                    if (c == '&') { Entity(sb, next); continue; }
+                    if (c == '\r' && crlf && j < end && attrs[j] == '\n') continue;
+                    sb.Append(c);
+                }
+                return sb.ToString();
+            }
+            i = end + 1;
+        }
+        return null;
+    }
+    // Text as text; anything that is not valid UTF-8 as 0x.. hex, as the rest of the app shows it.
+    public static string Cell(string raw) {
+        if (raw == null) return null;
+        bool ascii = true;
+        for (int i = 0; i < raw.Length; i++) if (raw[i] > 127) { ascii = false; break; }
+        if (ascii) return raw;
+        byte[] b = Latin1.GetBytes(raw);
+        try { return Strict.GetString(b); }
+        catch (DecoderFallbackException) { return "0x" + BitConverter.ToString(b).Replace("-", ""); }
+    }
+    static string Name(string raw) {
+        try { return Strict.GetString(Latin1.GetBytes(raw)); } catch (DecoderFallbackException) { return raw; }
+    }
+    string[] Row(bool keep) {
+        var vals = keep ? new List<string>() : null;
+        bool names = keep && Names.Count == 0;
+        while (true) {
+            int c = Read();
+            if (c < 0) throw new InvalidDataException("mysql --xml output ended inside a row.");
+            if (c != '<') continue;
+            string tag = TagName();
+            if (tag == "/row") { TagRest(null); break; }
+            if (tag != "field") { TagRest(null); continue; }
+            var attrs = new StringBuilder();
+            bool closed = TagRest(attrs);
+            string a = attrs.ToString();
+            bool found, nil;
+            string name = AttrValue(a, "name", out found);
+            string nilv = AttrValue(a, "xsi:nil", out nil);
+            string val = null;
+            if (!closed) {
+                val = Text();
+                if (Read() != '<' || TagName() != "/field") throw new InvalidDataException("Unexpected markup inside a field in mysql --xml output.");
+                TagRest(null);
+            } else if (!(nil && nilv == "true")) val = "";
+            if (nil && nilv == "true") val = null;
+            if (keep) {
+                vals.Add(Cell(val));
+                if (names) Names.Add(Name(name ?? ""));
+            }
+        }
+        return keep ? vals.ToArray() : null;
+    }
+    string[] NextCore() {
+        while (true) {
+            int c = Read();
+            if (c < 0) return null;
+            if (c != '<') continue;
+            string tag = TagName();
+            if (tag == "?xml") {
+                TagRest(null);
+                if (!eolKnown) { eolKnown = true; crlf = Peek() == '\r'; }
+            } else if (tag == "resultset") {
+                sets++;
+                if (TagRest(null) && sets == 1) firstClosed = true;
+            } else if (tag == "/resultset") {
+                TagRest(null);
+                if (sets == 1) firstClosed = true;
+            } else if (tag == "row") {
+                TagRest(null);
+                bool keep = sets == 1 && !firstClosed;
+                string[] row = Row(keep);
+                if (keep) return row;
+            } else TagRest(null);
+        }
+    }
+    public string[] Next() {
+        if (pendingSet) { pendingSet = false; var p = pending; pending = null; return p; }
+        return NextCore();
+    }
+    // Up to n rows; More says whether another one follows (it is held back for the next call).
+    public List<string[]> Page(int n) {
+        var list = new List<string[]>();
+        while (list.Count < n) {
+            var row = Next();
+            if (row == null) { More = false; return list; }
+            list.Add(row);
+        }
+        var peek = Next();
+        More = peek != null;
+        if (More) { pending = peek; pendingSet = true; }
+        return list;
+    }
+    public List<string[]> All() { return Page(int.MaxValue); }
 }
 public static class NobsDumpDb {
     static bool Kw(byte[] l, int n, ref int i, string w) {
@@ -2195,7 +2478,8 @@ function Api-Fk { param($conn,$db,$table)
 # re-scanning the whole table again).
 function Get-RowsByPk { param($conn,$db,$table,$pkCols,$pkValues,$RequestId)
     if(-not $pkValues -or $pkValues.Count -eq 0){ return @{ ok=$true; columns=@(); rows=(New-Object System.Collections.ArrayList) } }
-    $pkList = ($pkCols | ForEach-Object { SqlId $_ }) -join ','
+    $binSet = Get-BinaryColumnSet $conn $db $table
+    if($null -eq $binSet){ return @{ ok=$false; err="Could not read the column types of $db.$table." } }
     $fetchChunk = 200
     $fullCols = $null
     $fullRows = New-Object System.Collections.ArrayList
@@ -2203,16 +2487,10 @@ function Get-RowsByPk { param($conn,$db,$table,$pkCols,$pkValues,$RequestId)
         if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
         $fEnd = [Math]::Min($fi+$fetchChunk,$pkValues.Count) - 1
         $chunk = $pkValues[$fi..$fEnd]
-        if($pkCols.Count -eq 1){
-            $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
-            $where = (SqlId $pkCols[0]) + ' IN (' + $vals + ')'
-        } else {
-            $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
-            $where = '(' + $pkList + ') IN (' + $tuples + ')'
-        }
-        $fr = Run-Query2 $conn ("SELECT * FROM " + (SqlId $db) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $RequestId
+        $where = Get-PkWhere $pkCols $chunk $binSet
+        $fr = Get-ExactRows $conn $db $table $where $RequestId
         if(-not $fr.ok){ return @{ ok=$false; err=$fr.err } }
-        if($null -eq $fullCols){ $fullCols = $fr.columns }
+        if(-not $fullCols -or @($fullCols).Count -eq 0){ $fullCols = $fr.columns }
         foreach($row in $fr.rows){ [void]$fullRows.Add($row) }
     }
     @{ ok=$true; columns=$fullCols; rows=$fullRows }
@@ -2260,7 +2538,7 @@ function Api-GenUserTransfer { param($conn,$data)
     # exist on the target - and handed SUPER and SYSTEM_USER grants to them. Only mysql.sys was on
     # the default list. Named, not matched as mysql.%: an account called mysql.backup is a user's.
     foreach ($sys in @('mysql.sys','mysql.session','mysql.infoschema','mariadb.sys')) { if ($excl -notcontains $sys) { $excl += $sys } }
-    $inList = ($excl | ForEach-Object { SqlValLit $_ }) -join ','
+    $inList = ($excl | ForEach-Object { SqlLit $_ }) -join ','
     $usersR = Run-Query2 $conn ("SELECT user, host FROM mysql.user WHERE user NOT IN ($inList) AND user <> ''") $null $null
     if (-not $usersR.ok) { return '{"ok":false,"error":'+(J-Str $usersR.err)+'}' }
     if ($usersR.rows.Count -eq 0) { return '{"ok":true,"sql":"-- No accounts matched (everything was excluded, or mysql.user is empty).","userCount":0,"errorCount":0}' }
@@ -2270,7 +2548,7 @@ function Api-GenUserTransfer { param($conn,$data)
     $errors = New-Object System.Collections.ArrayList
 
     # A MySQL 8 caching_sha2_password hash carries a salt of arbitrary 7-bit bytes, control
-    # characters included. This edition shows a value holding control characters as hex, so the
+    # characters included. This edition used to show a value holding control characters as hex, so the
     # CREATE USER line came back as one long 0x... blob, was written into the script as-is, and the
     # account silently went missing from the transfer (measured on MySQL 8.0.46). With
     # print_identified_with_as_hex (8.0.17+) the hash is printed as a 0x literal inside a readable
@@ -2407,27 +2685,25 @@ function Api-CompareRowsDiff { param($data)
     if($useCommon.Count -eq 0){
         return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"fkCols":'+(J-Arr $fk)+',"diffs":[],"commonTotal":'+$commonTotal+',"comparedCount":0,"truncated":false,"targetReadonly":'+$roJson+'}'
     }
+    $binSet = Get-BinaryColumnSet $src $srcDb $table
+    if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $srcDb.$table.")+'}' }
     $fetchChunk = 200
     $fullCols = $null
-    $srcFull = @{}; $tgtFull = @{}
+    # Keyed by exact key text: a PowerShell hashtable ignores case, so keys 'a' and 'A' were one row.
+    $srcFull = New-Object 'System.Collections.Generic.Dictionary[string,object]'
+    $tgtFull = New-Object 'System.Collections.Generic.Dictionary[string,object]'
     $cancelled = $false
     for($fi=0; $fi -lt $useCommon.Count; $fi += $fetchChunk){
         if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
         $fEnd = [Math]::Min($fi+$fetchChunk,$useCommon.Count) - 1
         $chunk = $useCommon[$fi..$fEnd]
-        if($pk.Count -eq 1){
-            $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
-            $where = (SqlId $pk[0]) + ' IN (' + $vals + ')'
-        } else {
-            $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
-            $where = '(' + $pkList + ') IN (' + $tuples + ')'
-        }
-        $sr = Run-Query2 $src ("SELECT * FROM " + (SqlId $srcDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+        $where = Get-PkWhere $pk $chunk $binSet
+        $sr = Get-ExactRows $src $srcDb $table $where $rid
         if(-not $sr.ok){ return '{"ok":false,"error":'+(J-Str $sr.err)+'}' }
-        if($null -eq $fullCols){ $fullCols = $sr.columns }
+        if(-not $fullCols -or @($fullCols).Count -eq 0){ $fullCols = $sr.columns }
         $pkIdx = @($pk | ForEach-Object { [Array]::IndexOf($fullCols,$_) })
         foreach($row in $sr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $srcFull[$k] = $row }
-        $tr = Run-Query2 $tgt ("SELECT * FROM " + (SqlId $tgtDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+        $tr = Get-ExactRows $tgt $tgtDb $table $where $rid
         if(-not $tr.ok){ return '{"ok":false,"error":'+(J-Str $tr.err)+'}' }
         foreach($row in $tr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $tgtFull[$k] = $row }
     }
@@ -2438,8 +2714,10 @@ function Api-CompareRowsDiff { param($data)
         $sRow = $srcFull[$k]; $tRow = $tgtFull[$k]
         $cdJ = New-Object System.Collections.ArrayList
         for($ci=0; $ci -lt $fullCols.Count; $ci++){
-            $sv = [string]$sRow[$ci]; $tv = [string]$tRow[$ci]
-            if($sv -ne $tv){ [void]$cdJ.Add('{"col":'+(J-Str $fullCols[$ci])+',"src":'+(J-Str $sRow[$ci])+',"tgt":'+(J-Str $tRow[$ci])+'}') }
+            # -ne ignores case, and [string] makes NULL and '' the same - so 'null' against 'NULL',
+            # or NULL against an empty string, was reported as no difference at all.
+            $sv = $sRow[$ci]; $tv = $tRow[$ci]
+            if((($null -eq $sv) -ne ($null -eq $tv)) -or ([string]$sv -cne [string]$tv)){ [void]$cdJ.Add('{"col":'+(J-Str $fullCols[$ci])+',"src":'+(J-Str $sRow[$ci])+',"tgt":'+(J-Str $tRow[$ci])+'}') }
         }
         if($cdJ.Count -gt 0){
             $pkVals = @($pkIdxFinal | ForEach-Object { $sRow[$_] })
@@ -2461,6 +2739,8 @@ function Api-CompareRowsApplyDiff { param($data)
     $pkCols = @($data.pkCols); $updates = @($data.updates)
     if($pkCols.Count -eq 0 -or $updates.Count -eq 0){ return '{"ok":false,"error":"No rows to update."}' }
     $obj = (SqlId $db) + '.' + (SqlId $table)
+    $binSet = Get-BinaryColumnSet $tgt $db $table
+    if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $db.$table.")+'}' }
     # Unlike Api-CompareRowsApply/Api-CompareRowsInsertAll (INSERT-only, each batch already atomic
     # as one statement, and a chunk failing partway through a large bulk insert shouldn't block
     # the rest), this updates EXISTING target rows one at a time - the exact "apply this reviewed
@@ -2474,9 +2754,9 @@ function Api-CompareRowsApplyDiff { param($data)
     $pkDescs = New-Object System.Collections.ArrayList
     $skipped = New-Object System.Collections.ArrayList
     foreach($u in $updates){
-        $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValLit $cd.src) }
+        $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValFor $cd.src ($binSet.Contains([string]$cd.col))) }
         $whs = @(); $pkv = @($u.pk)
-        for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValLit $pkv[$i]) }
+        for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValFor $pkv[$i] ($binSet.Contains([string]$pkCols[$i]))) }
         $pkDesc = ($pkv -join ',')
         if($sets.Count -eq 0 -or $whs.Count -eq 0){ [void]$skipped.Add($pkDesc); continue }
         [void]$stmts.Add("UPDATE $obj SET " + ($sets -join ',') + ' WHERE ' + ($whs -join ' AND ') + ' LIMIT 1;')
@@ -2542,25 +2822,23 @@ function Api-CompareRowsInsertAll { param($data)
     $chunkSize = 200
     $log = New-Object System.Collections.ArrayList
     $inserted = 0
+    $srcBin = Get-BinaryColumnSet $src $srcDb $table
+    $tgtBin = Get-BinaryColumnSet $tgt $tgtDb $table
+    if($null -eq $srcBin -or $null -eq $tgtBin){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $table on both sides.")+'}' }
     $cnf = New-Cnf $tgt
     try {
         for($fi=0; $fi -lt $missingRows.Count; $fi += $chunkSize){
             if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
             $fEnd = [Math]::Min($fi+$chunkSize,$missingRows.Count) - 1
             $chunk = $missingRows[$fi..$fEnd]
-            if($pk.Count -eq 1){
-                $vals = ($chunk | ForEach-Object { SqlValLit $_[0] }) -join ','
-                $where = (SqlId $pk[0]) + ' IN (' + $vals + ')'
-            } else {
-                $tuples = ($chunk | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
-                $where = '(' + $pkList + ') IN (' + $tuples + ')'
-            }
-            $fr = Run-Query2 $src ("SELECT * FROM " + (SqlId $srcDb) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $rid
+            $where = Get-PkWhere $pk $chunk $srcBin
+            $fr = Get-ExactRows $src $srcDb $table $where $rid
             if(-not $fr.ok){ [void]$log.Add("FAILED (fetch) rows "+$fi+"-"+$fEnd+" : "+$fr.err); continue }
             if($fr.rows.Count -eq 0){ continue }
-            $colList = ($fr.columns | ForEach-Object { SqlId $_ }) -join ','
+            $cols = @($fr.columns)
+            $colList = ($cols | ForEach-Object { SqlId $_ }) -join ','
             $obj = (SqlId $tgtDb) + '.' + (SqlId $table)
-            $valuesSql = ($fr.rows | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $valuesSql = ($fr.rows | ForEach-Object { Get-ValuesTuple $cols $_ $tgtBin }) -join ','
             $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
             $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null $null $rid
             if($r2.exit -eq 0){ $inserted += $fr.rows.Count; [void]$log.Add("OK  inserted "+$fr.rows.Count+" row(s) ("+($inserted)+" of "+$missingTotal+" so far)") }
@@ -2582,6 +2860,8 @@ function Api-CompareRowsApply { param($data)
     if($cols.Count -eq 0 -or $rows.Count -eq 0){ return '{"ok":false,"error":"No rows to insert."}' }
     $colList = ($cols | ForEach-Object { SqlId $_ }) -join ','
     $obj = (SqlId $db) + '.' + (SqlId $table)
+    $binSet = Get-BinaryColumnSet $tgt $db $table
+    if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $db.$table.")+'}' }
     $log = New-Object System.Collections.ArrayList
     $batchSize = 500
     $cnf = New-Cnf $tgt
@@ -2589,7 +2869,7 @@ function Api-CompareRowsApply { param($data)
         for($i=0; $i -lt $rows.Count; $i += $batchSize){
             $endIdx = [Math]::Min($i+$batchSize,$rows.Count) - 1
             $batch = $rows[$i..$endIdx]
-            $valuesSql = ($batch | ForEach-Object { '(' + (($_ | ForEach-Object { SqlValLit $_ }) -join ',') + ')' }) -join ','
+            $valuesSql = ($batch | ForEach-Object { Get-ValuesTuple $cols $_ $binSet }) -join ','
             $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
             # IMPORTANT: pipe the SQL via stdin (Run-Stdin), not as a "-e" command-line argument
             # (Run-Proc) - a batch of rows easily exceeds Windows' command-line length limit
@@ -3389,10 +3669,62 @@ function hide(id){
 const RESERVED=new Set(['accessible','add','all','alter','analyze','and','as','asc','before','between','bigint','binary','blob','both','by','call','cascade','case','change','char','character','check','collate','column','condition','constraint','continue','convert','create','cross','current_date','current_time','current_timestamp','cursor','database','databases','default','delete','desc','describe','distinct','div','double','drop','dual','each','else','exists','explain','false','fetch','float','for','force','foreign','from','fulltext','function','group','having','if','ignore','in','index','inner','insert','int','integer','interval','into','is','join','key','keys','left','like','limit','lock','long','longblob','longtext','match','mediumblob','mediumint','mediumtext','natural','not','null','numeric','offset','on','optimize','option','or','order','outer','primary','procedure','references','rename','repeat','replace','restrict','return','revoke','right','rlike','schema','schemas','select','set','show','smallint','spatial','sql','table','then','tinyblob','tinyint','tinytext','to','trigger','true','union','unique','unlock','unsigned','update','usage','use','using','values','varbinary','varchar','varying','when','where','while','with','write','zerofill']);
 function qid(n){n=String(n);if(n===''||!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(n)||RESERVED.has(n.toLowerCase()))return '`'+n.replace(/`/g,'``')+'`';return n;}
 function lit(v){if(v===null)return 'NULL';const s=String(v);if(/^0x[0-9A-Fa-f]+$/.test(s))return s;return strLit(s);}
+// Which of a grid's columns hold binary values - the ones shown as 0x... The Tauri build reads that
+// from the result set itself; the PowerShell one asks information_schema, which needs a table.
+// null when neither can tell, and the caller then falls back to lit(), which goes by the value.
+const BIN_COL_TYPE=/^(binary|varbinary|tinyblob|blob|mediumblob|longblob|bit|geometry|point|linestring|polygon|multipoint|multilinestring|multipolygon|geometrycollection|geomcollection)\b/i;
+async function tableBinCols(db,table,cols){
+ try{
+  const r=await api('/api/query',{sql:"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)});
+  if(!r.ok||!r.rows||!r.rows.length)return null;
+  const m={};r.rows.forEach(x=>{m[String(x[0]).toLowerCase()]=BIN_COL_TYPE.test(String(x[1]));});
+  const out=[];for(const c of cols){const k=String(c).toLowerCase();if(!(k in m))return null;out.push(m[k]);}
+  return out;
+ }catch(e){return null;}
+}
+async function gridBinCols(id){
+ const t=T(id);if(!t||!t.cols)return null;
+ if(t.binCols&&t.binCols.length===t.cols.length)return t.binCols.map(Boolean);
+ if(!t.table)return null;
+ return tableBinCols(dbOf(t),t.table,t.cols);
+}
+// lit() decides from the value's shape, which is wrong both ways for row data: a text cell holding
+// 0x41 was written as the byte A, and an empty binary value - shown as the bare 0x - as the two
+// characters 0x. With the column's type known (bin true/false) the type decides instead; with it
+// unknown (null) this is lit().
+function litAs(v,bin){
+ if(bin==null)return lit(v);
+ if(v===null||v===undefined)return 'NULL';
+ const s=String(v);
+ if(bin){if(s==='0x')return "X''";if(/^0x[0-9A-Fa-f]+$/.test(s))return s;}
+ return strLit(s);
+}
+// This edition reads results from mysql.exe's XML output, which writes a NUL byte inside a text
+// value as a space. An export built from such a grid would carry the space, so exports of a table
+// check for it first and send the user to the Export tool (mysqldump), which copies bytes exactly.
+async function tableNulTextCount(db,table){
+ try{
+  const r=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)+" AND DATA_TYPE IN ('char','varchar','tinytext','text','mediumtext','longtext')"});
+  if(!r.ok)return null;
+  if(!r.rows.length)return 0;
+  const cond=r.rows.map(x=>"LOCATE(0x00,CAST(CONVERT("+qid(x[0])+" USING utf8mb4) AS BINARY))>0").join(' OR ');
+  const c=await api('/api/query',{sql:'SELECT COUNT(*) FROM '+qid(db)+'.'+qid(table)+' WHERE '+cond});
+  return c.ok&&c.rows.length?+c.rows[0][0]:null;
+ }catch(e){return null;}
+}
+async function refuseNulTextExport(db,table){
+ const n=await tableNulTextCount(db,table);
+ if(!n)return false;
+ toast(fmtCount(n)+' row(s) of '+db+'.'+table+' hold a NUL byte inside a text value, which this edition reads as a space, so this export would not be exact. Use the Export tool in the top toolbar instead - it copies them byte for byte.',true);
+ return true;
+}
 // Always a quoted string literal - unlike lit(), never reinterprets a hex-looking value as a raw
 // unquoted hex literal. lit()'s passthrough is meant for grid cell values; a password or other
 // plain-text field that happens to look like hex should stay exactly the text the user typed.
-function strLit(v){return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''")+"'";}
+// CR and NUL are written as escapes. mysql.exe reading a script (stdin, or source) turns every CR LF
+// into LF, so a raw CR before a line feed was silently dropped; a raw NUL makes it refuse the
+// statement unless --binary-mode is on.
+function strLit(v){return "'"+String(v).replace(/\\/g,'\\\\').replace(/'/g,"''").replace(/\r/g,'\\r').replace(/\0/g,'\\0')+"'";}
 
 async function searchAllSchemas(){
   const term=($('objFilter').value||'').trim();
@@ -5554,6 +5886,7 @@ function pasteRowIntoIns(id,ii){const t=T(id);const vals=singleRowClipboard();if
  renderGrid(id);log('Pasted copied row into new row. Review and click Apply to commit.');}
 function revertChanges(id){const t=T(id);t.pending={upd:{},del:new Set(),ins:[]};renderGrid(id);}
 async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];const tbl=qid(t.db)+'.'+qid(t.table);
+ const bc=await gridBinCols(id);
  // Screened before any SQL is built, so a bad paste writes nothing at all rather than part of a
  // batch. Covers inline cell edits and new rows alike - the grid is the other way into a binary
  // column, and the value editor's guard never sees it.
@@ -5566,10 +5899,10 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  }
  // updates grouped by row
  const byRow={};Object.keys(t.pending.upd).forEach(k=>{const[ri,ci]=k.split(':').map(Number);(byRow[ri]=byRow[ri]||{})[ci]=t.pending.upd[k];});
- Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+lit(byRow[ri][ci]));
-   const wh=t.pk.map(p=>qid(p)+'='+lit(t.rows[ri][t.cols.indexOf(p)]));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
- t.pending.del.forEach(ri=>{const wh=t.pk.map(p=>qid(p)+'='+lit(t.rows[ri][t.cols.indexOf(p)]));S.push('DELETE FROM '+tbl+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
- t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>lit(row[c])).join(',')+');');});
+ Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+litAs(byRow[ri][ci],bc?bc[ci]:null));
+   const wh=t.pk.map(p=>qid(p)+'='+litAs(t.rows[ri][t.cols.indexOf(p)],bc?bc[t.cols.indexOf(p)]:null));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
+ t.pending.del.forEach(ri=>{const wh=t.pk.map(p=>qid(p)+'='+litAs(t.rows[ri][t.cols.indexOf(p)],bc?bc[t.cols.indexOf(p)]:null));S.push('DELETE FROM '+tbl+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
+ t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>litAs(row[c],bc?bc[t.cols.indexOf(c)]:null)).join(',')+');');});
  // A BIT or binary column round-trips as 0x..., and lit() passes that through unquoted. Anything
  // else is quoted, and MySQL then stores the BYTES of the text: typing 8 into a BIT(8) cell
  // stored 56 - the byte value of the character '8' - silently, with no error, because one byte
@@ -5579,7 +5912,8 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  // column type - available in the Tauri build. Failing that, fall back to the value already in
  // the cell: both builds render a binary/BIT value as 0x..., so replacing one with something
  // else is the same mistake regardless of who reported the type.
- const binAt=(ci,ri)=>(t.binCols&&t.binCols[ci])||(ri!=null&&t.rows[ri]&&t.rows[ri][ci]!=null&&isHex(t.rows[ri][ci]));
+ // With the column types known they decide; the value's shape is only the fallback.
+ const binAt=(ci,ri)=>bc?bc[ci]:((t.binCols&&t.binCols[ci])||(ri!=null&&t.rows[ri]&&t.rows[ri][ci]!=null&&isHex(t.rows[ri][ci])));
  const badBin=[];
  Object.keys(t.pending.upd).forEach(k=>{const [ri,ci]=k.split(':').map(Number);
   if(!binAt(ci,ri))return;
@@ -5710,9 +6044,9 @@ function selAll(id,ch){const t=T(id);if(!t.selected)t.selected=new Set();const v
 function copySel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bTSV(t.cols,rows)).then(()=>log('Copied '+rows.length+' selected row(s) (TSV).'));}
 function copySelCsv(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bCSV(t.cols,rows)).then(()=>{csvNullHint(rows);}).then(()=>log('Copied '+rows.length+' selected row(s) (CSV).'));}
 function csvGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'csv');return;}dl(bCSV(t.cols,t.rows),'result.csv');}
-function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const s=t.rows.map(r=>'INSERT IGNORE INTO `table` ('+t.cols.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
-function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
-function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
+async function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const bc=await gridBinCols(id);const s=t.rows.map(r=>'INSERT IGNORE INTO `table` ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
+async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&await refuseNulTextExport(dbOf(t),t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
+async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&await refuseNulTextExport(dbOf(t),t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
 async function dl(text,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
  // Tauri: native Save As + backend write
@@ -7151,7 +7485,8 @@ async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts'
    }
  }catch(e){}
  const q=await api('/api/query',{sql:'SELECT * FROM '+qid(db)+'.'+qid(name),db:db});if(!q.ok){toast(q.error,true);return;}
- if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const s=q.rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+q.columns.map(qid).join(',')+') VALUES ('+r.map(lit).join(',')+');').join('\n');dl(s,defName);}
+ if(await refuseNulTextExport(db,name))return;
+ if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const bc=await tableBinCols(db,name,q.columns);const s=q.rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+q.columns.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,defName);}
  else{dl(bCSV(q.columns,q.rows),defName);}}
 function importCsv(db,table){csvTarget={db,table};$('csvTitle').textContent='Import CSV into '+db+'.'+table;$('csvFile').value='';$('csvLog').textContent='';show('mCsv');}
 async function runCsvImport(){const f=$('csvFile').value.trim();if(!f){toast('Choose a CSV file.',true);return;}
@@ -7316,7 +7651,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ClientBinHex','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }

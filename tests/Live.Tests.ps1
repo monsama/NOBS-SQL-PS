@@ -86,6 +86,10 @@ try {
         return $null
     }
 
+    # Which client the server is using: results differ between MariaDB's and MySQL's mysql.exe.
+    $tools = Api '/api/tools-status' @{}
+    "  (mysql client: $($tools.mysql))"
+
     # --- 0. without the fixture every result below is meaningless ------------------------------
     $canary = Scalar 'SELECT COUNT(*) FROM ro_canary' 'nobs_test'
     if ($canary -ne '3') {
@@ -338,8 +342,7 @@ try {
     # replace every byte that was not valid UTF-8 with U+FFFD before any of this app's code saw
     # it: VARBINARY 00 FF 10 arrived as 0x00EFBFBD10. It was not merely a display problem - the
     # grid writes a cell back exactly as it holds it, so saving such a row committed the mangled
-    # bytes to disk. The reader is byte-preserving now and CellVal decides per field whether the
-    # bytes are text or binary.
+    # bytes to disk. The reader is byte-preserving now, and binary columns arrive as 0x.. hex.
     $cb = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT bin_col, blob_col, bit8, emoji, cjk FROM charset_binary WHERE id=1' }
     Check ($cb.ok -and [string]$cb.rows[0][0] -eq '0x00FF10') 'a VARBINARY column arrives with its bytes intact' ("got " + [string]$cb.rows[0][0])
     Check ([string]$cb.rows[0][1] -eq '0xDEADBEEF') 'a BLOB column arrives with its bytes intact' ("got " + [string]$cb.rows[0][1])
@@ -347,8 +350,7 @@ try {
     # The same change must not break text: these share the stream and are decoded as UTF-8.
     Check ([string]$cb.rows[0][3] -eq ([char]::ConvertFromUtf32(0x1F600))) 'a 4-byte emoji still arrives as itself' ("got " + [string]$cb.rows[0][3])
     Check ([string]$cb.rows[0][4] -ne '' -and [string]$cb.rows[0][4] -notmatch [char]0xFFFD) 'CJK text still arrives undamaged' ("got " + [string]$cb.rows[0][4])
-    # NULL must stay distinguishable from an empty binary. (This is why --binary-as-hex on the
-    # client was not usable: it renders NULL and empty identically, both as "0x".)
+    # NULL must stay distinguishable from an empty binary.
     $nullRow = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT bin_col FROM charset_binary WHERE id=3' }
     Check ($null -eq $nullRow.rows[0][0]) 'a NULL binary column is still NULL, not an empty blob' ("got " + ($nullRow.rows[0][0] | ConvertTo-Json -Compress))
 
@@ -402,6 +404,8 @@ const cases = [
   ['CJK',                                 '\u4E2D\u6587\u6D4B\u8BD5','text'],
   ['RTL',                                 '\u0645\u0631\u062D\u0628\u0627','text'],
   ['a newline and a tab',                 'line1\nline2\tend',       'text'],
+  ['Windows line breaks',                 'line1\r\nline2\r\n',    'text'],
+  ['a lone carriage return',              'a\rb',                   'text'],
   ['text shaped like SQL injection',      "'; DROP TABLE x; --",     'text'],
   ['an empty box',                        '',                        'text'],
   ['text that looks like hex',            '0x1234abcd',              'text'],
@@ -424,10 +428,12 @@ for (const [label, value, tab] of cases) {
   id++;
   const hex = tab === 'text' ? F.textToHex(value) : F.normalizeHexInput(value);
   if (hex === null) throw new Error('normalizeHexInput rejected a case it should accept: ' + label);
-  out.push({ id, label, tab, literal: F.lit(forEmpty(hex)),
+  out.push({ id, label, tab, literal: F.lit(forEmpty(hex)), quoted: F.strLit(value),
              expect: tab === 'text' ? hexOf(value) : hex.slice(2).toUpperCase() });
 }
-console.log(JSON.stringify(out));
+// ASCII only: PowerShell decodes a native command's output with the console code page, which
+// turned the emoji and CJK cases into different text before they were ever sent.
+console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0')));
 '@
     $rtTmp = Join-Path ([IO.Path]::GetTempPath()) "rt-harness-$PID.mjs"
     Set-Content -LiteralPath $rtTmp -Value $rtHarness -Encoding utf8
@@ -438,16 +444,26 @@ console.log(JSON.stringify(out));
     } else {
         $rtCases = $rtJson | ConvertFrom-Json
         Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.rt_probe' } | Out-Null
-        Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.rt_probe (id INT PRIMARY KEY, b LONGBLOB)' } | Out-Null
+        Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.rt_probe (id INT PRIMARY KEY, b LONGBLOB, t LONGTEXT CHARACTER SET utf8mb4)' } | Out-Null
         $bad = @()
         foreach ($c in $rtCases) {
-            $ins = Api '/api/exec' @{ conn = $conn; sql = "INSERT INTO nobs_test.rt_probe VALUES ($($c.id), $($c.literal))" }
+            # /api/script, as the grid's Apply sends it: the SQL goes to mysql.exe as a script, which
+            # turns CR LF into LF - a raw CR in a literal did not survive that.
+            # Text also goes, quoted by strLit as the grid writes a text cell, into a real text column: a
+            # BLOB stores whatever bytes arrive, so it cannot
+            # see the client converting them from the wrong character set.
+            $tcol = if ($c.tab -eq 'text') { $c.quoted } else { 'NULL' }
+            $ins = Api '/api/script' @{ conn = $conn; sql = "INSERT INTO nobs_test.rt_probe VALUES ($($c.id), $($c.literal), $tcol);"; transaction = $true }
             if (-not $ins.ok) { $bad += "$($c.label): insert failed - $($ins.error)"; continue }
             $got = Scalar "SELECT IFNULL(HEX(b),'<NULL>') FROM rt_probe WHERE id=$($c.id)" 'nobs_test'
             if ($got -ne $c.expect) {
                 $sg = if ($got.Length -gt 40) { $got.Substring(0,40) + '...' } else { $got }
                 $se = if ($c.expect.Length -gt 40) { $c.expect.Substring(0,40) + '...' } else { $c.expect }
                 $bad += "[$($c.tab)] $($c.label): got $sg want $se"
+            }
+            if ($c.tab -eq 'text') {
+                $gotT = Scalar "SELECT IFNULL(HEX(t),'<NULL>') FROM rt_probe WHERE id=$($c.id)" 'nobs_test'
+                if ($gotT -ne $c.expect) { $bad += "[text column] $($c.label): got $gotT" }
             }
         }
         Check ($bad.Count -eq 0) "every one of $($rtCases.Count) inputs stores exactly the bytes it should" ($bad -join ' | ')
@@ -482,10 +498,77 @@ console.log(JSON.stringify(out));
     foreach ($s in @("DROP DATABASE IF EXISTS $cs", "DROP DATABASE IF EXISTS $ct")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
     Api '/api/conn-delete' @{ name = $cn } | Out-Null
 
+    # --- 5b. compare copies every value exactly --------------------------------------------------
+    # All three write paths: insert-all (server to server), apply (rows that went through the
+    # browser as JSON), and apply-diff (updates). Each was wrong for some value here: the text
+    # 'NULL' arrived as NULL (--batch output), a text '0x41' was written as the byte A and an empty
+    # binary value as the two characters 0x (the value's shape decided, not the column's type), and
+    # a binary key did not match its own row once read as text. And a NUL inside text, which XML
+    # output turns into a space, has to arrive as a NUL.
+    $vs = 'nobs_live_val_src'
+    $vt = 'nobs_live_val_tgt'
+    $vn = "nobs_live_val_$PID"
+    $cn = $vn
+    Api '/api/conn-save' @{ name = $vn; conn = $conn; accent = '#3b82f6'; env = 'test'; readonly = $false; savepw = $true } | Out-Null
+    $vdef = '(id VARBINARY(4) PRIMARY KEY, txt TEXT NULL, bin VARBINARY(8) NULL, big MEDIUMTEXT NULL, bits BIT(8) NULL, geo GEOMETRY NULL)'
+    $setup = @(
+        "DROP DATABASE IF EXISTS $vs", "CREATE DATABASE $vs CHARACTER SET utf8mb4"
+        "DROP DATABASE IF EXISTS $vt", "CREATE DATABASE $vt CHARACTER SET latin1"
+        "CREATE TABLE $vs.t $vdef"
+        # latin1 on the target on purpose: a text value is converted, never poured in as bytes.
+        "CREATE TABLE $vt.t $vdef"
+        ("INSERT INTO $vs.t VALUES " +
+         "(0x0001, 'NULL', X'', REPEAT('xy', 40000), b'101', ST_GeomFromText('POINT(1 2)'))," +
+         "(0x00FF, NULL, NULL, CONCAT('a', CHAR(13), 'b', CHAR(10), 'c', CHAR(13), CHAR(10), CHAR(9), 'd'), NULL, NULL)," +
+         "(0x41, '0x41', 0x0041, 'null', b'0', NULL)," +
+         "(0x0A0D, CONVERT(x'C3A9' USING utf8mb4), 0x00, '', b'11111111', NULL)," +
+         "(X'', '<&>`"''\\', 0x0A0D, '0x', NULL, NULL)," +
+         # NUL inside text: mysql.exe --xml prints it as a space, so it has to be fetched another way.
+         "(0x0B, CONVERT(x'610062' USING utf8mb4), NULL, CONVERT(CONCAT('x', CHAR(0), 'y') USING utf8mb4), NULL, NULL)")
+    )
+    foreach ($s in $setup) { $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" } }
+    $same = "SELECT COUNT(*) FROM $vs.t s JOIN $vt.t d ON s.id = d.id WHERE " +
+            "CONVERT(s.txt USING utf8mb4) <=> CONVERT(d.txt USING utf8mb4) AND CAST(CONVERT(s.txt USING utf8mb4) AS BINARY) <=> CAST(CONVERT(d.txt USING utf8mb4) AS BINARY) AND " +
+            "s.bin <=> d.bin AND CAST(s.big AS BINARY) <=> CAST(d.big AS BINARY) AND s.bits <=> d.bits AND ST_AsBinary(s.geo) <=> ST_AsBinary(d.geo)"
+
+    $ia = Api '/api/compare-rows-insert-all' @{ sourceConnName = $vn; sourceDb = $vs; targetConnName = $vn; targetDb = $vt; table = 't' }
+    Check ($ia.ok -and $ia.inserted -eq 6) 'compare insert-all copies all 6 rows' ($ia | ConvertTo-Json -Compress)
+    Check ((Scalar $same) -eq '6') 'compare insert-all: every value arrives exactly' "identical rows: $(Scalar $same)"
+
+    Api '/api/exec' @{ conn = $conn; sql = "DELETE FROM $vt.t" } | Out-Null
+    $cmpv = Api '/api/compare-rows' @{ sourceConnName = $vn; sourceDb = $vs; targetConnName = $vn; targetDb = $vt; table = 't' }
+    Check ($cmpv.ok -and $cmpv.missingTotal -eq 6 -and @($cmpv.rows).Count -eq 6) 'compare finds the 6 missing rows, binary keys included' ("missing=$($cmpv.missingTotal) rows=$(@($cmpv.rows).Count) $($cmpv.error)")
+    if ($cmpv.ok) {
+        $ap = Api '/api/compare-rows-apply' @{ targetConnName = $vn; targetDb = $vt; table = 't'; columns = @($cmpv.columns); rows = @($cmpv.rows) }
+        Check ($ap.ok -and -not (@($ap.log) -match '^FAILED')) 'compare apply succeeds' ($ap | ConvertTo-Json -Compress)
+        Check ((Scalar $same) -eq '6') 'compare apply: every value arrives exactly after a trip through JSON' "identical rows: $(Scalar $same)"
+    }
+
+    Api '/api/exec' @{ conn = $conn; sql = "UPDATE $vt.t SET txt = 'changed', bin = 0x99, big = 'x', bits = b'1', geo = NULL" } | Out-Null
+    $df = Api '/api/compare-rows-diff' @{ sourceConnName = $vn; sourceDb = $vs; targetConnName = $vn; targetDb = $vt; table = 't' }
+    Check ($df.ok -and @($df.diffs).Count -eq 6) 'compare diff finds the 6 changed rows' ("diffs=$(@($df.diffs).Count) $($df.error)")
+    if ($df.ok) {
+        $ad = Api '/api/compare-rows-apply-diff' @{ targetConnName = $vn; targetDb = $vt; table = 't'; pkCols = @($df.pkCols); updates = @($df.diffs) }
+        Check ($ad.ok) 'compare apply-diff succeeds' ($ad | ConvertTo-Json -Compress)
+        Check ((Scalar $same) -eq '6') 'compare apply-diff: every value is restored exactly' "identical rows: $(Scalar $same)"
+    }
+    # Differences a case-insensitive, NULL-blind comparison did not see.
+    Api '/api/exec' @{ conn = $conn; sql = "UPDATE $vt.t SET big = NULL WHERE id = 0x0A0D" } | Out-Null
+    Api '/api/exec' @{ conn = $conn; sql = "UPDATE $vt.t SET big = 'NULL' WHERE id = 0x41" } | Out-Null
+    $df2 = Api '/api/compare-rows-diff' @{ sourceConnName = $vn; sourceDb = $vs; targetConnName = $vn; targetDb = $vt; table = 't' }
+    Check ($df2.ok -and @($df2.diffs).Count -eq 2) "compare diff sees NULL against '' and 'null' against 'NULL'" ("diffs=$(@($df2.diffs).Count) $($df2.error)")
+    if ($df2.ok -and @($df2.diffs).Count) {
+        $ad2 = Api '/api/compare-rows-apply-diff' @{ targetConnName = $vn; targetDb = $vt; table = 't'; pkCols = @($df2.pkCols); updates = @($df2.diffs) }
+        Check ($ad2.ok -and (Scalar $same) -eq '6') 'and applying those restores them' "identical rows: $(Scalar $same)"
+    }
+    foreach ($s in @("DROP DATABASE IF EXISTS $vs", "DROP DATABASE IF EXISTS $vt")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+    Api '/api/conn-delete' @{ name = $vn } | Out-Null
+    $cn = $null
+
     # --- 6. paging a cursor delivers every row exactly once -------------------------------------
     # The Tauri edition dropped one row at every page boundary by reading a look-ahead row and
-    # discarding it; a forward-only cursor cannot re-read it. This edition holds it in
-    # $cursorObj.Pending and emits it first next time. Keep it that way.
+    # discarding it; a forward-only cursor cannot re-read it. This edition holds it back
+    # (NobsXmlRows.Page) and emits it first next time. Keep it that way.
     $first = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT id FROM bulk_rows ORDER BY id LIMIT 25'; pageSize = 10 }
     $got = @($first.rows | ForEach-Object { [string]$_[0] })
     $more = $first.hasMore
@@ -501,20 +584,43 @@ console.log(JSON.stringify(out));
     Check ((@($got | Select-Object -Unique)).Count -eq 25) 'no row is delivered twice'
 
     # --- values holding CR / LF, and NULL-looking text, come back as themselves --------------------
-    # mysql --batch escapes LF but not CR, and rows used to be cut with ReadLine(), which also stops
-    # at CR - so such a row split in two and every later column shifted. And the NULL marker was
-    # matched ignoring case, so a value of one line feed (escaped as \n) read as NULL, as did 'null'.
-    $cr = Api '/api/query' @{ conn = $conn; sql = "SELECT CONCAT('a',CHAR(10),'b',CHAR(13),'c') AS t, 0x0A0D AS b, 0x0A AS lf, 'null' AS n, 'x' AS after UNION ALL SELECT '', NULL, NULL, 'Null', 'y'" }
-    Check ($cr.ok -and @($cr.rows).Count -eq 2) 'a CR inside a value does not split its row' "rows=$(@($cr.rows).Count)"
+    # Rows used to be parsed from --batch output. It escapes LF but not CR, and rows were cut with
+    # ReadLine(), which also stops at CR - so such a row split in two and every later column
+    # shifted. The NULL marker was matched ignoring case, so 'null' read as NULL. And --batch prints
+    # the text 'NULL' exactly like NULL, which no option changes; the rows now come from --xml.
+    # MySQL's own mysql.exe additionally writes every LF as CRLF, value bytes included.
+    $crSql = "SELECT CONVERT(CONCAT('a',CHAR(10),'b',CHAR(13),'c',CHAR(13),CHAR(10)) USING utf8mb4) AS t, 0x0A0D AS b, " +
+             "CONVERT(0x0A USING utf8mb4) AS lf, 'null' AS n, 'NULL' AS nn, 'x' AS after, x'' AS eb, '<&>`"' AS mk " +
+             "UNION ALL SELECT '', NULL, NULL, 'Null', NULL, 'y', NULL, NULL"
+    $cr = Api '/api/query' @{ conn = $conn; sql = $crSql }
+    Check ($cr.ok -and @($cr.rows).Count -eq 2) 'a CR inside a value does not split its row' "rows=$(@($cr.rows).Count) $($cr.error)"
     if ($cr.ok -and @($cr.rows).Count -eq 2) {
-        $r0 = $cr.rows[0]
-        Check ($r0[0] -ceq "a`nb`rc")      'text with LF and CR arrives intact' ([string]$r0[0])
-        Check ($r0[1] -ceq "`n`r")         'binary 0x0A0D arrives intact'
+        $r0 = $cr.rows[0]; $r1 = $cr.rows[1]
+        Check ((@($cr.columns) -join ',') -ceq 't,b,lf,n,nn,after,eb,mk') 'column names' (@($cr.columns) -join ',')
+        Check ($r0[0] -ceq "a`nb`rc`r`n")  'text with LF, CR and CRLF arrives intact' (($r0[0] | ConvertTo-Json -Compress))
+        Check ($r0[1] -ceq '0x0A0D')       'binary 0x0A0D arrives as its hex'
         Check ($r0[2] -ceq "`n")           'a value of one line feed is not NULL'
-        Check ($r0[3] -ceq 'null' -and $cr.rows[1][3] -ceq 'Null') "the text 'null' is not NULL"
-        Check ($r0[4] -ceq 'x' -and $cr.rows[1][4] -ceq 'y') 'the column after them is still in place'
-        Check ($cr.rows[1][0] -ceq '' -and $null -eq $cr.rows[1][1]) 'empty string and NULL stay distinct'
+        Check ($r0[3] -ceq 'null' -and $r1[3] -ceq 'Null') "the text 'null' is not NULL"
+        Check ($r0[4] -ceq 'NULL')         "the text 'NULL' is not NULL" (($r0[4] | ConvertTo-Json -Compress))
+        Check ($null -eq $r1[4])           "and NULL is still NULL"
+        Check ($r0[5] -ceq 'x' -and $r1[5] -ceq 'y') 'the column after them is still in place'
+        Check ($r1[0] -ceq '' -and $null -eq $r1[1]) 'empty string and NULL stay distinct'
+        Check ($r0[6] -ceq '0x' -and $null -eq $r1[6]) 'empty binary and NULL binary stay distinct'
+        Check ($r0[7] -ceq '<&>"')         'markup characters arrive as themselves'
     }
+
+    # XML output carries no column names for a result without rows. They are asked for again only
+    # when the statement is safe to repeat - an empty table still has to show its columns.
+    $empty = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT id, bin_col FROM charset_binary WHERE 1=0' }
+    Check ($empty.ok -and (@($empty.columns) -join ',') -eq 'id,bin_col' -and @($empty.rows).Count -eq 0) 'an empty result still has its column names' ($empty | ConvertTo-Json -Compress)
+    $emptyW = Api '/api/query' @{ conn = $conn; sql = 'DO 1; SELECT 1 AS a FROM DUAL WHERE 1=0' }
+    Check ($emptyW.ok -and @($emptyW.columns).Count -eq 0 -and $emptyW.message -match 'not available') 'a statement that is not safe to repeat is not run twice for them' ($emptyW | ConvertTo-Json -Compress)
+    $multi = Api '/api/query' @{ conn = $conn; sql = 'SELECT 1 AS a; SELECT 2 AS b' }
+    Check ($multi.ok -and (@($multi.columns) -join ',') -eq 'a' -and [string]$multi.rows[0][0] -eq '1' -and @($multi.rows).Count -eq 1) 'several statements show the first result' ($multi | ConvertTo-Json -Compress)
+    $big = Api '/api/query' @{ conn = $conn; sql = "SELECT REPEAT(CONVERT(x'C3A9' USING utf8mb4), 70000) AS v" }
+    Check ($big.ok -and ([string]$big.rows[0][0]).Length -eq 70000 -and ([string]$big.rows[0][0]).Trim([char]0xE9) -eq '') 'a 70,000-character value arrives whole' "len=$(([string]$big.rows[0][0]).Length)"
+    $ddl = Api '/api/ddl' @{ conn = $conn; db = 'nobs_test'; type = 'table'; name = 'charset_binary' }
+    Check ($ddl.ok -and [string]$ddl.ddl -match '(?s)CREATE TABLE.*\n') 'SHOW CREATE TABLE still arrives with its line breaks' ($ddl | ConvertTo-Json -Compress)
 
     # --- the CA certificate is actually used, not just written down ------------------------------
     # Writing ssl-ca= into the options file proves nothing on its own: the client could ignore it

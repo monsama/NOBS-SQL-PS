@@ -238,6 +238,31 @@ eq(applyBody.indexOf('pastedHexColumns(') >= 0, true, 'applyChanges calls the sc
 eq(applyBody.indexOf('pastedHexColumns(') < applyBody.indexOf('UPDATE '), true,
    'the screen runs before any SQL is built');
 
+// Row values are written for their column's type once it is known. lit() goes by the value's shape,
+// so a text cell holding 0x41 became the byte A, and an empty binary value - shown as the bare 0x -
+// became the two characters 0x. And a CR is escaped: mysql.exe reading a script turns CR LF into
+// LF, which silently dropped the CR from any value that had one before a line feed.
+const litSrc = ['strLit', 'lit', 'litAs'].map(n => extractFunction(src, n)).join('\n');
+const L = new Function(litSrc + '\nreturn {strLit, lit, litAs};')();
+eq(L.strLit('a\r\nb'), "'a\\r\nb'", 'a CR is written as \\r, so a script reader cannot drop it');
+eq(L.strLit('a\0b'), "'a\\0b'", 'a NUL is written as \\0');
+eq(L.litAs('0x41', false), "'0x41'", 'text that looks like hex stays text in a text column');
+eq(L.litAs('0x41', true), '0x41', 'hex in a binary column is a hex literal');
+eq(L.litAs('0x', true), "X''", 'the bare 0x of an empty binary value is empty, not the characters 0x');
+eq(L.litAs('0x', false), "'0x'", 'in a text column 0x is the two characters');
+eq(L.litAs(null, true), 'NULL', 'NULL is NULL');
+eq(L.litAs('NULL', false), "'NULL'", "the text 'NULL' is quoted");
+eq(L.litAs('0x41', null), '0x41', 'with the type unknown it is lit(), as before');
+eq(/litAs\(t\.rows\[ri\]/.test(applyBody), true, 'applyChanges writes row keys by column type');
+eq(/litAs\(byRow\[ri\]\[ci\]/.test(applyBody), true, 'applyChanges writes changed cells by column type');
+for (const f of ['insGrid', 'insSel', 'exportFull']) {
+  eq(extractFunction(src, f).includes('litAs('), true, f + ' writes rows by column type');
+}
+// XML output turns a NUL inside text into a space, so exports of a table refuse such a table.
+for (const f of ['insSel', 'csvSel', 'exportFull']) {
+  eq(extractFunction(src, f).includes('refuseNulTextExport('), true, f + ' checks the table for NUL in text first');
+}
+
 process.exit(fail ? 1 : 0);
 '@
 

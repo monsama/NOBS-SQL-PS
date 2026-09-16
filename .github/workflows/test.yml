@@ -74,8 +74,8 @@ jobs:
         shell: pwsh
         run: ./tests/DumpTarget.Tests.ps1 ./NOBSSQL.ps1
 
-      # mysql --batch does not escape CR, and rows were cut at CR as well as LF - a value holding
-      # one split its row and shifted the columns after it.
+      # Result rows come from mysql --xml, the only output that tells NULL from the text 'NULL'.
+      # The reader is checked against real output from both clients (MySQL's writes CRLF).
       - name: Run result row tests
         shell: pwsh
         run: ./tests/ResultRows.Tests.ps1 ./NOBSSQL.ps1
