@@ -403,8 +403,9 @@ function Run-Query2 {
     try {
         $a=@("--defaults-extra-file=$cnf","--batch","--default-character-set=utf8mb4")
         if($db){ $a+="--database=$db" }
-        $a+=@("-e",$sql)
+        $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
         $r=Run-Proc $script:MysqlPath $a $RequestId
+        if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
         if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
         $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
@@ -524,6 +525,9 @@ function Close-QueryCursorProc {
     try { $cursor.Process.Dispose() } catch {}
     if ($cursor.RequestId) { $null = $script:RunningQueries.TryRemove($cursor.RequestId, [ref]$null) }
     if ($cursor.Cnf) { Remove-Item $cursor.Cnf -Force -ErrorAction SilentlyContinue }
+    # The temp file New-SqlArg may have written for an oversized statement lives as long as the
+    # cursor does - mysql.exe is still reading from it while rows are being paged.
+    if ($cursor.SqlFile) { Remove-Item $cursor.SqlFile -Force -ErrorAction SilentlyContinue }
     @{ exit=$exitCode; err=$errTxt }
 }
 
@@ -540,7 +544,8 @@ function Open-QueryCursor {
     $cnf = New-Cnf $conn
     $a=@("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
     if ($db) { $a += "--database=$db" }
-    $a += @("-e",$sql)
+    $sqlArg = New-SqlArg $sql
+    $a += @("-e",$sqlArg.arg)
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$script:MysqlPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
@@ -556,7 +561,7 @@ function Open-QueryCursor {
     if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
     $cursor=[pscustomobject]@{
         Process=$p; Reader=$p.StandardOutput; ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry
-        Headers=$null; Pending=$null; RequestId=$RequestId; Cnf=$cnf
+        Headers=$null; Pending=$null; RequestId=$RequestId; Cnf=$cnf; SqlFile=$sqlArg.file
         LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
     }
     $headerLine=$null
@@ -602,8 +607,9 @@ function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
     try {
         $a=@("--defaults-extra-file=$cnf","--batch","--raw","--default-character-set=utf8mb4")
         if($db){ $a+="--database=$db" }
-        $a+=@("-e",$sql)
+        $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
         $r=Run-Proc $script:MysqlPath $a $RequestId
+        if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
         if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
         $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
@@ -730,12 +736,31 @@ function Api-SearchAllSchemas { param($conn,$term)
     '{"ok":true,"items":['+($items -join ',')+']}'
 }
 
+# SQL goes to mysql.exe as a single command-line argument (-e "..."), and Windows caps a whole
+# command line at about 32767 characters. Past that Process.Start throws, and the user saw a raw
+# .NET exception - "An error occurred trying to start process" - with nothing about SQL or size in
+# it. Saving a BLOB of any real size hit this: a 16 KB value becomes a ~33 KB hex literal.
+#
+# Past a safe threshold, hand mysql a file to read instead. "source <file>" keeps the argument
+# short, and is exactly what Api-Script has always done for multi-statement scripts. The caller
+# gets the temp path back and is responsible for deleting it once the process has finished with
+# it - for a cursor that means when the cursor closes, not when it is opened.
+function New-SqlArg {
+    param([string]$Sql)
+    # Well under the limit, leaving room for the other arguments and the executable path.
+    if ($null -eq $Sql -or $Sql.Length -le 16000) { return @{ arg = $Sql; file = $null } }
+    $tmp = Join-Path $env:TEMP ("nobs-sql-" + [Guid]::NewGuid().ToString('N') + ".sql")
+    [IO.File]::WriteAllText($tmp, $Sql, (New-Object System.Text.UTF8Encoding($false)))
+    return @{ arg = ("source " + ($tmp -replace '\\','/')); file = $tmp }
+}
+
 # Execute SQL that returns no rows (INSERT / UPDATE / DDL ...).
 function Run-Exec { param($conn,$sql)
     $cnf=New-Cnf $conn
-    try { $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","-e",$sql)
+    $sa=New-SqlArg $sql
+    try { $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","-e",$sa.arg)
         if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
-    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue } }
 }
 # Read-only guard: true only if EVERY statement is a pure read (SELECT/SHOW/EXPLAIN...).
 # Removes every balanced (...) group, tracking nesting depth AND quote state (so a ')' or keyword
@@ -4646,6 +4671,16 @@ function normalizeHexInput(s){
 // the bytes they denote. That is how a blob in this database came to hold 307 bytes of hex-dump
 // text in place of a 102-byte hash. Only the 0x-prefixed form is flagged: a bare run of hex
 // digits is very often a genuine value (an MD5 written out as text, say).
+// The value a binary/BLOB cell hands to lit() for a given tab. Named and top-level so the tests
+// exercise this exact function rather than a restatement of it - an earlier version of those
+// tests reimplemented the empty-value rule and would have kept passing without it.
+function hexCellValueForSave(mode, raw){
+ const h = mode==='text' ? textToHex(raw) : normalizeHexInput(raw);
+ // An empty box is an empty value, and both conversions give "0x" - zero digits. That is not
+ // valid SQL, and lit()'s hex passthrough requires at least one digit, so it fell through to
+ // being quoted and stored the two CHARACTERS 0 and x instead of nothing at all.
+ return (h===null||h==='0x')?'':h;
+}
 function looksLikePastedHex(s){
  return /^0[xX][0-9A-Fa-f]{8,}$/.test(String(s==null?'':s).replace(/\s+/g,''));
 }
@@ -4756,14 +4791,7 @@ function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;c
   // string goes unquoted via litForCol's existing BIT-integer path, a "0x.." string goes unquoted
   // via lit()'s existing hex-literal passthrough. Neither needs re-encoding here.
   if(opts.bitNumeric)return ta.value;
-  if(opts.hexText){
-   const h=_vHexState.mode==='text'?textToHex(ta.value):normalizeHexInput(ta.value);
-   // An empty box is an empty value, and textToHex('') / normalizeHexInput('') both give "0x"
-   // - zero digits. That is not valid SQL, and lit()'s hex passthrough requires at least one
-   // digit, so it fell through to being quoted and stored the two CHARACTERS 0 and x instead of
-   // nothing at all. Hand back an empty string and let it be quoted as one.
-   return (h===null||h==='0x')?'':h;
-  }
+  if(opts.hexText)return hexCellValueForSave(_vHexState.mode, ta.value);
   return opts.options?sel.value:ta.value;
  };
  if(!opts.options&&!opts.multiOptions&&!opts.dateType){

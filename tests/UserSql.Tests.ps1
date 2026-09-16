@@ -125,16 +125,19 @@ eq(H.looksLikePastedHex('d41d8cd98f00b204e9800998ecf8427e'), false, 'a bare MD5-
 // and lit()'s hex passthrough requires at least one digit, so it used to fall through to being
 // quoted: clearing a BLOB stored the literal characters 0 and x. Found by round-tripping every
 // kind of input through a live server and comparing HEX(col) to the bytes that went in.
-const litFn = new Function(extractFunction(src, 'strLit') + '\n' + extractFunction(src, 'lit') + '\nreturn lit;')();
-const t2h = new Function(extractFunction(src, 'bytesToHex') + '\n' + extractFunction(src, 'textToHex') + '\nreturn textToHex;')();
-const forEmpty = (h) => (h === null || h === '0x') ? '' : h;
+// Drives the real hexCellValueForSave - the function getVal() calls - so removing the empty-value
+// rule from the app breaks this. An earlier version restated the rule and would have kept passing.
+const saveSrc = ['strLit','lit','bytesToHex','textToHex','hexToBytes','normalizeHexInput','hexCellValueForSave']
+  .map(n => extractFunction(src, n)).join('\n');
+const S = new Function(saveSrc + '\nreturn {lit,textToHex,normalizeHexInput,hexCellValueForSave};')();
+const litFn = S.lit, t2h = S.textToHex;
 
 eq(t2h(''), '0x', 'an empty Text box converts to a digit-less 0x');
 eq(H.normalizeHexInput(''), '0x', 'an empty Hex box normalises to a digit-less 0x');
 eq(litFn('0x'), "'0x'", 'lit() quotes a digit-less 0x, which is why getVal maps it to empty first');
-eq(litFn(forEmpty(t2h(''))), "''", 'an empty Text box stores an empty value, not the characters 0x');
-eq(litFn(forEmpty(H.normalizeHexInput(''))), "''", 'an empty Hex box stores an empty value');
-eq(litFn(forEmpty(H.normalizeHexInput('0x00'))), '0x00', 'a real one-byte value is untouched by that mapping');
+eq(litFn(S.hexCellValueForSave('text','')), "''", 'an empty Text box stores an empty value, not the characters 0x');
+eq(litFn(S.hexCellValueForSave('hex','')), "''", 'an empty Hex box stores an empty value');
+eq(litFn(S.hexCellValueForSave('hex','0x00')), '0x00', 'a real one-byte value is untouched by that mapping');
 
 process.exit(fail ? 1 : 0);
 '@

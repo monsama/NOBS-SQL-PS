@@ -346,6 +346,99 @@ try {
     Check ((Scalar 'SELECT HEX(b) FROM bin_rt WHERE id=1' 'nobs_test') -eq '00FF10') 'writing a binary cell back leaves the bytes unchanged' "held=$held"
     Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.bin_rt' } | Out-Null
 
+    # --- 4e. byte fidelity: what you type is what gets stored ---------------------------------
+    # Three separate binary-fidelity bugs shipped in code that read correctly and passed the tests
+    # that existed: the stdout reader destroying non-UTF-8 bytes, hex pasted into the Text tab
+    # being stored as characters, and an emptied cell storing the two characters "0x". None were
+    # found by reasoning about the code - all three were found by putting a value in, reading it
+    # back out, and comparing bytes. So that comparison lives here now, across the kinds of input
+    # that actually break things.
+    #
+    # The SQL literal is built by the REAL editor functions lifted out of NOBSSQL.ps1 (textToHex,
+    # normalizeHexInput, lit, strLit) plus the empty-value mapping getVal applies, so this follows
+    # the shipped save path rather than a description of it.
+    $rtHarness = @'
+import { readFileSync } from 'node:fs';
+function ex(src, name) {
+  let s = src.indexOf(`async function ${name}(`);
+  if (s === -1) s = src.indexOf(`function ${name}(`);
+  if (s === -1) throw new Error(name + ' not found - was it renamed?');
+  let d = 0;
+  for (let j = src.indexOf('{', s); j < src.length; j++) {
+    if (src[j] === '{') d++;
+    else if (src[j] === '}' && --d === 0) return src.slice(s, j + 1);
+  }
+  throw new Error('unbalanced braces in ' + name);
+}
+const src = readFileSync(process.argv[2], 'utf8');
+const names = ['strLit','lit','bytesToHex','textToHex','hexToBytes','normalizeHexInput'];
+const F = new Function(names.map(n => ex(src, n)).join('\n') + `\nreturn {${names.join(',')}};`)();
+const enc = new TextEncoder();
+const hexOf = s => [...enc.encode(s)].map(b => b.toString(16).padStart(2,'0')).join('').toUpperCase();
+
+const cases = [
+  ['a crypt hash typed as text',          '$7$C6..../....RYngpNxfC6t.r9JyBynUxwywkD8T/MbQx7QQl.Acjv.', 'text'],
+  ['single quotes',                       "it's a 'quoted' value",   'text'],
+  ['double quotes',                       'he said "hello"',         'text'],
+  ['backslashes',                         'C:\\path\\to\\file',      'text'],
+  ['a trailing backslash',                'trailing\\',              'text'],
+  ['a quote and a backslash together',    "mix'\\'end",              'text'],
+  ['a 4-byte emoji',                      'hi \u{1F600} there',      'text'],
+  ['CJK',                                 '\u4E2D\u6587\u6D4B\u8BD5','text'],
+  ['RTL',                                 '\u0645\u0631\u062D\u0628\u0627','text'],
+  ['a newline and a tab',                 'line1\nline2\tend',       'text'],
+  ['text shaped like SQL injection',      "'; DROP TABLE x; --",     'text'],
+  ['an empty box',                        '',                        'text'],
+  ['text that looks like hex',            '0x1234abcd',              'text'],
+  ['64 KB of text',                       'A'.repeat(65536),         'text'],
+  ['hex, as this app copies it',          '0x00ff10',                'hex'],
+  ['hex, Workbench-spaced',               '24 37 24 43',             'hex'],
+  ['hex, wrapped across lines',           '2437\n2443',              'hex'],
+  ['hex, without the 0x prefix',          'deadbeef',                'hex'],
+  ['hex, uppercase',                      '0xDEADBEEF',              'hex'],
+  ['hex, a lone NUL byte',                '0x00',                    'hex'],
+  ['hex, bytes that are not valid UTF-8', '0x00ff10fe',              'hex'],
+  ['hex, an empty box',                   '0x',                      'hex'],
+];
+// The mapping getVal() applies before handing the value to lit(): a digit-less "0x" is an empty
+// value, not the characters 0 and x.
+const forEmpty = h => (h === null || h === '0x') ? '' : h;
+const out = [];
+let id = 0;
+for (const [label, value, tab] of cases) {
+  id++;
+  const hex = tab === 'text' ? F.textToHex(value) : F.normalizeHexInput(value);
+  if (hex === null) throw new Error('normalizeHexInput rejected a case it should accept: ' + label);
+  out.push({ id, label, tab, literal: F.lit(forEmpty(hex)),
+             expect: tab === 'text' ? hexOf(value) : hex.slice(2).toUpperCase() });
+}
+console.log(JSON.stringify(out));
+'@
+    $rtTmp = Join-Path ([IO.Path]::GetTempPath()) "rt-harness-$PID.mjs"
+    Set-Content -LiteralPath $rtTmp -Value $rtHarness -Encoding utf8
+    $rtJson = & node $rtTmp (Resolve-Path $ScriptPath).Path
+    Remove-Item -LiteralPath $rtTmp -ErrorAction SilentlyContinue
+    if (-not $rtJson) {
+        Check $false 'the byte-fidelity harness produced cases' 'node returned nothing'
+    } else {
+        $rtCases = $rtJson | ConvertFrom-Json
+        Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.rt_probe' } | Out-Null
+        Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.rt_probe (id INT PRIMARY KEY, b LONGBLOB)' } | Out-Null
+        $bad = @()
+        foreach ($c in $rtCases) {
+            $ins = Api '/api/exec' @{ conn = $conn; sql = "INSERT INTO nobs_test.rt_probe VALUES ($($c.id), $($c.literal))" }
+            if (-not $ins.ok) { $bad += "$($c.label): insert failed - $($ins.error)"; continue }
+            $got = Scalar "SELECT IFNULL(HEX(b),'<NULL>') FROM rt_probe WHERE id=$($c.id)" 'nobs_test'
+            if ($got -ne $c.expect) {
+                $sg = if ($got.Length -gt 40) { $got.Substring(0,40) + '...' } else { $got }
+                $se = if ($c.expect.Length -gt 40) { $c.expect.Substring(0,40) + '...' } else { $c.expect }
+                $bad += "[$($c.tab)] $($c.label): got $sg want $se"
+            }
+        }
+        Check ($bad.Count -eq 0) "every one of $($rtCases.Count) inputs stores exactly the bytes it should" ($bad -join ' | ')
+        Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.rt_probe' } | Out-Null
+    }
+
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
     # extra rows used to read as "no row differences" - the wrong answer when checking production
