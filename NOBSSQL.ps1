@@ -1086,6 +1086,10 @@ function Api-Export { param($conn,$data)
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
     $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
+    # Statements mysql skipped because --force ("Continue on error") was in effect. Counted and
+    # reported back so a failed restore cannot quietly present itself as a screen full of OK
+    # lines - see the per-file logging below.
+    $errorsSkipped=0
     $jobId=[string]$data.jobId
     $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
     if($jobId){ $script:RunningJobs[$jobId]=$job }
@@ -1110,9 +1114,27 @@ function Api-Import { param($conn,$data)
                 $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId
                 $autoRetried = $true
             }
-            [void]$log.Add($(if($r.exit -eq 0){"OK  "+[IO.Path]::GetFileName($f)+$(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})}else{"FAILED ($($r.exit)) "+[IO.Path]::GetFileName($f)+" : "+(Friendly-DumpErr (FirstErr $r.err))+$(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})}))
+            $short = [IO.Path]::GetFileName($f)
+            $retryNote = $(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})
+            if($r.exit -eq 0){
+                # "Continue on error" passes --force, and mysql then exits 0 even when every statement
+                # failed, reporting what went wrong on stderr instead. Taking the exit code at face value
+                # turned a completely failed import into a clean list of OK lines - the worst possible
+                # outcome for a restore, because it looks like it worked. Report what the tool said.
+                $skipped = @(($r.err -split "`r?`n") | ForEach-Object { $_.Trim() } | Where-Object { $_ -match "ERROR" })
+                if($skipped.Count -eq 0){
+                    [void]$log.Add("OK  $short$retryNote")
+                } else {
+                    $errorsSkipped += $skipped.Count
+                    $more = $(if($skipped.Count -gt 1){" (+"+($skipped.Count-1)+" more)"}else{""})
+                    [void]$log.Add("OK with $($skipped.Count) error(s) SKIPPED  $short : "+$skipped[0]+$more+$retryNote)
+                }
+            } else {
+                $failNote = $(if($autoRetried){" (retried with --binary-mode, still failed)"}else{""})
+                [void]$log.Add("FAILED ($($r.exit)) $short : "+(Friendly-DumpErr (FirstErr $r.err))+$failNote)
+            }
         }
-        if($job.Cancelled){ '{"ok":true,"cancelled":true,"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"log":'+(J-Arr $log)+'}' }
+        if($job.Cancelled){ '{"ok":true,"cancelled":true,"errorsSkipped":'+$errorsSkipped+',"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"errorsSkipped":'+$errorsSkipped+',"log":'+(J-Arr $log)+'}' }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
 }
 

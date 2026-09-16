@@ -196,8 +196,15 @@ try {
     $sawCancel = $false
     $reachedRoutines = $false
     $reasonless = @()
-    foreach ($delay in 20, 40, 60, 80, 100, 130, 160, 200, 250, 300, 400, 550) {
-        if ($reachedRoutines -and $sawCancel) { break }
+    # Retry until the window is actually observed rather than hoping one pass of a fixed sweep
+    # lands in it. The dump is quick, so the window is narrow and a single sweep does flake; each
+    # attempt is cheap (every table is excluded, so there is almost nothing else to do). The sweep
+    # is cycled with a small jitter so repeated attempts do not all land in the same place.
+    $delaySweep = @(20, 30, 40, 55, 70, 85, 100, 120, 145, 175, 210, 260, 320, 400, 500)
+    $attempt = 0
+    while (-not ($reachedRoutines -and $sawCancel) -and $attempt -lt 45) {
+        $delay = $delaySweep[$attempt % $delaySweep.Count] + (Get-Random -Minimum 0 -Maximum 12)
+        $attempt++
         $folder = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-exp-$PID-$delay"
         Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
         $jobId = "live-$PID-$delay"
@@ -230,10 +237,45 @@ try {
     # Without this the whole case can pass by never happening: if every cancel lands during the
     # table loop, the routines/events branch under test is never executed and the assertion below
     # is vacuous. Confirmed by reverting the fix - the test only catches the bug when it gets here.
-    Check $reachedRoutines 'a cancel actually reached the routines/events step' "cancelled runs never got that far (full export ${full}ms) - widen the fractions above"
+    Check $reachedRoutines 'a cancel actually reached the routines/events step' "$attempt attempts, none landed inside the routines/events dump - widen `$delaySweep above"
     Check ($reasonless.Count -eq 0) 'a cancelled export never logs a FAILED line with no reason' ($reasonless -join ' | ')
     $orphans = @(Get-Process -Name 'mysqldump', 'mariadb-dump' -ErrorAction SilentlyContinue)
     Check ($orphans.Count -eq 0) 'cancelling leaves no orphaned mysqldump process' "found $($orphans.Count)"
+
+    # --- 4b. "Continue on error" must not hide the errors it continued past --------------------
+    # --force makes mysql exit 0 even when every statement failed, putting what went wrong on
+    # stderr instead. Trusting the exit code turned a completely failed restore into a clean list
+    # of OK lines - the worst outcome this endpoint can produce, because it looks like it worked.
+    $badSql = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-import-bad-$PID.sql"
+    Set-Content -LiteralPath $badSql -Encoding ascii -Value @(
+        'INSERT INTO nobs_test.no_such_table VALUES (1);'
+        'INSERT INTO nobs_test.also_missing VALUES (2);'
+    )
+    $forced = Api '/api/import' @{ conn = $conn; files = @($badSql); targetDb = 'nobs_test'; force = $true }
+    $forcedLine = ''
+    if ($forced.log) { $forcedLine = [string]$forced.log[0] }
+    # A plain success is "OK  <file>" with two spaces; "OK with N error(s) SKIPPED" is the honest
+    # form. Matching on the two spaces is what tells them apart - the same discriminator the Tauri
+    # edition's force_mode_reports_the_errors_it_skipped uses.
+    Check ($forcedLine -notmatch '^OK  ') 'a wholly failed force-import is not reported as a plain OK' "log: $forcedLine"
+    Check ($forcedLine -match 'error\(s\) SKIPPED') 'the skipped errors are named in the log' "log: $forcedLine"
+    Check ($forced.errorsSkipped -eq 2) 'errorsSkipped counts them' "errorsSkipped=$($forced.errorsSkipped)"
+
+    # The control: without --force the same file already reported correctly, and must still do so.
+    $unforced = Api '/api/import' @{ conn = $conn; files = @($badSql); targetDb = 'nobs_test'; force = $false }
+    $unforcedLine = ''
+    if ($unforced.log) { $unforcedLine = [string]$unforced.log[0] }
+    Check ($unforcedLine -match '^FAILED') 'without force, a failing import still reports FAILED' "log: $unforcedLine"
+
+    # And a genuinely clean import must stay a plain OK - otherwise the check above could be
+    # satisfied by simply never saying OK again.
+    $goodSql = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-import-good-$PID.sql"
+    Set-Content -LiteralPath $goodSql -Encoding ascii -Value @('SELECT 1;')
+    $clean = Api '/api/import' @{ conn = $conn; files = @($goodSql); targetDb = 'nobs_test'; force = $true }
+    $cleanLine = ''
+    if ($clean.log) { $cleanLine = [string]$clean.log[0] }
+    Check ($cleanLine -match '^OK  ' -and $clean.errorsSkipped -eq 0) 'a clean import is still a plain OK' "log: $cleanLine errorsSkipped=$($clean.errorsSkipped)"
+    Remove-Item -LiteralPath $badSql, $goodSql -Force -ErrorAction SilentlyContinue
 
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
