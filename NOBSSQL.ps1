@@ -1798,12 +1798,23 @@ function Api-CompareRows { param($data)
     $missingRows = New-Object System.Collections.ArrayList
     foreach($row in $srcR.rows){ if(-not $tgtSet.Contains(($row -join "`u{1}"))){ [void]$missingRows.Add($row) } }
     $missingTotal = $missingRows.Count
+    # Rows present only on the TARGET. Nothing here acts on them - this comparison inserts into
+    # the target and never deletes from it - but not REPORTING them let a target holding extra
+    # rows read as "no row differences", which is the wrong answer to hand someone comparing a
+    # production database against a copy. Both key sets are already in memory, so this costs one
+    # more pass and no extra query; only key values are returned, never full row data.
+    $srcSet = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach($row in $srcR.rows){ [void]$srcSet.Add(($row -join "`u{1}")) }
+    $extraRows = New-Object System.Collections.ArrayList
+    foreach($row in $tgtR.rows){ if(-not $srcSet.Contains(($row -join "`u{1}"))){ [void]$extraRows.Add($row) } }
+    $extraTotal = $extraRows.Count
+    $extraPks = if($extraTotal -gt 2000){ $extraRows.GetRange(0,2000) } else { $extraRows }
     $cap = 2000
     $truncated = $missingTotal -gt $cap
     $useRows = if($truncated){ $missingRows.GetRange(0,$cap) } else { $missingRows }
     $roJson = $(if($tgt.readonly){'true'}else{'false'})
     if($useRows.Count -eq 0){
-        return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":[],"rows":[],"missingTotal":0,"truncated":false,"targetReadonly":'+$roJson+',"allMissingPks":[]}'
+        return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":[],"rows":[],"missingTotal":0,"truncated":false,"targetReadonly":'+$roJson+',"extraTotal":'+$extraTotal+',"extraPks":'+(J-RowsFast $extraPks)+',"allMissingPks":[]}'
     }
     $fetch = Get-RowsByPk $src $srcDb $table $pk $useRows $rid
     if(-not $fetch.ok){ return '{"ok":false,"error":'+(J-Str $fetch.err)+'}' }
@@ -1818,7 +1829,7 @@ function Api-CompareRows { param($data)
     # the gap widens further at scale. This list can have hundreds of thousands of entries, so
     # using the pipeline version here would silently reintroduce the exact kind of slowness this
     # whole feature was built to eliminate.
-    '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":'+(J-Arr $fetch.columns)+',"rows":'+(J-RowsFast $fetch.rows)+',"missingTotal":'+$missingTotal+',"truncated":'+($(if($truncated){'true'}else{'false'}))+',"targetReadonly":'+$roJson+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+',"allMissingPks":'+(J-RowsFast $missingRows)+'}'
+    '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":'+(J-Arr $fetch.columns)+',"rows":'+(J-RowsFast $fetch.rows)+',"missingTotal":'+$missingTotal+',"truncated":'+($(if($truncated){'true'}else{'false'}))+',"targetReadonly":'+$roJson+',"extraTotal":'+$extraTotal+',"extraPks":'+(J-RowsFast $extraPks)+',"cancelled":'+($(if($cancelled){'true'}else{'false'}))+',"allMissingPks":'+(J-RowsFast $missingRows)+'}'
 }
 # Inserts the (client-selected) missing rows into the target, batched, using the exact column
 # list and values fetched from the source - so ids/keys match the source exactly. Always
@@ -5975,9 +5986,9 @@ async function cmpCompareRows(ti){
  const r=await api('/api/compare-rows',{sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,table:t.name,requestId:rid1},_cmprAbortCtrl.signal);
  _cmprRequestId=null;_cmprAbortCtrl=null;
  if(!r.ok){$('cmprNote').textContent='';$('cmprGrid').innerHTML='<div class="muted" style="padding:8px">'+esc(r.error||'Could not compare rows.')+' <a href="#" onclick="cmpCompareRows('+ti+');return false" style="color:var(--accent)">Retry</a></div>';return;}
- _cmprState={table:t.name,pkCols:r.pkCols,columns:r.columns,rows:r.rows.map(row=>({data:row,checked:true})),sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,missingTotal:r.missingTotal,truncated:r.truncated,allMissingPks:r.allMissingPks||[],targetTableMissing:targetTableMissing};
+ _cmprState={table:t.name,pkCols:r.pkCols,columns:r.columns,rows:r.rows.map(row=>({data:row,checked:true})),sourceConnName:sc,sourceDb:sd,targetConnName:tc,targetDb:td,missingTotal:r.missingTotal,truncated:r.truncated,allMissingPks:r.allMissingPks||[],extraTotal:r.extraTotal||0,extraPks:r.extraPks||[],targetTableMissing:targetTableMissing};
  var _cmprCancelNote1=r.cancelled?' (cancelled - only some tables/rows were checked before you stopped it)':'';
- $('cmprNote').innerHTML=r.missingTotal+' row(s) missing on target'+(r.truncated?(' (showing first '+r.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+r.missingTotal+' without reviewing them</a>)'):'')+_cmprCancelNote1+'. Rows are inserted with the SAME '+r.pkCols.join('/')+ ' value(s) as the source (insert-only - existing target rows are never changed).';
+ $('cmprNote').innerHTML=r.missingTotal+' row(s) missing on target'+(r.truncated?(' (showing first '+r.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+r.missingTotal+' without reviewing them</a>)'):'')+_cmprCancelNote1+'. Rows are inserted with the SAME '+r.pkCols.join('/')+ ' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(r.extraTotal,r.extraPks,r.pkCols);
  $('cmprRoNote').style.display=r.targetReadonly?'inline':'none';
  cmprRender();
 
@@ -6052,6 +6063,19 @@ async function cmprDiffApply(){
  const tableName=_cmprDiffState.table,ti=_cmpFindTableIndex(tableName);
  if(ti>=0){await cmpCompareRows(ti);}
  toast('Updated '+updates.length+' row(s) in '+tableName+'. Results refreshed.');
+}
+// Rows the TARGET holds that the source does not. Nothing in this dialog acts on them - the
+// comparison is insert-only and never deletes from the target - but leaving them unreported let
+// a target carrying extra rows read as "no row differences", which is the wrong answer to hand
+// someone checking a production database against a copy. So: always stated, never acted on.
+function cmprExtraNote(total,pks,pkCols){
+ if(!total)return '';
+ pks=pks||[];
+ const shown=pks.slice(0,10).map(r=>esc(r.map(v=>v==null?'NULL':v).join('/'))).join(', ');
+ const ellipsis=total>Math.min(pks.length,10)?' …':'';
+ return '<div class="muted" style="margin-top:6px"><b>'+total+'</b> row(s) exist only on the target'
+  +(shown?(' ['+esc((pkCols||[]).join('/'))+': '+shown+ellipsis+']'):'')
+  +" - reported only; this comparison never deletes from the target.</div>";
 }
 function cmprRender(){
  const box=$('cmprGrid');
@@ -6138,7 +6162,7 @@ async function cmprTopUpAfterInsert(insertedRows){
    _cmprState.rows=[];
  }
  const stillTruncated=_cmprState.allMissingPks.length>_cmprState.rows.length;
- $('cmprNote').innerHTML=_cmprState.missingTotal+' row(s) missing on target'+(stillTruncated?(' (showing next '+_cmprState.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+_cmprState.missingTotal+' without reviewing them</a>)'):'')+'. Rows are inserted with the SAME '+_cmprState.pkCols.join('/')+' value(s) as the source (insert-only - existing target rows are never changed).';
+ $('cmprNote').innerHTML=_cmprState.missingTotal+' row(s) missing on target'+(stillTruncated?(' (showing next '+_cmprState.rows.length+' for review - <a href="#" onclick="cmprInsertAll();return false" style="color:var(--accent)">insert all '+_cmprState.missingTotal+' without reviewing them</a>)'):'')+'. Rows are inserted with the SAME '+_cmprState.pkCols.join('/')+' value(s) as the source (insert-only - existing target rows are never changed).'+cmprExtraNote(_cmprState.extraTotal,_cmprState.extraPks,_cmprState.pkCols);
  cmprRender();
 }
 // Reset every field to its fresh-open default here rather than on Close - Escape closes the
