@@ -318,6 +318,34 @@ try {
     Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_rt' } | Out-Null
     Remove-Item -LiteralPath $csv1, $csv2, $csvBad -Force -ErrorAction SilentlyContinue
 
+    # --- 4d. binary values survive the trip through the CLI ------------------------------------
+    # Rows are parsed out of mysql.exe's stdout. Reading that stream as UTF-8 made the decoder
+    # replace every byte that was not valid UTF-8 with U+FFFD before any of this app's code saw
+    # it: VARBINARY 00 FF 10 arrived as 0x00EFBFBD10. It was not merely a display problem - the
+    # grid writes a cell back exactly as it holds it, so saving such a row committed the mangled
+    # bytes to disk. The reader is byte-preserving now and CellVal decides per field whether the
+    # bytes are text or binary.
+    $cb = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT bin_col, blob_col, bit8, emoji, cjk FROM charset_binary WHERE id=1' }
+    Check ($cb.ok -and [string]$cb.rows[0][0] -eq '0x00FF10') 'a VARBINARY column arrives with its bytes intact' ("got " + [string]$cb.rows[0][0])
+    Check ([string]$cb.rows[0][1] -eq '0xDEADBEEF') 'a BLOB column arrives with its bytes intact' ("got " + [string]$cb.rows[0][1])
+    Check ([string]$cb.rows[0][2] -eq '0xAA') 'a BIT(8) column arrives as its real byte' ("got " + [string]$cb.rows[0][2])
+    # The same change must not break text: these share the stream and are decoded as UTF-8.
+    Check ([string]$cb.rows[0][3] -eq ([char]::ConvertFromUtf32(0x1F600))) 'a 4-byte emoji still arrives as itself' ("got " + [string]$cb.rows[0][3])
+    Check ([string]$cb.rows[0][4] -ne '' -and [string]$cb.rows[0][4] -notmatch [char]0xFFFD) 'CJK text still arrives undamaged' ("got " + [string]$cb.rows[0][4])
+    # NULL must stay distinguishable from an empty binary. (This is why --binary-as-hex on the
+    # client was not usable: it renders NULL and empty identically, both as "0x".)
+    $nullRow = Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT bin_col FROM charset_binary WHERE id=3' }
+    Check ($null -eq $nullRow.rows[0][0]) 'a NULL binary column is still NULL, not an empty blob' ("got " + ($nullRow.rows[0][0] | ConvertTo-Json -Compress))
+
+    # And the round trip, which is where the corruption used to become permanent.
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.bin_rt' } | Out-Null
+    Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.bin_rt (id INT PRIMARY KEY, b VARBINARY(8))' } | Out-Null
+    Api '/api/exec' @{ conn = $conn; sql = 'INSERT INTO nobs_test.bin_rt VALUES (1, 0x00FF10)' } | Out-Null
+    $held = [string](Api '/api/query' @{ conn = $conn; db = 'nobs_test'; sql = 'SELECT b FROM bin_rt WHERE id=1' }).rows[0][0]
+    Api '/api/rowop' @{ conn = $conn; db = 'nobs_test'; table = 'bin_rt'; op = 'update'; set = @{ b = $held }; where = @{ id = 1 } } | Out-Null
+    Check ((Scalar 'SELECT HEX(b) FROM bin_rt WHERE id=1' 'nobs_test') -eq '00FF10') 'writing a binary cell back leaves the bytes unchanged' "held=$held"
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.bin_rt' } | Out-Null
+
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
     # extra rows used to read as "no row differences" - the wrong answer when checking production

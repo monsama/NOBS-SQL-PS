@@ -275,12 +275,47 @@ $script:ReservedSet = [System.Collections.Generic.HashSet[string]]::new([string[
 # True if a table/column name must be backtick-quoted (reserved word or odd characters).
 function Needs-Quote { param([string]$n) if ($n -eq '' -or $n -notmatch '^[A-Za-z_$][A-Za-z0-9_$]*$') { return $true } return $script:ReservedSet.Contains($n.ToLower()) }
 $script:CtrlChars = [char[]]@([char]0,[char]1,[char]2,[char]3,[char]4,[char]5,[char]6,[char]7,[char]8,[char]11,[char]12,[char]14,[char]15,[char]16,[char]17,[char]18,[char]19,[char]20,[char]21,[char]22,[char]23,[char]24,[char]25,[char]26,[char]27,[char]28,[char]29,[char]30,[char]31)
+# Result rows are read off mysql.exe's stdout with a byte-preserving Latin-1 reader (see
+# Open-QueryCursor), so every char in a raw field is exactly one byte the server sent. These two
+# encodings turn that back into either real text or an honest hex representation.
+#
+# Reading stdout as UTF-8 instead - which is what this did - silently destroyed every byte that
+# was not valid UTF-8: the .NET decoder replaced each one with U+FFFD before any of this code saw
+# it. A VARBINARY holding 00 FF 10 came back as 0x00EFBFBD10 (EFBFBD being U+FFFD re-encoded), and
+# because the grid writes a cell back exactly as it displays it, saving that row committed the
+# corruption to disk. Verified against a live server, before and after.
+#
+# --binary-as-hex on the client would have been the obvious fix and is not usable here: it renders
+# a NULL binary column and an empty one identically, both as "0x", losing the NULL/empty
+# distinction this app is careful about everywhere else.
+$script:RawEnc    = [System.Text.Encoding]::GetEncoding(28591)              # ISO-8859-1: byte <-> char, lossless
+$script:StrictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)     # throws rather than substituting
+
+# Recovers real text from a Latin-1-read string, for values that are known to be text (column
+# headers). Falls back to the raw string if it is somehow not valid UTF-8, since a header is more
+# useful mangled than missing.
+function ConvertFrom-RawText {
+    param([string]$s)
+    if ([string]::IsNullOrEmpty($s)) { return $s }
+    try { return $script:StrictUtf8.GetString($script:RawEnc.GetBytes($s)) } catch { return $s }
+}
+
 # Turn a raw CLI cell value into a real value (the literal NULL marker becomes an actual null).
 function CellVal { param($raw)
     if($raw -eq '\N' -or $raw -eq 'NULL'){ return $null }
     $v=ConvertFrom-BatchField $raw
-    if($v.Length -gt 0 -and $v.IndexOfAny($script:CtrlChars) -ge 0){ $b=[Text.Encoding]::UTF8.GetBytes($v); return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
-    return $v
+    if($v.Length -eq 0){ return $v }
+    $b=$script:RawEnc.GetBytes($v)
+    # Valid UTF-8 means it is text the user should see as text - emoji, CJK, accents and all.
+    # Anything else is genuinely binary, and hex is this app's display encoding for binary (the
+    # same 0x.. form SqlValLit already knows how to send back unquoted).
+    $text=$null
+    try { $text=$script:StrictUtf8.GetString($b) } catch { $text=$null }
+    if($null -eq $text){ return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
+    # Valid UTF-8 can still be a byte the grid should not print - a BIT column's 0x01, say - so
+    # control characters keep going out as hex exactly as they did before.
+    if($text.IndexOfAny($script:CtrlChars) -ge 0){ return '0x'+(([BitConverter]::ToString($b)) -replace '-','') }
+    return $text
 }
 # Quote an identifier (table/column) with backticks when needed - prevents broken/injected SQL.
 function SqlId  { param($x) $s=[string]$x; if (Needs-Quote $s) { '`' + ($s -replace '`','``') + '`' } else { $s } }
@@ -509,7 +544,12 @@ function Open-QueryCursor {
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$script:MysqlPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
-    $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
+    # Result rows are parsed out of this stream, so it must not lose bytes. A UTF-8 reader
+    # replaces every invalid byte with U+FFFD, which silently destroyed binary column values
+    # before CellVal ever saw them. Latin-1 maps each byte to one char untouched; CellVal then
+    # decides per field whether those bytes are text or binary. stderr stays UTF-8 - it carries
+    # human-readable server messages, not row data.
+    $psi.StandardOutputEncoding=$script:RawEnc; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
     $psi.Arguments=Format-Args $a
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
     $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
@@ -528,7 +568,7 @@ function Open-QueryCursor {
         if ($r.exit -ne 0) { return @{ ok=$false; err=(FirstErr $r.err) } }
         return @{ ok=$true; columns=@(); rows=@(); hasMore=$false }
     }
-    $cursor.Headers = @($headerLine.Split([char]9))
+    $cursor.Headers = @($headerLine.Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
     $page = Read-CursorRows $cursor $PageSize
     if (-not $page.hasMore) {
         $r = Close-QueryCursorProc $cursor
@@ -6551,7 +6591,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
