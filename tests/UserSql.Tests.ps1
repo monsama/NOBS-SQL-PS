@@ -139,6 +139,19 @@ eq(litFn(S.hexCellValueForSave('text','')), "''", 'an empty Text box stores an e
 eq(litFn(S.hexCellValueForSave('hex','')), "''", 'an empty Hex box stores an empty value');
 eq(litFn(S.hexCellValueForSave('hex','0x00')), '0x00', 'a real one-byte value is untouched by that mapping');
 
+
+// The shape that actually corrupted two blobs in a real database: a copied cell pasted WITHOUT
+// first selecting what was in the box, so the hex ends up alongside the old value rather than
+// replacing it. The first version of this guard was anchored ^...$ and stayed silent for exactly
+// this - it only noticed a box containing nothing but hex.
+const pxHex = '0x24372443362e2e2e2e2f2e2e2e2e65306b307751397a566d78426c66416c67353867';
+const pxText = '$7$C6..../....RYngpNxfC6t.r9JyBynUxwywkD8T/MbQx7QQl.Acjv.';
+eq(H.looksLikePastedHex(pxHex + pxText), true, 'hex pasted in front of the old value is recognised');
+eq(H.looksLikePastedHex(pxText + pxHex), true, 'hex pasted after the old value is recognised');
+eq(H.looksLikePastedHex('the 0xAB flag is set'), false, 'text mentioning a short hex number is left alone');
+eq(H.looksLikePastedHex('value: 0x1234 and 0x5678'), false, 'short hex numbers in prose are left alone');
+eq(H.looksLikePastedHex(pxText), false, 'the decoded value itself must never warn');
+
 process.exit(fail ? 1 : 0);
 '@
 
