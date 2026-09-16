@@ -195,6 +195,44 @@ function Get-SslLines {
     else        { switch ($Mode) { 'disabled'{return @('ssl-mode=DISABLED')} 'required'{return @('ssl-mode=REQUIRED')} 'verify'{return @('ssl-mode=VERIFY_IDENTITY')} } }
     return @()
 }
+# Where the client should look for authentication plugins.
+#
+# MySQL 8 authenticates with caching_sha2_password by default - every account on a stock install,
+# including root. That is a CLIENT-side plugin, a separate DLL the client dlopens at connect time,
+# and a client resolves it relative to its own location (../lib/plugin) unless told otherwise.
+# Api-DownloadTools extracts the .exe files into a flat directory with no lib/plugin beside them,
+# so the bundled client had nowhere to find it and every connection to a stock MySQL 8 server died
+# before it could even ask for SSL:
+#
+#   ERROR 1045 (28000): Plugin caching_sha2_password could not be loaded:
+#   The specified module could not be found. Library path is 'caching_sha2_password.dll'
+#
+# The plugins ship in the same archive the binaries come from; they were simply not being unpacked.
+# They are now, into a plugin/ directory beside them, and this points the client at it.
+#
+# Only for OUR copy. A client from a real MariaDB or MySQL installation sits in a proper bin/ with
+# its own lib/plugin next door and finds the right ones by itself - overriding that with a plugin
+# set from a different product is how you turn a working connection into a broken one.
+function Get-PluginDir {
+    if (-not $script:MysqlPath) { return $null }
+    $binDir = Split-Path -Parent $script:MysqlPath
+    if (-not $binDir -or -not $script:ToolsDir) { return $null }
+    if ($binDir.TrimEnd('\') -ne ([string]$script:ToolsDir).TrimEnd('\')) { return $null }
+    $p = Join-Path $script:ToolsDir 'plugin'
+    if (Test-Path $p) { return $p }
+    return $null
+}
+
+# The client plugins worth unpacking: the ones that let it AUTHENTICATE. The archive also carries
+# storage engines, audit plugins and the like, which belong to a server and have no business here.
+$script:ClientAuthPlugins = @(
+    'caching_sha2_password.dll',        # MySQL 8's default, and the reason this exists
+    'sha256_password.dll',              # MySQL 5.7's equivalent, still accepted by 8
+    'client_ed25519.dll', 'parsec.dll', # MariaDB's own
+    'dialog.dll', 'mysql_clear_password.dll',
+    'auth_gssapi_client.dll', 'authentication_windows_client.dll', 'auth_named_pipe.dll'
+)
+
 # Create a temp my.cnf so the CLI tools can log in WITHOUT the password showing on the command line.
 # A raw newline in a value would otherwise start a brand new line in the .cnf file, letting a
 # saved connection's host/user/password inject an arbitrary extra option-file directive (e.g.
@@ -210,6 +248,8 @@ function New-Cnf {
     [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
     if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
     foreach ($l in (Get-SslLines $conn.ssl)) { [void]$sb.AppendLine($l) }
+    $pluginDir = Get-PluginDir
+    if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
     [IO.File]::WriteAllText($tmp, '', (New-Object System.Text.UTF8Encoding($false)))
@@ -395,6 +435,18 @@ function Get-BatchFailureNote { param([string]$Err)
 # export/import option only supported by one dump-tool flavor (MySQL vs MariaDB, or an older
 # version of either) is used against the other. Name the likely cause instead of leaving a bare
 # "unknown variable" for the user to puzzle over.
+# A missing client authentication plugin reads like a broken install, and the fix is not obvious
+# from the message. It is also the single thing standing between this app and a stock MySQL 8
+# server, since caching_sha2_password is what every account on one uses by default.
+#
+# Client tools downloaded before the plugins were unpacked (see Get-PluginDir) are in exactly this
+# state, and no amount of retrying fixes them - the plugin simply is not on disk. Say what to do.
+function Friendly-AuthErr { param($raw)
+    if ($raw -match "(?i)plugin\s+(\S+)\s+could not be loaded") {
+        return "$raw - the client tools are missing the authentication plugin this server asked for. MySQL 8 uses caching_sha2_password for every account by default. Open Settings and download the client tools again (the plugins are unpacked alongside the binaries now), or point Settings at a full MySQL/MariaDB client installation."
+    }
+    return $raw
+}
 function Friendly-DumpErr { param($raw)
     if($raw -match "unknown variable '([^']*)'"){
         return "$raw - '$($matches[1])' isn't supported by this build of the tool (MySQL and MariaDB's client tools, and different versions of each, support different flag sets). Uncheck the matching export/import option, or point Settings at the other flavor's .exe."
@@ -683,7 +735,7 @@ function Api-Connect { param($conn)
     try {
         $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
         if($r.exit -eq 0){ $v=($r.out).Trim(); $script:ServerIsMariaDB=($v -match 'MariaDB'); return '{"ok":true,"version":'+(J-Str $v)+',"mariadb":'+(($script:ServerIsMariaDB).ToString().ToLower())+'}' }
-        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(FirstErr $r.err)))+'}'
+        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-AuthErr (FirstErr $r.err))))+'}'
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
 # List databases with their sizes for the left sidebar.
@@ -1652,15 +1704,27 @@ function Api-DownloadTools {
         if(-not(Test-Path $script:ToolsDir)){ New-Item -ItemType Directory -Path $script:ToolsDir -Force | Out-Null }
         $want = @('mysqldump.exe','mysql.exe','mysqlimport.exe','mysqlcheck.exe','mariadb.exe','mariadb-dump.exe')
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $zip=[IO.Compression.ZipFile]::OpenRead($tmpZip); $got=@()
-        foreach($e in $zip.Entries){ if($want -contains $e.Name){ [IO.Compression.ZipFileExtensions]::ExtractToFile($e,(Join-Path $script:ToolsDir $e.Name),$true); $got+=$e.Name } }
+        $zip=[IO.Compression.ZipFile]::OpenRead($tmpZip); $got=@(); $gotPlugins=0
+        # Authentication plugins go into plugin/ beside the binaries - without caching_sha2_password
+        # the client cannot log in to a stock MySQL 8 server at all (see Get-PluginDir). Matched on
+        # the archive path as well as the name so this takes the client plugins from lib/plugin and
+        # not something else that happens to share a file name.
+        $pluginDir = Join-Path $script:ToolsDir 'plugin'
+        foreach($e in $zip.Entries){
+            if($want -contains $e.Name){
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e,(Join-Path $script:ToolsDir $e.Name),$true); $got+=$e.Name
+            } elseif(($script:ClientAuthPlugins -contains $e.Name) -and ($e.FullName -replace '\\','/') -match '/lib/plugin/'){
+                if(-not(Test-Path $pluginDir)){ New-Item -ItemType Directory -Path $pluginDir -Force | Out-Null }
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e,(Join-Path $pluginDir $e.Name),$true); $gotPlugins++
+            }
+        }
         $zip.Dispose(); Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
         if($got.Count -eq 0){ return '{"ok":false,"error":"Archive downloaded but no client binaries inside."}' }
         $mb = @('mysql.exe','mariadb.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
         $db = @('mysqldump.exe','mariadb-dump.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
         Save-Cfg ([pscustomobject]@{ mysql_bin=[string]$mb; mysqldump_bin=[string]$db })
         if($mb){ $script:MysqlPath=[string]$mb }; if($db){ $script:MysqldumpPath=[string]$db }
-        '{"ok":true,"message":'+(J-Str ("Downloaded MariaDB $patch client tools to $script:ToolsDir"))+',"config":{"mysql_bin":'+(J-Str ([string]$mb))+',"mysqldump_bin":'+(J-Str ([string]$db))+'}}'
+        '{"ok":true,"message":'+(J-Str ("Downloaded MariaDB $patch client tools to $script:ToolsDir ($gotPlugins auth plugins)"))+',"config":{"mysql_bin":'+(J-Str ([string]$mb))+',"mysqldump_bin":'+(J-Str ([string]$db))+'}}'
     } catch {
         $detail = $_.Exception.Message
         try {

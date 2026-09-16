@@ -495,8 +495,12 @@ console.log(JSON.stringify(out));
         "  skip  no mysql client found for the connection-loss test"
     } else {
         $cnf = Join-Path $env:TEMP ("livetx-" + [Guid]::NewGuid().ToString('N') + ".cnf")
-        "[client]`nhost=$($conn.host)`nport=$($conn.port)`nuser=$($conn.user)`npassword=$($conn.password)" |
-            Set-Content -NoNewline -Encoding ascii $cnf
+        # Same plugin-dir the app's own New-Cnf writes - without it this helper cannot authenticate
+        # to a MySQL 8 server at all, since caching_sha2_password is a client-side plugin.
+        $body = "[client]`nhost=$($conn.host)`nport=$($conn.port)`nuser=$($conn.user)`npassword=$($conn.password)"
+        $plugDir = Join-Path (Split-Path -Parent $mysql) 'plugin'
+        if (Test-Path $plugDir) { $body += "`nplugin-dir=$($plugDir -replace '\\','\\')" }
+        $body | Set-Content -NoNewline -Encoding ascii $cnf
         function Sql($q) { & $mysql "--defaults-extra-file=$cnf" -N -B -e $q 2>&1 }
         try {
             Sql "CREATE DATABASE IF NOT EXISTS nobs_test" | Out-Null

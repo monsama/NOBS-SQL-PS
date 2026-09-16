@@ -56,6 +56,12 @@ jobs:
         shell: pwsh
         run: ./tests/BatchFailureNote.Tests.ps1 ./NOBSSQL.ps1
 
+      # MySQL 8 authenticates with caching_sha2_password by default, which is a client-side plugin
+      # the downloaded tools were not unpacking - so the app could not connect to one at all.
+      - name: Run client plugin directory tests
+        shell: pwsh
+        run: ./tests/PluginDir.Tests.ps1 ./NOBSSQL.ps1
+
       # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
       # windows-latest has none (GitHub's service containers are Linux-only, while this app
       # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would
