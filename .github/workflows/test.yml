@@ -31,3 +31,9 @@ jobs:
       - name: Run viewIndices tests
         shell: pwsh
         run: ./tests/ViewIndices.Tests.ps1 ./NOBSSQL.ps1
+
+      # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
+      # windows-latest has none (GitHub's service containers are Linux-only, while this app
+      # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would
+      # turn a green check into a claim about work that never ran. It is a local gate instead -
+      # see docs/TESTING.md.
