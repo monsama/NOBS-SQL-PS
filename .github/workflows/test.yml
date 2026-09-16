@@ -43,6 +43,13 @@ jobs:
         shell: pwsh
         run: ./tests/ViewIndices.Tests.ps1 ./NOBSSQL.ps1
 
+      # The MariaDB and MySQL clients name their SSL options mutually exclusively, so choosing the
+      # wrong set does not weaken the connection, it stops it outright. This needs no database: it
+      # asks the client binary, which parses the options file before it ever opens a socket.
+      - name: Run SSL options tests
+        shell: pwsh
+        run: ./tests/SslLines.Tests.ps1 ./NOBSSQL.ps1
+
       # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
       # windows-latest has none (GitHub's service containers are Linux-only, while this app
       # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would

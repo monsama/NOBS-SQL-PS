@@ -47,6 +47,9 @@ $ErrorActionPreference = 'Stop'
 $script:MysqldumpPath = $null
 $script:MysqlPath     = $null
 $script:ServerIsMariaDB = $null
+# Which SSL flag dialect the CLIENT binary speaks - see Test-ClientIsMariaDB. Deliberately
+# separate from ServerIsMariaDB above, which describes the far end of the connection.
+$script:ClientIsMariaDB = $null
 $script:RunningQueries = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # Live, streaming query cursors opened by /api/query and read incrementally by
@@ -152,12 +155,43 @@ function Resolve-Tools {
     if (-not $script:MysqldumpPath) { $c=Get-Command mysqldump.exe -ErrorAction SilentlyContinue; if($c){$script:MysqldumpPath=$c.Source; $script:MysqldumpSource = 'Found on the system PATH'} }
 }
 
+# Which SSL flag dialect the client binary speaks.
+#
+# The MariaDB and MySQL clients accept MUTUALLY EXCLUSIVE option names, so getting this wrong does
+# not weaken the connection, it stops it dead before a single byte reaches the server:
+#   MariaDB client 15.2  --ssl-mode=REQUIRED      -> unknown variable 'ssl-mode=REQUIRED'
+#   MySQL   client 8.0   --ssl                    -> unknown option '--ssl'
+#                        --ssl-verify-server-cert -> unknown option
+#                        --skip-ssl               -> unknown option
+#
+# This is a property of the BINARY, not of the server: these lines go into a [client] options file
+# that the client parses on startup, long before it opens a socket. Choosing from the server type
+# was wrong twice over - it asked the wrong end, and it asked a variable that could not answer.
+# $script:ServerIsMariaDB is set by Api-Connect from INSIDE a pooled runspace, so the assignment
+# stays in whichever of the 8 runspaces happened to serve that request; every other runspace still
+# sees the startup $null. Measured against a MySQL server, 8 concurrent requests split 4/4 between
+# the two dialects. $script:MysqlPath, by contrast, is resolved at startup and seeded into every
+# runspace, so deriving the dialect from it is deterministic everywhere.
+# Cached against the path it probed, so pointing Settings at a different client re-probes rather
+# than answering for the binary that used to be there.
+function Test-ClientIsMariaDB {
+    $path = [string]$script:MysqlPath
+    if ($script:ClientIsMariaDB -and $script:ClientIsMariaDB.Path -eq $path) { return $script:ClientIsMariaDB.Maria }
+    # The bundled client is MariaDB, so that is the safe assumption if the probe cannot run.
+    $maria = $true
+    if ($path -and (Test-Path $path)) {
+        try { $maria = ((& $path --version 2>&1 | Out-String) -match 'MariaDB') } catch { }
+    }
+    $script:ClientIsMariaDB = @{ Path = $path; Maria = $maria }
+    return $maria
+}
+
 # Build the SSL-related lines for the temporary my.cnf options file.
 function Get-SslLines {
-    param($Mode)
+    param($Mode, $Maria)
     if (-not $Mode -or $Mode -eq 'default') { return @() }
-    $maria = ($script:ServerIsMariaDB -ne $false)
-    if ($maria) { switch ($Mode) { 'disabled'{return @('skip-ssl')} 'required'{return @('ssl')} 'verify'{return @('ssl','ssl-verify-server-cert')} } }
+    if ($null -eq $Maria) { $Maria = Test-ClientIsMariaDB }
+    if ($Maria) { switch ($Mode) { 'disabled'{return @('skip-ssl')} 'required'{return @('ssl')} 'verify'{return @('ssl','ssl-verify-server-cert')} } }
     else        { switch ($Mode) { 'disabled'{return @('ssl-mode=DISABLED')} 'required'{return @('ssl-mode=REQUIRED')} 'verify'{return @('ssl-mode=VERIFY_IDENTITY')} } }
     return @()
 }
@@ -4968,7 +5002,17 @@ async function editWidgetFor(id,colName,curVal){
  if(colType&&/^date$/i.test(colType))dateType='date';
  else if(colType&&/^(datetime|timestamp)/i.test(colType))dateType='datetime-local';
  else if(colType&&/^time/i.test(colType))dateType='time';
- if(dateType&&(curVal==null||curVal===''||mysqlToNativeDate(curVal,dateType)))return {dateType};
+ // The picker is only safe for a value it can hand back unchanged. This used to ask merely
+ // whether the conversion produced SOMETHING, which is not the same thing: a DATETIME(6) of
+ // 2024-01-01 12:34:56.123456 converts happily to 2024-01-01T12:34:56, and saving that back
+ // dropped the fractional seconds without a word. Same for TIME(3). Require a real round trip -
+ // anything that does not survive one falls through to the plain text editor, where it is edited
+ // exactly as stored. That is what the comment below has always claimed; now it is true.
+ if(dateType&&(curVal==null||curVal==='')) return {dateType};
+ if(dateType){
+  const native=mysqlToNativeDate(curVal,dateType);
+  if(native&&nativeDateToMysql(native,dateType)===String(curVal)) return {dateType};
+ }
  // BIT columns get their own Number/Hex toggle (Heidi/Workbench show these as a plain numeric
  // value, not a byte dump) - see the block comment above hexToBitNumber.
  if(colType&&/^bit\(/i.test(colType))return {bitNumeric:true};
@@ -6643,6 +6687,9 @@ window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.prev
 $Html = $Html.Replace('__TOKEN__', $Token)
 
 Resolve-Tools
+# Probe the client's SSL flag dialect once here, so the answer is seeded into every runspace
+# below rather than each of them shelling out to "mysql.exe --version" on its first connection.
+[void](Test-ClientIsMariaDB)
 # Use a STABLE port so the app origin stays constant across restarts.
 # (Browser localStorage - favorites, accent colors, env labels, query library,
 #  session tabs - is scoped per origin; a random port would wipe it every launch.)
@@ -6757,7 +6804,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
