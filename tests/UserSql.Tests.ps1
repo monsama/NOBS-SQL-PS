@@ -119,6 +119,23 @@ eq(H.looksLikePastedHex('0x24372443362e2e2e'), true, 'hex pasted into the Text t
 eq(H.looksLikePastedHex('$7$C6..../....RYngpNxf'), false, 'the decoded value itself is not flagged');
 eq(H.looksLikePastedHex('d41d8cd98f00b204e9800998ecf8427e'), false, 'a bare MD5-looking value is not flagged');
 
+
+// An empty binary cell must store nothing, not the two characters "0x".
+// textToHex('') and normalizeHexInput('') both yield "0x" - zero digits. That is not valid SQL,
+// and lit()'s hex passthrough requires at least one digit, so it used to fall through to being
+// quoted: clearing a BLOB stored the literal characters 0 and x. Found by round-tripping every
+// kind of input through a live server and comparing HEX(col) to the bytes that went in.
+const litFn = new Function(extractFunction(src, 'strLit') + '\n' + extractFunction(src, 'lit') + '\nreturn lit;')();
+const t2h = new Function(extractFunction(src, 'bytesToHex') + '\n' + extractFunction(src, 'textToHex') + '\nreturn textToHex;')();
+const forEmpty = (h) => (h === null || h === '0x') ? '' : h;
+
+eq(t2h(''), '0x', 'an empty Text box converts to a digit-less 0x');
+eq(H.normalizeHexInput(''), '0x', 'an empty Hex box normalises to a digit-less 0x');
+eq(litFn('0x'), "'0x'", 'lit() quotes a digit-less 0x, which is why getVal maps it to empty first');
+eq(litFn(forEmpty(t2h(''))), "''", 'an empty Text box stores an empty value, not the characters 0x');
+eq(litFn(forEmpty(H.normalizeHexInput(''))), "''", 'an empty Hex box stores an empty value');
+eq(litFn(forEmpty(H.normalizeHexInput('0x00'))), '0x00', 'a real one-byte value is untouched by that mapping');
+
 process.exit(fail ? 1 : 0);
 '@
 
