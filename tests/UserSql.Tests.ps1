@@ -204,6 +204,40 @@ eq(M.cellCopyValue('0x00ff10fe'), '0x00ff10fe', 'bytes that are not text keep th
 eq(M.cellCopyValue('plain'), 'plain', 'a non-binary cell is copied untouched');
 eq(M.cellCopyValue(null), '', 'NULL copies as empty, not the word null');
 
+
+// --- the OTHER way into a binary column -------------------------------------------------------
+// The value editor is not the only route: you can type or paste straight into a grid cell, which
+// never opens that editor and so never saw its guard. A blob in a real database was destroyed
+// through this path AFTER the editor had been fixed, ending up with 919 bytes of doubly-nested
+// hex text where a 102-byte hash belonged. applyChanges screens staged edits before building any
+// SQL - the one choke point inline edits and new rows both pass through.
+const gSrc = ['bytesToHex','hexToBytes','normalizeHexInput','looksLikePastedHex','pastedHexColumns']
+  .map(n => extractFunction(src, n)).join('\n');
+const G = new Function(gSrc + '\nreturn pastedHexColumns;')();
+const gTab = (val) => ({ cols: ['id','data'], binCols: [false, true],
+                         pending: { upd: { '0:1': val }, ins: [] } });
+const gHex  = '0x24372443362e2e2e2e2f2e2e2e2e65306b307751397a566d78426c66416c67353867';
+const gHash = '$7$C6..../....hMYEng9e5.w8dP2TZwBhx.NwI9';
+
+eq(G(gTab(gHex + gHash)).join(','), 'data', 'hex pasted in front of the cell contents is refused');
+eq(G(gTab(gHash + gHex)).join(','), 'data', 'hex pasted after the cell contents is refused');
+eq(G(gTab(gHex + gHex + gHash)).join(','), 'data', 'hex pasted twice then the old value is refused');
+eq(G(gTab('0x00ff10')).join(','), '', 'a clean hex value is still allowed');
+eq(G(gTab(gHex)).join(','), '', 'a clean copied cell is still allowed');
+eq(G(gTab(gHash)).join(','), '', 'the decoded value itself is allowed');
+eq(G(gTab('')).join(','), '', 'an emptied cell is allowed');
+eq(G(gTab(null)).join(','), '', 'a cell set to NULL is allowed');
+eq(G({ cols:['id','data'], binCols:[false,true], pending:{ upd:{}, ins:[{ data: gHex + gHash }] } }).join(','),
+   'data', 'a new row with a bad paste is screened too');
+eq(G({ cols:['id','note'], binCols:[false,false], pending:{ upd:{ '0:1': gHex + gHash }, ins:[] } }).join(','),
+   '', 'a text column is not screened - 0x.. is not the display encoding there');
+
+// The logic above can be perfect and still never run, so pin the wiring too.
+const applyBody = extractFunction(src, 'applyChanges');
+eq(applyBody.indexOf('pastedHexColumns(') >= 0, true, 'applyChanges calls the screen');
+eq(applyBody.indexOf('pastedHexColumns(') < applyBody.indexOf('UPDATE '), true,
+   'the screen runs before any SQL is built');
+
 process.exit(fail ? 1 : 0);
 '@
 
