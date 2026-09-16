@@ -277,6 +277,47 @@ try {
     Check ($cleanLine -match '^OK  ' -and $clean.errorsSkipped -eq 0) 'a clean import is still a plain OK' "log: $cleanLine errorsSkipped=$($clean.errorsSkipped)"
     Remove-Item -LiteralPath $badSql, $goodSql -Force -ErrorAction SilentlyContinue
 
+    # --- 4c. CSV import: NULL and the empty string must stay different ------------------------
+    # A CSV field is just text, so the only thing separating "this cell is NULL" from "this cell
+    # is an empty string" is the null marker. Collapsing the two silently changes data on the way
+    # in, and it is the kind of thing nobody notices until a NOT NULL constraint or an IS NULL
+    # query behaves unexpectedly much later. The Tauri edition tests this; this one did not.
+    $csvDir = [IO.Path]::GetTempPath()
+    $csv1 = Join-Path $csvDir "nobs-live-csv-$PID.csv"
+    Set-Content -LiteralPath $csv1 -Encoding ascii -Value @(
+        'id,note,tag'
+        '1,\N,keep'          # \N is the marker -> NULL
+        '2,,keep'            # empty field -> empty string, NOT null
+    )
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_rt' } | Out-Null
+    Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.csv_live_rt (id INT PRIMARY KEY, note VARCHAR(32) NULL, tag VARCHAR(32))' } | Out-Null
+    $imp = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = 'csv_live_rt'; file = $csv1; hasHeader = $true; nullValue = '\N' }
+    Check ($imp.ok -eq $true) 'CSV import succeeds' ($imp | ConvertTo-Json -Compress)
+    $shape = Scalar "SELECT CONCAT(SUM(id=1 AND note IS NULL), '/', SUM(id=2 AND note='' AND note IS NOT NULL)) FROM csv_live_rt" 'nobs_test'
+    Check ($shape -eq '1/1') 'the marker becomes NULL and a blank field stays an empty string' "got $shape (want 1/1)"
+
+    # With an empty marker, a blank cell is meant to mean NULL instead.
+    $csv2 = Join-Path $csvDir "nobs-live-csv2-$PID.csv"
+    Set-Content -LiteralPath $csv2 -Encoding ascii -Value @('id,note,tag', '3,,keep')
+    $imp2 = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = 'csv_live_rt'; file = $csv2; hasHeader = $true; nullValue = '' }
+    Check ($imp2.ok -eq $true) 'CSV import with an empty null marker succeeds' ($imp2 | ConvertTo-Json -Compress)
+    Check ((Scalar "SELECT note IS NULL FROM csv_live_rt WHERE id=3" 'nobs_test') -eq '1') 'an empty marker makes blank cells NULL again'
+
+    # Replace-mode empties the table first. If the import then fails, that emptying must go too -
+    # otherwise a botched import destroys the data it was supposed to replace. (TRUNCATE could not
+    # deliver this: MySQL implicitly commits it. This path uses DELETE FROM inside the transaction
+    # for exactly that reason.)
+    $csvBad = Join-Path $csvDir "nobs-live-csv-bad-$PID.csv"
+    Set-Content -LiteralPath $csvBad -Encoding ascii -Value @('id,note,tag', '9,a,keep', '9,b,keep')  # duplicate PK
+    $before = Scalar 'SELECT COUNT(*) FROM csv_live_rt' 'nobs_test'
+    $impBad = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = 'csv_live_rt'; file = $csvBad; hasHeader = $true; nullValue = '\N'; truncate = $true }
+    Check ($impBad.ok -eq $false) 'an import with a duplicate key fails' ($impBad | ConvertTo-Json -Compress)
+    $after = Scalar 'SELECT COUNT(*) FROM csv_live_rt' 'nobs_test'
+    Check ($after -eq $before) 'a failed replace-mode import leaves the original rows untouched' "before=$before after=$after"
+
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_rt' } | Out-Null
+    Remove-Item -LiteralPath $csv1, $csv2, $csvBad -Force -ErrorAction SilentlyContinue
+
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
     # extra rows used to read as "no row differences" - the wrong answer when checking production
