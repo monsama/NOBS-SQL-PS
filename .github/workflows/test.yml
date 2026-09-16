@@ -68,6 +68,29 @@ jobs:
         shell: pwsh
         run: ./tests/ConnSslCa.Tests.ps1 ./NOBSSQL.ps1
 
+      # Restoring a per-database dump into a different target used to drop and rebuild the SOURCE
+      # database, because the file's own USE overrode the chosen target.
+      - name: Run dump target tests
+        shell: pwsh
+        run: ./tests/DumpTarget.Tests.ps1 ./NOBSSQL.ps1
+
+      # mysql --batch does not escape CR, and rows were cut at CR as well as LF - a value holding
+      # one split its row and shifted the columns after it.
+      - name: Run result row tests
+        shell: pwsh
+        run: ./tests/ResultRows.Tests.ps1 ./NOBSSQL.ps1
+
+      # The designer rewrote whatever it does not show (DECIMAL scale, UNSIGNED, fractional
+      # seconds, character set) on any edit, and renamed a column by dropping it.
+      - name: Run table designer tests
+        shell: pwsh
+        run: ./tests/TableDesigner.Tests.ps1 ./NOBSSQL.ps1
+
+      # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
+      - name: Run DDL recreate tests
+        shell: pwsh
+        run: ./tests/DdlRecreate.Tests.ps1 ./NOBSSQL.ps1
+
       # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
       # windows-latest has none (GitHub's service containers are Linux-only, while this app
       # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would

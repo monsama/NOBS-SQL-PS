@@ -50,6 +50,7 @@ $script:ServerIsMariaDB = $null
 # Which SSL flag dialect the CLIENT binary speaks - see Test-ClientIsMariaDB. Deliberately
 # separate from ServerIsMariaDB above, which describes the far end of the connection.
 $script:ClientIsMariaDB = $null
+$script:DumpIsMariaDB = $null
 $script:RunningQueries = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # Live, streaming query cursors opened by /api/query and read incrementally by
@@ -300,11 +301,11 @@ function Format-Args { param([string[]]$Arguments) ($Arguments | ForEach-Object 
 # Run an external process (mysql/mysqldump) and capture its stdout + stderr.
 # If $RequestId is supplied, the running process is registered so /api/cancel-query can kill it.
 function Run-Proc {
-    param([string]$Exe,[string[]]$Arguments,[string]$RequestId,[string]$JobId)
+    param([string]$Exe,[string[]]$Arguments,[string]$RequestId,[string]$JobId,[switch]$RawOut)
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$Exe; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
-    $psi.StandardOutputEncoding=[System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
+    $psi.StandardOutputEncoding=$(if($RawOut){$script:RawEnc}else{[System.Text.Encoding]::UTF8}); $psi.StandardErrorEncoding=[System.Text.Encoding]::UTF8
     $psi.Arguments=Format-Args $Arguments
     $p=New-Object System.Diagnostics.Process; $p.StartInfo=$psi; [void]$p.Start()
     $entry=[pscustomobject]@{ Process=$p; Cancelled=$false }
@@ -323,7 +324,7 @@ function Run-Proc {
 }
 # Like Run-Proc, but also pipes SQL text into the process via standard input.
 function Run-Stdin {
-    param([string]$Exe,[string[]]$Arguments,[string]$Text,[string]$File,[string]$JobId,[string]$RequestId)
+    param([string]$Exe,[string[]]$Arguments,[string]$Text,[string]$File,[string]$JobId,[string]$RequestId,[hashtable]$Rename)
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$Exe; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardInput=$true; $psi.RedirectStandardError=$true; $psi.Arguments=Format-Args $Arguments
@@ -333,7 +334,10 @@ function Run-Stdin {
     if ($RequestId) { $qEntry=[pscustomobject]@{ Process=$p; Cancelled=$false }; $script:RunningQueries[$RequestId]=$qEntry }
     try {
         $et=$p.StandardError.ReadToEndAsync()
-        if ($File) {
+        if ($File -and $Rename) {
+            # See Get-DumpPlan: the dump's own database statements are pointed at the chosen target.
+            try { [NobsDumpDb]::CopyRenamed($File, $p.StandardInput.BaseStream, $Rename.From, $Rename.To) } finally { try { $p.StandardInput.Close() } catch {} }
+        } elseif ($File) {
             $fs=[IO.File]::OpenRead($File); $buf=New-Object byte[] 1048576
             try { while(($n=$fs.Read($buf,0,$buf.Length)) -gt 0){ try { $p.StandardInput.BaseStream.Write($buf,0,$n) } catch { break } }; try { $p.StandardInput.BaseStream.Flush() } catch {} } finally { $fs.Close(); try { $p.StandardInput.Close() } catch {} }
         } else {
@@ -392,7 +396,9 @@ function ConvertFrom-RawText {
 
 # Turn a raw CLI cell value into a real value (the literal NULL marker becomes an actual null).
 function CellVal { param($raw)
-    if($raw -eq '\N' -or $raw -eq 'NULL'){ return $null }
+    # -ceq, not -eq: PowerShell's -eq ignores case, so the escaped newline \n matched \N and a value
+    # that was a single line feed came back as NULL - and so did the text 'null'.
+    if($raw -ceq '\N' -or $raw -ceq 'NULL'){ return $null }
     $v=ConvertFrom-BatchField $raw
     if($v.Length -eq 0){ return $v }
     $b=$script:RawEnc.GetBytes($v)
@@ -457,6 +463,29 @@ function Get-BatchFailureNote { param([string]$Err)
 #
 # Client tools downloaded before the plugins were unpacked (see Get-PluginDir) are in exactly this
 # state, and no amount of retrying fixes them - the plugin simply is not on disk. Say what to do.
+# A verifying connection that fails prints a bare TLS error that names neither the setting nor the
+# fix - and the usual cause is a perfectly normal server using the self-signed certificate MariaDB
+# and MySQL generate for themselves. Same three cases the Tauri edition explains (no CA, a CA that
+# does not match, a name that does not match), worded for whichever client is in use, because the
+# MariaDB client cannot check a CA without also checking the host name.
+function Friendly-TlsErr { param($raw, $conn)
+    $mode = [string]$conn.ssl
+    if ($mode -ne 'verify' -and $mode -ne 'verify-ca') { return $raw }
+    if ($raw -notmatch '(?i)ERROR 2026|certificate|TLS/SSL|SSL connection error') { return $raw }
+    if ($raw -match 'CA certificate is required') {
+        return "$raw - the MySQL client refuses SSL mode ""$mode"" without a CA. Set ""CA certificate"" on this connection to the server's CA file, or use ""required"" to encrypt without verifying."
+    }
+    if (-not [string]$conn.sslCa) {
+        return "$raw - SSL mode ""$mode"" needs the server's certificate to be signed by a CA this machine already trusts, and the self-signed certificate MariaDB and MySQL generate by default never is. Set ""CA certificate"" on this connection to the server's CA file, or use ""required"" to encrypt without verifying."
+    }
+    $tail = ''
+    if (Test-ClientIsMariaDB) {
+        $tail = " The MariaDB client also checks that the certificate names the host you connected to (except for this machine), and the certificates MariaDB and MySQL generate for themselves never do. For such a server, point Settings at MySQL's own mysql.exe and use ""verify-ca"", which checks only the CA."
+    } elseif ($mode -eq 'verify') {
+        $tail = " If the CA is right, the certificate may not name the host you connected to - the certificates MariaDB and MySQL generate for themselves never do. ""verify-ca"" checks the CA but not the host name."
+    }
+    return "$raw - a CA certificate was supplied, but the server's certificate could not be validated against it. Check that the CA file belongs to this server (for a MySQL server with an auto-generated certificate, that is ca.pem in its data directory).$tail"
+}
 function Friendly-AuthErr { param($raw)
     if ($raw -match "(?i)plugin\s+(\S+)\s+could not be loaded") {
         return "$raw - the client tools are missing the authentication plugin this server asked for. MySQL 8 uses caching_sha2_password for every account by default. Open Settings and download the client tools again (the plugins are unpacked alongside the binaries now), or point Settings at a full MySQL/MariaDB client installation."
@@ -523,30 +552,29 @@ function Run-Query2 {
         $a=@("--defaults-extra-file=$cnf","--batch","--default-character-set=utf8mb4")
         if($db){ $a+="--database=$db" }
         $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
-        $r=Run-Proc $script:MysqlPath $a $RequestId
+        # Read losslessly and decode each cell with CellVal, exactly as the editor's cursor path does.
+        # This used to decode the whole output as UTF-8 (destroying any binary value before it was
+        # looked at), split rows on CR as well as LF (mysql does not escape CR inside a value, so
+        # such a row broke in two and its columns shifted), drop empty lines (a row holding one
+        # empty string vanished), and match the NULL marker ignoring case (an escaped newline \n
+        # matched \N, so a value of one line feed read as NULL, as did the text 'null').
+        $r=Run-Proc $script:MysqlPath $a $RequestId -RawOut
         if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
         if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
-        $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
-        if($lines.Count -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
-        $headers=@($lines[0].Split([char]9))
+        $lines=$r.out.Split([char]10)
+        $n=$lines.Count
+        if($n -gt 0 -and $lines[$n-1] -eq ''){ $n-- }   # the output's own final line feed
+        if($n -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
+        $headers=@($lines[0].Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
         $hCount=$headers.Count
-        $rows=New-Object System.Collections.ArrayList($lines.Count)
-        for($i=1;$i -lt $lines.Count;$i++){
+        $rows=New-Object System.Collections.ArrayList($n)
+        for($i=1;$i -lt $n;$i++){
             $fields=$lines[$i].Split([char]9)
             $fCount=$fields.Count
             $cells=New-Object object[] $hCount
             for($c=0;$c -lt $hCount;$c++){
-                if($c -ge $fCount){ $cells[$c]=$null; continue }
-                $raw=$fields[$c]
-                if($raw -eq '\N' -or $raw -eq 'NULL'){ $cells[$c]=$null; continue }
-                $v = if($raw.IndexOf('\') -lt 0){ $raw } else { ConvertFrom-BatchField $raw }
-                if($v.Length -gt 0 -and $v.IndexOfAny($script:CtrlChars) -ge 0){
-                    $b=[Text.Encoding]::UTF8.GetBytes($v)
-                    $cells[$c]='0x'+(([BitConverter]::ToString($b)) -replace '-','')
-                } else {
-                    $cells[$c]=$v
-                }
+                $cells[$c] = if($c -lt $fCount){ CellVal $fields[$c] } else { $null }
             }
             [void]$rows.Add($cells)
         }
@@ -613,7 +641,7 @@ function Read-CursorRows {
     }
     while ($count -lt $PageSize) {
         $line = $null
-        try { $line = $cursorObj.Reader.ReadLine() } catch { $line = $null }
+        try { $line = [NobsLf]::ReadLine($cursorObj.Reader) } catch { $line = $null }
         if ($null -eq $line) { return @{ rows=$rows; hasMore=$false } }
         $fields = $line.Split([char]9)
         $cells = New-Object object[] $hCount
@@ -623,7 +651,7 @@ function Read-CursorRows {
     }
     # Got a full page - peek one more line to learn whether more data remains.
     $peek = $null
-    try { $peek = $cursorObj.Reader.ReadLine() } catch { $peek = $null }
+    try { $peek = [NobsLf]::ReadLine($cursorObj.Reader) } catch { $peek = $null }
     if ($null -eq $peek) { return @{ rows=$rows; hasMore=$false } }
     $cursorObj.Pending = $peek
     return @{ rows=$rows; hasMore=$true }
@@ -660,6 +688,7 @@ function Close-QueryCursorProc {
 function Open-QueryCursor {
     param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
     if ($PageSize -lt 1) { $PageSize = 1000 }
+    Initialize-DumpDb
     $cnf = New-Cnf $conn
     $a=@("--defaults-extra-file=$cnf","--quick","--batch","--default-character-set=utf8mb4")
     if ($db) { $a += "--database=$db" }
@@ -684,7 +713,7 @@ function Open-QueryCursor {
         LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
     }
     $headerLine=$null
-    try { $headerLine = $cursor.Reader.ReadLine() } catch { $headerLine = $null }
+    try { $headerLine = [NobsLf]::ReadLine($cursor.Reader) } catch { $headerLine = $null }
     if ($null -eq $headerLine) {
         # No stdout at all - either a real error, or a statement with no result set.
         $r = Close-QueryCursorProc $cursor
@@ -751,7 +780,7 @@ function Api-Connect { param($conn)
     try {
         $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
         if($r.exit -eq 0){ $v=($r.out).Trim(); $script:ServerIsMariaDB=($v -match 'MariaDB'); return '{"ok":true,"version":'+(J-Str $v)+',"mariadb":'+(($script:ServerIsMariaDB).ToString().ToLower())+'}' }
-        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-AuthErr (FirstErr $r.err))))+'}'
+        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-TlsErr (Friendly-AuthErr (FirstErr $r.err)) $conn)))+'}'
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
 }
 # List databases with their sizes for the left sidebar.
@@ -1217,6 +1246,28 @@ function Strip-DefinerFile { param($file)
         [IO.File]::WriteAllText($file, $stripped)
     } catch {}
 }
+# Whether a dump binary is MariaDB's, cached against its path like Test-ClientIsMariaDB.
+function Test-DumpIsMariaDB {
+    $path = [string]$script:MysqldumpPath
+    if ($script:DumpIsMariaDB -and $script:DumpIsMariaDB.Path -eq $path) { return $script:DumpIsMariaDB.Maria }
+    $maria = $true
+    if ($path -and (Test-Path $path)) { try { $maria = ((& $path --version 2>&1 | Out-String) -match 'MariaDB') } catch { } }
+    $script:DumpIsMariaDB = @{ Path = $path; Maria = $maria }
+    return $maria
+}
+# Tables with a generated column in the given databases - only when the dump tool is MariaDB's and
+# the server is MySQL (MariaDB's tool understands MariaDB's own generated columns). Empty when the
+# check cannot be made, so the export goes ahead as before.
+function Get-MySqlGeneratedTables { param($conn, $dbs, $excl)
+    if (-not (Test-DumpIsMariaDB)) { return @() }
+    $v = Run-Query2 $conn 'SELECT VERSION()' $null $null
+    if (-not $v.ok -or ([string]$v.rows[0][0]) -match 'MariaDB') { return @() }
+    $list = (@($dbs) | ForEach-Object { SqlValLit $_ }) -join ','
+    if (-not $list) { return @() }
+    $r = Run-Query2 $conn ("SELECT DISTINCT TABLE_SCHEMA, TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA IN ($list) AND GENERATION_EXPRESSION IS NOT NULL AND GENERATION_EXPRESSION <> '' ORDER BY 1,2") $null $null
+    if (-not $r.ok) { return @() }
+    return @($r.rows | ForEach-Object { "$($_[0]).$($_[1])" } | Where-Object { -not $excl.ContainsKey($_) })
+}
 function Api-Export { param($conn,$data)
     if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $dbs=@($data.dbs); if($dbs.Count -eq 0){ return '{"ok":false,"error":"No databases selected."}' }
@@ -1230,6 +1281,15 @@ function Api-Export { param($conn,$data)
     # mode: 'table' (one file per table, the default), 'db' (one file per database), 'single' (one combined file)
     $mode=[string]$data.mode; if(-not $mode){ if($data.single){$mode='single'}else{$mode='table'} }
     try {
+        # MariaDB's dump tool does not recognise a MySQL generated column as generated, so it writes
+        # a value for it into every INSERT - and MySQL refuses exactly that on restore ("The value
+        # specified for generated column ... is not allowed"). MySQL's own mysqldump leaves those
+        # columns out. Measured on MySQL 8.0.46: the export reported OK and the file could not be
+        # restored. A backup that looks fine and is not is worse than none, so refuse up front.
+        $genTables = Get-MySqlGeneratedTables $conn $dbs $excl
+        if ($genTables.Count -gt 0) {
+            return '{"ok":false,"error":'+(J-Str ("Not exported: $($genTables.Count) table(s) on this MySQL server have generated columns ($($genTables -join ', ')). The MariaDB dump tool writes values into those columns, which MySQL refuses when the file is restored - the dump would not restore. In Settings, point mysqldump at MySQL's own mysqldump.exe (for example C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe), or exclude those tables."))+'}'
+        }
         $stamp = if($data.stamp){ '_'+(Get-Date -Format 'yyyyMMdd_HHmmss') } else { '' }
         # Flags shared by EVERY mysqldump call in this run (per-table-safe: no database-level flags here).
         $common=@("--defaults-extra-file=$cnf","--default-character-set=$($o.charset)")
@@ -1333,6 +1393,163 @@ function Api-Export { param($conn,$data)
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
 }
 # Endpoint: import one or more .sql dump files.
+# ---------------------------------------------------------------------------
+# Restoring a dump into a database of your choosing
+# ---------------------------------------------------------------------------
+# A dump made per database - the export dialog's default - opens with its own
+#
+#   /*!40000 DROP DATABASE IF EXISTS `shop`*/;
+#   CREATE DATABASE /*!32312 IF NOT EXISTS*/ `shop` ...;
+#   USE `shop`;
+#
+# and "Target database" was only handed to mysql.exe as its default database, which the file's own
+# USE overrides on line three. So "import shop.sql into shop_copy" dropped and rebuilt `shop`
+# itself and left `shop_copy` empty - and when the file then failed partway (MySQL rejecting a
+# generated column's value, measured on 8.0.46), `shop` was left with the tables up to that point
+# and nothing after them.
+#
+# When a target is chosen those statements now name the target instead. Only whole statements of
+# those three kinds at the start of a line are touched, and only their database identifier; data
+# rows never start a line with them, because mysqldump escapes newlines inside values. A file that
+# names more than one database is refused rather than squashed into one.
+#
+# Byte-level and streaming: a dump can be many GB, may hold bytes that are not UTF-8, and a
+# PowerShell loop per line would take minutes. Compiled once per process; C# 5 so Windows
+# PowerShell 5.1 can build it too. The same logic lives in the Tauri edition (dump_db_ident).
+$script:DumpDbSource = @'
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+// mysql --batch ends a row with LF alone and escapes tab, newline, NUL and backslash inside
+// values - but NOT carriage return. .NET's ReadLine() also ends a line at CR, so a value holding a
+// CR split its row in two and shifted every column after it (measured: 'a' LF 'b' CR 'c' came back
+// as two rows). This ends a line at LF and nowhere else.
+public static class NobsLf {
+    public static string ReadLine(TextReader r) {
+        var sb = new StringBuilder(); int c; bool any = false;
+        while ((c = r.Read()) >= 0) { any = true; if (c == 10) return sb.ToString(); sb.Append((char)c); }
+        return any ? sb.ToString() : null;
+    }
+}
+public static class NobsDumpDb {
+    static bool Kw(byte[] l, int n, ref int i, string w) {
+        if (i + w.Length > n) return false;
+        for (int k = 0; k < w.Length; k++) { byte c = l[i + k]; if (c >= 97 && c <= 122) c = (byte)(c - 32); if (c != (byte)w[k]) return false; }
+        int e = i + w.Length;
+        if (e < n) { byte c = l[e]; if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) return false; }
+        i = e; return true;
+    }
+    static void Ws(byte[] l, int n, ref int i) { while (i < n && (l[i] == 32 || l[i] == 9)) i++; }
+    // Start, end and unescaped name of the database identifier in a USE / CREATE DATABASE /
+    // DROP DATABASE line; start is -1 for any other line.
+    public static int Ident(byte[] l, int n, out int end, out string name) {
+        end = -1; name = null;
+        int i = 0; Ws(l, n, ref i);
+        if (i + 3 <= n && l[i] == 47 && l[i + 1] == 42 && l[i + 2] == 33) {          // /*!40000 DROP ...
+            int j = i + 3; while (j < n && l[j] >= 48 && l[j] <= 57) j++;
+            Ws(l, n, ref j); int k = j;
+            if (!Kw(l, n, ref k, "DROP")) return -1;
+            i = j;
+        }
+        if (Kw(l, n, ref i, "USE")) { Ws(l, n, ref i); }
+        else if (Kw(l, n, ref i, "CREATE")) {
+            Ws(l, n, ref i);
+            if (!(Kw(l, n, ref i, "DATABASE") || Kw(l, n, ref i, "SCHEMA"))) return -1;
+            Ws(l, n, ref i);
+            if (i + 3 <= n && l[i] == 47 && l[i + 1] == 42 && l[i + 2] == 33) {
+                int c = i; while (c + 1 < n && !(l[c] == 42 && l[c + 1] == 47)) c++;
+                if (c + 1 < n) i = c + 2;
+            }
+            Ws(l, n, ref i);
+            if (Kw(l, n, ref i, "IF")) { Ws(l, n, ref i); if (!Kw(l, n, ref i, "NOT")) return -1; Ws(l, n, ref i); if (!Kw(l, n, ref i, "EXISTS")) return -1; Ws(l, n, ref i); }
+        }
+        else if (Kw(l, n, ref i, "DROP")) {
+            Ws(l, n, ref i);
+            if (!(Kw(l, n, ref i, "DATABASE") || Kw(l, n, ref i, "SCHEMA"))) return -1;
+            Ws(l, n, ref i);
+            if (Kw(l, n, ref i, "IF")) { Ws(l, n, ref i); if (!Kw(l, n, ref i, "EXISTS")) return -1; Ws(l, n, ref i); }
+        }
+        else return -1;
+        if (i >= n) return -1;
+        int start = i;
+        var ms = new MemoryStream();
+        if (l[i] == 96) {
+            i++;
+            while (true) {
+                if (i >= n) return -1;
+                if (l[i] == 96) { if (i + 1 < n && l[i + 1] == 96) { ms.WriteByte(96); i += 2; continue; } i++; break; }
+                ms.WriteByte(l[i]); i++;
+            }
+        } else {
+            while (i < n && ((l[i] >= 48 && l[i] <= 57) || (l[i] >= 65 && l[i] <= 90) || (l[i] >= 97 && l[i] <= 122) || l[i] == 95 || l[i] == 36)) { ms.WriteByte(l[i]); i++; }
+            if (i == start) return -1;
+        }
+        end = i; name = Encoding.UTF8.GetString(ms.ToArray());
+        return start;
+    }
+    // Reads a stream line by line, keeping the line ending; returns false at end of input.
+    sealed class LineReader {
+        readonly Stream s; readonly byte[] buf = new byte[1 << 20]; int pos, len;
+        public LineReader(Stream s) { this.s = s; }
+        public bool Next(MemoryStream line) {
+            line.SetLength(0);
+            while (true) {
+                if (pos >= len) { len = s.Read(buf, 0, buf.Length); pos = 0; if (len <= 0) return line.Length > 0; }
+                int nl = Array.IndexOf(buf, (byte)10, pos, len - pos);
+                if (nl < 0) { line.Write(buf, pos, len - pos); pos = len; continue; }
+                line.Write(buf, pos, nl - pos + 1); pos = nl + 1; return true;
+            }
+        }
+    }
+    public static string[] Names(string path) {
+        var seen = new List<string>();
+        using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
+            var r = new LineReader(f); var line = new MemoryStream();
+            while (r.Next(line)) {
+                int end; string name;
+                if (Ident(line.GetBuffer(), (int)line.Length, out end, out name) >= 0 && !seen.Contains(name)) seen.Add(name);
+            }
+        }
+        return seen.ToArray();
+    }
+    public static byte[] RewriteLine(byte[] l, int n, string from, string to) {
+        int end; string name;
+        int start = Ident(l, n, out end, out name);
+        var o = new MemoryStream();
+        if (start >= 0 && name == from) {
+            o.Write(l, 0, start);
+            var q = Encoding.UTF8.GetBytes("`" + to.Replace("`", "``") + "`");
+            o.Write(q, 0, q.Length);
+            o.Write(l, end, n - end);
+        } else o.Write(l, 0, n);
+        return o.ToArray();
+    }
+    // Copies a dump to a process's stdin with the database renamed. Stops quietly when the reader
+    // goes away - a failed statement ends mysql.exe, and that failure is reported from its stderr.
+    public static void CopyRenamed(string path, Stream dst, string from, string to) {
+        using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
+            var r = new LineReader(f); var line = new MemoryStream();
+            var w = new BufferedStream(dst, 1 << 20);
+            try {
+                while (r.Next(line)) { var b = RewriteLine(line.GetBuffer(), (int)line.Length, from, to); w.Write(b, 0, b.Length); }
+                w.Flush();
+            } catch (IOException) { }
+        }
+    }
+}
+'@
+function Initialize-DumpDb {
+    if (-not ('NobsDumpDb' -as [type])) { Add-Type -TypeDefinition $script:DumpDbSource -Language CSharp }
+}
+# What to do with one file for a given target: AsIs, Rename (with .From), or Refuse (with .Why).
+function Get-DumpPlan { param([string[]]$Names, [string]$Target)
+    $Names = @($Names)
+    if (-not $Target -or $Names.Count -eq 0 -or ($Names.Count -eq 1 -and $Names[0] -ceq $Target)) { return @{ Kind = 'AsIs' } }
+    if ($Names.Count -eq 1) { return @{ Kind = 'Rename'; From = $Names[0] } }
+    return @{ Kind = 'Refuse'; Why = "this file contains $($Names.Count) databases ($($Names -join ', ')), so it cannot be restored into the single target '$Target'. Clear ""Target database"" to restore each under its own name." }
+}
+
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
     $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
@@ -1356,15 +1573,20 @@ function Api-Import { param($conn,$data)
             # exported with a larger packet size fails with "MySQL server has gone away".
             $maxPacket = ([string]$data.maxpacket).Trim()
             $a=@("--defaults-extra-file=$cnf"); if($data.force){$a+='--force'}; if($binMode){$a+='--binary-mode'}; if($maxPacket){$a+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a+=$target}
-            $r=Run-Stdin $script:MysqlPath $a $null $f $jobId
+            $short = [IO.Path]::GetFileName($f)
+            Initialize-DumpDb
+            $plan = Get-DumpPlan ([NobsDumpDb]::Names($f)) $target
+            if ($plan.Kind -eq 'Refuse') { [void]$log.Add("SKIPPED $short : "+$plan.Why); continue }
+            $rename = $null
+            if ($plan.Kind -eq 'Rename') { $rename = @{ From = $plan.From; To = $target }; [void]$log.Add("$short holds database '$($plan.From)' - restoring it into '$target' instead") }
+            $r=Run-Stdin $script:MysqlPath $a $null $f $jobId -Rename $rename
             if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
             $autoRetried = $false
             if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
                 $a2=@("--defaults-extra-file=$cnf","--binary-mode"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
-                $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId
+                $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId -Rename $rename
                 $autoRetried = $true
             }
-            $short = [IO.Path]::GetFileName($f)
             $retryNote = $(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})
             if($r.exit -eq 0){
                 # "Continue on error" passes --force, and mysql then exits 0 even when every statement
@@ -1480,7 +1702,9 @@ function Api-ImportCsv { param($conn,$data)
         # The export writes NULL as an explicit marker (\N by default) so it stays distinct
         # from an empty string in the file. Read it back the same way; an empty cell keeps its
         # long-standing meaning of NULL, so importing a spreadsheet is unchanged.
-        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -eq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
+        # A bare "0x" in a binary column is an EMPTY binary value - that is how the Tauri edition exports
+        # one - and the hex rule below needs at least one digit, so it used to be stored as the text "0x".
+        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -ceq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -eq '0x'){ $vals+="X''" } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
         [void]$batch.Add('('+($vals -join ',')+')'); $n++
         if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
     }
@@ -2018,10 +2242,24 @@ function Api-CompareRowsFetchByPk { param($data)
 # CREATE USER statements are emitted before any GRANT statements (not just alphabetically, but
 # genuinely grouped that way) so replaying the result on a target server never grants to a user
 # that doesn't exist yet.
+# True for MySQL 8.0.17 and later - the first version with print_identified_with_as_hex.
+function Test-MySqlHexIdentified { param([string]$Version)
+    if ($Version -match 'MariaDB') { return $false }
+    $m = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')
+    if (-not $m.Success) { return $false }
+    $v = [version]("{0}.{1}.{2}" -f $m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value)
+    return $v -ge [version]'8.0.17'
+}
 function Api-GenUserTransfer { param($conn,$data)
     $exclRaw = [string]$data.exclude
     $excl = @($exclRaw -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_.Length -gt 0 })
     if ($excl.Count -eq 0) { $excl = @('mysql.sys','root','debian-sys-maint','mariadb.sys','healthcheck','mariabackup','galera','replica','PUBLIC') }
+    # The server's own internal accounts are never moved, whatever the list says. They exist on
+    # every install of that server and are managed by it, so a script carrying them cannot run: on
+    # MySQL 8 it opened with CREATE USER `mysql.infoschema` and `mysql.session` - which already
+    # exist on the target - and handed SUPER and SYSTEM_USER grants to them. Only mysql.sys was on
+    # the default list. Named, not matched as mysql.%: an account called mysql.backup is a user's.
+    foreach ($sys in @('mysql.sys','mysql.session','mysql.infoschema','mariadb.sys')) { if ($excl -notcontains $sys) { $excl += $sys } }
     $inList = ($excl | ForEach-Object { SqlValLit $_ }) -join ','
     $usersR = Run-Query2 $conn ("SELECT user, host FROM mysql.user WHERE user NOT IN ($inList) AND user <> ''") $null $null
     if (-not $usersR.ok) { return '{"ok":false,"error":'+(J-Str $usersR.err)+'}' }
@@ -2031,11 +2269,21 @@ function Api-GenUserTransfer { param($conn,$data)
     $grantLines = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
 
+    # A MySQL 8 caching_sha2_password hash carries a salt of arbitrary 7-bit bytes, control
+    # characters included. This edition shows a value holding control characters as hex, so the
+    # CREATE USER line came back as one long 0x... blob, was written into the script as-is, and the
+    # account silently went missing from the transfer (measured on MySQL 8.0.46). With
+    # print_identified_with_as_hex (8.0.17+) the hash is printed as a 0x literal inside a readable
+    # statement instead - plain text, and safe to paste or save. It is a session variable, and each
+    # query here is its own mysql.exe session, so it goes in front of the statement itself.
+    $hexPrefix = ''
+    $vr = Run-Query2 $conn 'SELECT VERSION()' $null $null
+    if ($vr.ok -and (Test-MySqlHexIdentified ([string]$vr.rows[0][0]))) { $hexPrefix = 'SET SESSION print_identified_with_as_hex = ON; ' }
     foreach ($row in $usersR.rows) {
         $u = [string]$row[0]; $h = [string]$row[1]
         $uq = $u -replace "'", "''"
         $hq = $h -replace "'", "''"
-        $cr = Run-Query2 $conn ("SHOW CREATE USER '$uq'@'$hq'") $null $null
+        $cr = Run-Query2 $conn ($hexPrefix + "SHOW CREATE USER '$uq'@'$hq'") $null $null
         if ($cr.ok -and $cr.rows.Count -gt 0) { [void]$createLines.Add([string]$cr.rows[0][0] + ';') }
         else { [void]$errors.Add("SHOW CREATE USER for '$u'@'$h': " + $(if ($cr.err) { $cr.err } else { 'no result returned' })) }
 
@@ -2781,7 +3029,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 
 <div class="modal floating" id="mUserTransfer"><div class="box" style="width:820px;max-width:94vw;top:60px;left:130px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mUserTransfer')" title="Drag to move"><h3 style="margin:0">Generate User Transfer Script</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mUserTransfer')" title="Maximize" id="maxBtn_mUserTransfer" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mUserTransfer')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <div class="muted" style="margin-bottom:8px">Uses SHOW CREATE USER and SHOW GRANTS FOR against this connection - the same statements the server itself would emit, so the correct auth plugin, password hash, column/routine grants, and grant options all come through correctly (works on MySQL and MariaDB alike). CREATE USER statements are listed first so the grants below can reference them. Copy or save the result and run it on the TARGET server.</div>
- <div class="row"><b>Exclude these accounts</b> <input id="utExclude" style="flex:1" value="mysql.sys,root,debian-sys-maint,mariadb.sys,healthcheck,mariabackup,galera,replica,PUBLIC"></div>
+ <div class="row"><b>Exclude these accounts</b> <input id="utExclude" style="flex:1" value="mysql.sys,mysql.session,mysql.infoschema,root,debian-sys-maint,mariadb.sys,healthcheck,mariabackup,galera,replica,PUBLIC"></div>
  <div class="row"><button class="go" onclick="genUserTransfer()">Generate</button><span id="utStatus" class="muted" style="margin-left:8px"></span></div>
  <textarea id="utResult" readonly style="width:100%;height:340px;box-sizing:border-box;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px;margin-top:8px"></textarea>
  <div class="row"><button onclick="copyUserTransfer()">Copy</button><button onclick="saveUserTransferFile()">Save to file...</button><button onclick="hide('mUserTransfer')">Close</button></div>
@@ -2943,7 +3191,14 @@ function showDead(){const d=$('deadOverlay');if(d)d.style.display='flex';}
 function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 // --- api(): the ONE way the UI talks to the server. Adds token + connection + read-only flag, returns parsed JSON, and shows the 'server down' overlay on failure.
 async function api(path,p,signal){p=p||{};p.token=TOKEN;
+ // Every call goes to the server you are actually CONNECTED to, never to whatever profile happens
+ // to be loaded in the form - so the connection is filled in here rather than trusted from the
+ // caller. conn-save is the one exception, because its conn is not a server to talk to at all:
+ // it is the profile being saved. Overwriting it made Save, Edit, Clone and Forget-password
+ // store the CONNECTED server's host, port, user, SSL settings and CA - and save its password
+ // under the other profile's name - whenever you were connected somewhere else.
  if(path==='/api/connect'){p.conn=getConn();p.ro=!!window.readOnly;}
+ else if(path==='/api/conn-save'&&p.conn){p.ro=false;}
  else{p.conn=window._activeConn||getConn();p.ro=(window._activeConn?!!window._activeReadOnly:!!window.readOnly);}
  busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});return await r.json();}catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
 // Floating (draggable, non-blocking) modals remember where they were left, keyed by id, and
@@ -3432,7 +3687,9 @@ async function connect() {
   const r = await api('/api/connect');
   if (!r.ok) {
     log('  ' + r.error);
-    toast('Connection failed: ' + r.error, true);
+    // Both backends already open their message with "Connection failed:", so adding it here too
+    // printed it twice.
+    toast(/^Connection failed/i.test(String(r.error)) ? r.error : 'Connection failed: ' + r.error, true);
     disconnect();
     if (tabs.length) { await closeAll(); }
     return;
@@ -3932,7 +4189,7 @@ async function newSchema(){const res=await inputBox({title:'New schema',okText:'
 async function newProcedure(db){
  const res=await inputBox({title:'New procedure',okText:'Create',fields:[{key:'name',label:'Procedure name'}]});
  if(!res||!res.name.trim())return;
- const name=res.name.trim();
+ const name=res.name.trim();if(!(await ddlConfirmNew(db,'procedure',name)))return;
  const body=window.mariadb
   ?('-- Fill in the procedure body, then click "Apply (recreate)".\nDELIMITER $$\nCREATE OR REPLACE PROCEDURE '+qid(db)+'.'+qid(name)+'()\nBEGIN\n\n  -- your logic here\n\nEND$$\nDELIMITER ;\n')
   :('-- Fill in the procedure body, then click "Apply (recreate)".\nDROP PROCEDURE IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\nCREATE PROCEDURE '+qid(db)+'.'+qid(name)+'()\nBEGIN\n\n  -- your logic here\n\nEND$$\nDELIMITER ;\n');
@@ -3941,7 +4198,7 @@ async function newProcedure(db){
 async function newFunction(db){
  const res=await inputBox({title:'New function',okText:'Create',fields:[{key:'name',label:'Function name'},{key:'returns',label:'Return type',value:'INT'}]});
  if(!res||!res.name.trim())return;
- const name=res.name.trim();const rt=(res.returns||'INT').trim()||'INT';
+ const name=res.name.trim();if(!(await ddlConfirmNew(db,'function',name)))return;const rt=(res.returns||'INT').trim()||'INT';
  const body=window.mariadb
   ?('-- Fill in the function body, then click "Apply (recreate)".\nDELIMITER $$\nCREATE OR REPLACE FUNCTION '+qid(db)+'.'+qid(name)+'() RETURNS '+rt+'\nDETERMINISTIC\nBEGIN\n\n  -- your logic here\n  RETURN NULL;\n\nEND$$\nDELIMITER ;\n')
   :('-- Fill in the function body, then click "Apply (recreate)".\nDROP FUNCTION IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\nCREATE FUNCTION '+qid(db)+'.'+qid(name)+'() RETURNS '+rt+'\nDETERMINISTIC\nBEGIN\n\n  -- your logic here\n  RETURN NULL;\n\nEND$$\nDELIMITER ;\n');
@@ -3954,7 +4211,7 @@ async function newTrigger(db,table){
   {key:'event',label:'Event',type:'select',options:['INSERT','UPDATE','DELETE'],value:'INSERT'}
  ]});
  if(!res||!res.name.trim())return;
- const name=res.name.trim();
+ const name=res.name.trim();if(!(await ddlConfirmNew(db,'trigger',name)))return;
  const body=window.mariadb
   ?('-- Fill in the trigger body, then click "Apply (recreate)".\nDELIMITER $$\nCREATE OR REPLACE TRIGGER '+qid(db)+'.'+qid(name)+'\n'+res.timing+' '+res.event+' ON '+qid(db)+'.'+qid(table)+'\nFOR EACH ROW\nBEGIN\n\n  -- your logic here\n\nEND$$\nDELIMITER ;\n')
   :('-- Fill in the trigger body, then click "Apply (recreate)".\nDROP TRIGGER IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\nCREATE TRIGGER '+qid(db)+'.'+qid(name)+'\n'+res.timing+' '+res.event+' ON '+qid(db)+'.'+qid(table)+'\nFOR EACH ROW\nBEGIN\n\n  -- your logic here\n\nEND$$\nDELIMITER ;\n');
@@ -4000,7 +4257,7 @@ async function openDdl(db,type,name){const r=await api('/api/ddl',{db,type,name}
    body='-- Edit then "Apply (recreate)".\nDROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\n'+body+'$$\nDELIMITER ;\n';
   }}
  else if(type==='view'){body='-- Edit then "Apply (recreate)".\n'+body.replace(/^CREATE/i,'CREATE OR REPLACE')+';\n';}
- openTab(type+': '+name,body,db,false,null,{type,db,name});}
+ openTab(type+': '+name,body,db,false,null,{type,db,name,orig:r.ddl});}
 
 // ---- tabs & editor ----
 // --- Query tabs: each tab has its own editor + result grid + pending edits.
@@ -5361,7 +5618,48 @@ function ddlFailureNote(err, sql){
  if (stmts < 2) return e;
  return e + "\n\nDDL is not transactional: any statements before this one have already been applied and cannot be rolled back. Check the object before re-running.";
 }
-async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const r=await api('/api/script',{sql:$('ed_'+id).value,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl)loadObjects(t.ddl.db);}else{st.className='status err';const _n=ddlFailureNote(r.error,$('ed_'+id).value);st.textContent=_n;log('APPLY ERROR: '+_n);}}
+// MySQL has no CREATE OR REPLACE for procedures, functions or triggers, so the editor recreates
+// them as DROP then CREATE - and when the CREATE fails, the DROP has already happened. Measured on
+// MySQL 8.0.46: a syntax error in an edited procedure left the procedure gone, with its code
+// surviving only in the unsaved editor tab. (MariaDB's CREATE OR REPLACE is atomic and keeps the
+// old version.)
+//
+// So the editor remembers the definition it was opened with, refreshes it after every successful
+// apply, and after a failure checks whether the object still exists. If it does not, the previous
+// definition is put back and the user is told; if even that fails, the definition is opened in a
+// tab of its own and the message says plainly that the object is gone.
+async function ddlExists(db,type,name){
+ const q={procedure:"SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_TYPE='PROCEDURE' AND ROUTINE_SCHEMA="+lit(db)+" AND ROUTINE_NAME="+lit(name),
+          function:"SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_TYPE='FUNCTION' AND ROUTINE_SCHEMA="+lit(db)+" AND ROUTINE_NAME="+lit(name),
+          trigger:"SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA="+lit(db)+" AND TRIGGER_NAME="+lit(name)}[type];
+ if(!q)return null;
+ const r=await api('/api/query',{sql:q});
+ return r.ok&&r.rows[0]?String(r.rows[0][0])!=='0':null;
+}
+async function ddlRememberCurrent(d){
+ if(!d||!/^(procedure|function|trigger)$/.test(d.type))return;
+ const r=await api('/api/ddl',{db:d.db,type:d.type,name:d.name});
+ if(r.ok&&r.ddl)d.orig=r.ddl;
+}
+async function ddlRestoreIfDropped(d){
+ if(!d||!d.orig||!/^(procedure|function|trigger)$/.test(d.type))return '';
+ if((await ddlExists(d.db,d.type,d.name))!==false)return '';
+ const script='DELIMITER $$\n'+d.orig+'$$\nDELIMITER ;\n';
+ const r=await api('/api/script',{sql:script,db:d.db});
+ if(r.ok&&(await ddlExists(d.db,d.type,d.name))){
+  loadObjects(d.db);
+  return '\n\nThe '+d.type+' had already been dropped when this failed, so its previous version has been put back. Your edit is still here in the editor.';
+ }
+ openTab(d.type+': '+d.name+' (previous version)','-- '+d.type+' '+d.name+' could not be restored automatically: '+String(r.error||'unknown error').split('\n')[0]+'\n-- This is its definition from before your edit. Apply this tab to put it back.\n'+script,d.db,false,null,{type:d.type,db:d.db,name:d.name,orig:d.orig});
+ return '\n\n'+d.type.toUpperCase()+' '+d.name+' IS GONE: it was dropped, the new version failed, and putting the old one back failed too. Its previous definition is open in a new tab.';
+}
+// "New procedure" with the name of one that already exists would replace it without a word - by
+// DROP on MySQL, by CREATE OR REPLACE on MariaDB. Ask first.
+async function ddlConfirmNew(db,type,name){
+ if(!(await ddlExists(db,type,name)))return true;
+ return await ask('A '+type+' named '+name+' already exists in '+db+'.\n\nApplying the new one will REPLACE it. Continue?');
+}
+async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const sql=$('ed_'+id).value;const r=await api('/api/script',{sql,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl){await ddlRememberCurrent(t.ddl);loadObjects(t.ddl.db);}}else{st.className='status err';const _n=ddlFailureNote(r.error,sql)+(await ddlRestoreIfDropped(t.ddl));st.textContent=_n;log('APPLY ERROR: '+_n);}}
 
 function bTSV(cols,rows){return cols.join('\t')+'\n'+rows.map(r=>r.map(v=>v===null?'NULL':v).join('\t')).join('\n');}
 // How a NULL is written to CSV. A NULL and an empty string both used to come out as an empty
@@ -6020,34 +6318,132 @@ async function grantUser(){const v=window._selUser;if(!v){toast('Select a user f
 // ---- table designer ----
 const DTYPES=['INT','BIGINT','TINYINT','SMALLINT','MEDIUMINT','DECIMAL','FLOAT','DOUBLE','BIT','BOOLEAN','CHAR','VARCHAR','TEXT','MEDIUMTEXT','LONGTEXT','DATE','DATETIME','TIMESTAMP','TIME','YEAR','JSON','BLOB','LONGBLOB','ENUM','BINARY','VARBINARY'];
 let dOrig=null,dEdited=false;
+// The designer shows a column as name / type / length / flags / default / comment, but a real
+// column carries more than that: UNSIGNED, a character set and collation, ON UPDATE, INVISIBLE, a
+// fractional-seconds precision, a DECIMAL scale, an ENUM's value list, and a default that may be an
+// expression rather than a literal. None of those used to survive a MODIFY. The length box was
+// filled from CHARACTER_MAXIMUM_LENGTH or NUMERIC_PRECISION alone, so editing nothing but the
+// comment on a column rewrote it - measured on MySQL 8.0.46, from a comment-only edit:
+//
+//   DECIMAL(10,2)   12.34                       ->  DECIMAL(10,0)  12
+//   INT UNSIGNED                                ->  INT (signed)
+//   DATETIME(6)     2024-01-01 12:34:56.123456  ->  DATETIME       2024-01-01 12:34:56
+//   latin1 text                                 ->  utf8mb4, re-encoded
+//   ENUM('alpha','beta')                        ->  ENUM(5), a syntax error
+//
+// dColFromInfo() reads everything from COLUMN_TYPE and friends instead. What the form cannot show
+// is kept on the row (keep) and written back unchanged, and only dropped where the user's own edit
+// makes it meaningless - UNSIGNED on a column changed to VARCHAR, a character set on one changed
+// to INT. Top-level and DOM-free so tests can drive them with real information_schema rows.
+const D_TEXTY=/^(CHAR|VARCHAR|TINYTEXT|TEXT|MEDIUMTEXT|LONGTEXT|ENUM|SET)$/;
+const D_NUMERIC=/^(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT|DECIMAL|NUMERIC|FLOAT|DOUBLE|REAL)$/;
+const D_TEMPORAL=/^(DATETIME|TIMESTAMP)$/;
+// row: COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, COLUMN_KEY,
+//      COLUMN_COMMENT, CHARACTER_SET_NAME, COLLATION_NAME, GENERATION_EXPRESSION
+// tableColl: the table's default collation. A column that merely inherits it gets no clause of its
+// own, so SHOW CREATE TABLE - and Compare DB - still read it as inheriting after an edit.
+function dColFromInfo(row,isMaria,tableColl){
+ const [name,dataType,colType,nullable,rawDef,extraRaw,key,comment,cs,coll,genExpr]=row;
+ const extra=extraRaw||'';
+ const type=String(dataType).toUpperCase();
+ // "decimal(10,2) unsigned zerofill", "enum('a)','b')", "bigint unsigned", "datetime(6)".
+ // The greedy group runs to the LAST ')' that still leaves only modifiers after it, so a ')'
+ // inside an ENUM value does not end the list early.
+ const m=/^[a-z ]+?(?:\((.*)\))?((?:\s+(?:unsigned|signed|zerofill))*)\s*$/i.exec(String(colType||''));
+ const len=m&&m[1]!=null?m[1]:'';
+ const mods=m&&m[2]?m[2].trim().toUpperCase():'';
+ // Defaults. MySQL gives a literal unquoted and marks an expression with DEFAULT_GENERATED;
+ // MariaDB quotes a literal, spells an explicit NULL default as the word NULL, and gives an
+ // expression bare. defShown is what the form displays; defSql is the exact SQL to write back
+ // while the displayed value is left alone.
+ let defShown='',defSql=null;
+ if(rawDef!=null){
+  const v=String(rawDef);
+  if(isMaria){
+   if(v==='NULL'){defShown='NULL';defSql='NULL';}
+   else if(/^'[\s\S]*'$/.test(v)){defShown=v.slice(1,-1).replace(/''/g,"'").replace(/\\\\/g,'\\');defSql=v;}
+   else{defShown=v;defSql=v;}
+  } else {
+   defShown=v;
+   if(/DEFAULT_GENERATED/i.test(extra))defSql=/^current_timestamp(\(\d*\))?$/i.test(v)?v:'('+v+')';
+   else if(/^b'[01]*'$/i.test(v)||/^0x[0-9a-f]*$/i.test(v))defSql=v;
+   else defSql=strLit(v);
+  }
+ }
+ const onUp=/on update\s+(\S+)/i.exec(extra);
+ const generated=/GENERATED/i.test(extra.replace(/DEFAULT_GENERATED/ig,''));
+ const col={name,type,len,nn:nullable==='NO',def:defShown,ai:/auto_increment/i.test(extra),pk:key==='PRI',comment:comment||''};
+ const inherits=!!coll&&coll===tableColl;
+ col.keep={origName:name,origType:type,origLen:len,mods,cs:inherits?'':(cs||''),coll:inherits?'':(coll||''),onUpdate:onUp?onUp[1]:'',
+   invisible:/\bINVISIBLE\b/i.test(extra),defShown,defSql,generated,genExpr:genExpr||''};
+ return col;
+}
+function colDef(c){
+ const k=c.keep||{};
+ let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';
+ if(k.mods&&D_NUMERIC.test(c.type))s+=' '+k.mods;
+ if(k.cs&&D_TEXTY.test(c.type))s+=' CHARACTER SET '+k.cs+(k.coll?' COLLATE '+k.coll:'');
+ if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
+ // An untouched default is written back exactly as it was read - including an empty-string
+ // default, which the form cannot tell apart from "no default" by looking at the box.
+ if(k.defSql!=null&&c.def===k.defShown)s+=' DEFAULT '+k.defSql;
+ else if(c.def!==''&&c.def!=null){s+=' DEFAULT '+(/^(CURRENT_TIMESTAMP(\(\d*\))?|NULL|TRUE|FALSE|-?\d+(\.\d+)?)$/i.test(c.def)?c.def:lit(c.def));}
+ if(k.onUpdate&&D_TEMPORAL.test(c.type))s+=' ON UPDATE '+k.onUpdate;
+ if(k.invisible)s+=' INVISIBLE';
+ if(c.comment)s+=' COMMENT '+strLit(c.comment);return s;}
+// The ALTER for a set of edited columns against what was read. A row keeps the name it was read
+// with, so renaming one is a CHANGE COLUMN; it used to be DROP COLUMN old + ADD COLUMN new, which
+// throws away every value in it.
+function dAlterSql(orig,cols,tbl){
+ const alt=[],notes=[];
+ const seen=new Set();
+ const same=(o,c)=>JSON.stringify({t:o.type,l:''+o.len,nn:o.nn,ai:o.ai,d:o.def,cm:o.comment})===JSON.stringify({t:c.type,l:''+c.len,nn:c.nn,ai:c.ai,d:c.def,cm:c.comment});
+ cols.forEach(c=>{
+  const on=c.keep&&c.keep.origName;
+  const o=on!=null?orig.find(x=>x.name===on):null;
+  if(!o){alt.push('ADD COLUMN '+colDef(c));return;}
+  seen.add(o.name);
+  const renamed=c.name!==o.name;
+  if(!renamed&&same(o,c))return;
+  // A generated column's expression comes back from information_schema with its quoting
+  // mangled on some versions, so rewriting it is not safe. Leave it, and say so.
+  if(o.keep&&o.keep.generated){notes.push('-- '+qid(o.name)+' is a generated column; change it with SQL, not the designer (left unchanged)');return;}
+  alt.push((renamed?'CHANGE COLUMN '+qid(o.name)+' ':'MODIFY COLUMN ')+colDef(c));
+ });
+ orig.filter(o=>!seen.has(o.name)).forEach(o=>alt.push('DROP COLUMN '+qid(o.name)));
+ const oldPk=orig.filter(c=>c.pk).map(c=>c.name).join(',');
+ const newPk=cols.filter(c=>c.pk).map(c=>(c.keep&&c.keep.origName)||c.name).join(',');
+ if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));if(pk.length)alt.push('ADD PRIMARY KEY ('+pk.join(',')+')');}
+ const head=notes.length?notes.join('\n')+'\n':'';
+ return alt.length?head+'ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';':head+'-- no changes detected';
+}
 async function designTable(name,db){dEdited=false;db=db||curSchema||'';$('dSchema').value=db;$('dName').value=name||'';$('dCols').innerHTML='';$('dLog').textContent='';dOrig=null;
  if(name){$('dTitle').textContent='Alter table';$('dMode').textContent='(existing - generates ALTER)';
-   const r=await api('/api/query',{sql:"SELECT COLUMN_NAME,DATA_TYPE,CHARACTER_MAXIMUM_LENGTH,NUMERIC_PRECISION,NUMERIC_SCALE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,COLUMN_KEY,COLUMN_COMMENT FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});
-   dOrig=[];if(r.ok)r.rows.forEach(c=>{const col={name:c[0],type:c[1].toUpperCase(),len:(c[2]||c[3]||''),nn:c[5]==='NO',def:c[6],ai:/auto_increment/i.test(c[7]||''),pk:c[8]==='PRI',comment:c[9]||''};dOrig.push(JSON.parse(JSON.stringify(col)));dAddCol(col);});
+   const r=await api('/api/query',{sql:"SELECT COLUMN_NAME,DATA_TYPE,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,COLUMN_KEY,COLUMN_COMMENT,CHARACTER_SET_NAME,COLLATION_NAME,GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)+" ORDER BY ORDINAL_POSITION"});
+   const tc=await api('/api/query',{sql:"SELECT TABLE_COLLATION FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(db)+" AND TABLE_NAME="+lit(name)});
+   const tableColl=tc.ok&&tc.rows[0]?tc.rows[0][0]:null;
+   dOrig=[];if(r.ok)r.rows.forEach(row=>{const col=dColFromInfo(row,!!window.mariadb,tableColl);dOrig.push(col);dAddCol(col);});
+   else{$('dLog').textContent='Could not read the table: '+r.error;}
  } else {$('dTitle').textContent='Create table';$('dMode').textContent='(new - generates CREATE)';dAddCol({name:'id',type:'INT',len:'',nn:true,ai:true,pk:true,def:null,comment:''});dAddCol({name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''});}
  dGen();show('mDesign');}
 function dAddCol(c){c=c||{name:'',type:'VARCHAR',len:'255',nn:false,ai:false,pk:false,def:null,comment:''};const tr=document.createElement('tr');
- tr.innerHTML='<td><input class="dn" value="'+esc(c.name)+'"></td><td><select class="dt">'+DTYPES.map(t=>'<option'+(t===c.type?' selected':'')+'>'+t+'</option>').join('')+'</select></td>'+
+ // A type the list does not carry (SET, TINYTEXT, GEOMETRY...) must still be offered, or the
+ // select falls back to its first entry and the column is silently read back as INT.
+ const types=DTYPES.includes(c.type)?DTYPES:DTYPES.concat([c.type]);
+ tr.innerHTML='<td><input class="dn" value="'+esc(c.name)+'"></td><td><select class="dt">'+types.map(t=>'<option'+(t===c.type?' selected':'')+'>'+esc(t)+'</option>').join('')+'</select></td>'+
   '<td><input class="dl" value="'+esc(c.len==null?'':c.len)+'" style="width:70px"></td><td><input type="checkbox" class="dnn"'+(c.nn?' checked':'')+'></td>'+
   '<td><input type="checkbox" class="dai"'+(c.ai?' checked':'')+'></td><td><input type="checkbox" class="dpk"'+(c.pk?' checked':'')+'></td>'+
   '<td><input class="dd" value="'+esc(c.def==null?'':c.def)+'" style="width:90px"></td><td><input class="dc" value="'+esc(c.comment||'')+'"></td>'+
   '<td><button class="sm" title="Remove this column" onclick="this.closest(\'tr\').remove();dGen()">x</button></td>';
+ tr._keep=c.keep||null;
+ if(c.keep){const hint=[c.keep.mods,c.keep.cs&&('CHARACTER SET '+c.keep.cs),c.keep.onUpdate&&('ON UPDATE '+c.keep.onUpdate),c.keep.invisible&&'INVISIBLE',c.keep.generated&&'GENERATED'].filter(Boolean).join(', ');if(hint)tr.title='Kept as is: '+hint;}
  $('dCols').appendChild(tr);tr.querySelectorAll('input,select').forEach(el=>el.addEventListener('change',dGen));}
-function dMark(){dEdited=true;$('dEditNote').textContent='\u270E manually edited - auto-update paused; use Regenerate to rebuild';}
-function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.trim(),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value.trim()})).filter(c=>c.name);}
-function colDef(c){let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
- if(c.def!==''&&c.def!=null){s+=' DEFAULT '+(/^(CURRENT_TIMESTAMP|NULL|TRUE|FALSE|\d+(\.\d+)?)$/i.test(c.def)?c.def:lit(c.def));}
- if(c.comment)s+=' COMMENT '+strLit(c.comment);return s;}
+function dMark(){dEdited=true;$('dEditNote').textContent='✎ manually edited - auto-update paused; use Regenerate to rebuild';}
+function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.trim(),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value.trim(),keep:tr._keep||null})).filter(c=>c.name);}
 function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.trim(),name=$('dName').value.trim();const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
  if(!name){$('dSql').value='-- enter a table name';return;}const tbl=qid(db)+'.'+qid(name);
  if(!dOrig){let s='CREATE TABLE '+tbl+' (\n  '+cols.map(colDef).join(',\n  ');if(pk.length)s+=',\n  PRIMARY KEY ('+pk.join(',')+')';s+='\n);';$('dSql').value=s;dEdited=false;$('dEditNote').textContent='';return;}
- // ALTER diff by name
- const oNames=dOrig.map(c=>c.name);const nNames=cols.map(c=>c.name);const alt=[];
- cols.forEach(c=>{const o=dOrig.find(x=>x.name===c.name);if(!o){alt.push('ADD COLUMN '+colDef(c));}else if(JSON.stringify({t:o.type,l:''+o.len,nn:o.nn,ai:o.ai,d:o.def,cm:o.comment})!==JSON.stringify({t:c.type,l:''+c.len,nn:c.nn,ai:c.ai,d:(c.def===''?null:c.def),cm:c.comment})){alt.push('MODIFY COLUMN '+colDef(c));}});
- oNames.filter(n=>!nNames.includes(n)).forEach(n=>alt.push('DROP COLUMN '+qid(n)));
- const oldPk=dOrig.filter(c=>c.pk).map(c=>c.name).join(','),newPk=cols.filter(c=>c.pk).map(c=>c.name).join(',');
- if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');if(newPk)alt.push('ADD PRIMARY KEY ('+pk.join(',')+')');}
- $('dSql').value=alt.length?('ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';'):'-- no changes detected';dEdited=false;$('dEditNote').textContent='';}
+ $('dSql').value=dAlterSql(dOrig,cols,tbl);dEdited=false;$('dEditNote').textContent='';}
 async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});if(r.ok){$('dLog').textContent='Applied OK.';log('DESIGN OK');if(curSchema)loadObjects(curSchema);}else{const _n=ddlFailureNote(r.error,sql);$('dLog').textContent=_n;log('DESIGN error: '+_n);}}
 
 // ---- export/import ----
@@ -6920,7 +7316,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','CtrlChars','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }

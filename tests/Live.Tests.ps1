@@ -49,20 +49,22 @@ $proc = Start-Process -FilePath (Get-Process -Id $PID).Path `
 
 $base = $null
 $token = $null
+$cn = $null      # the compare check's saved profile, if it got that far - see finally
 try {
-    # The server takes the first free port from its fixed list; find whichever it got.
+    # The server takes the first free port from its fixed list and prints the address it got.
+    # Read it from there. Probing the ports instead found whatever answered first - including an
+    # instance of the app someone had open - and this script then ran every check against that one
+    # and finished by sending it /api/quit.
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline -and -not $token) {
-        foreach ($try in 17673, 17674, 17675, 17676, 17677, 17678, 17679, 17680) {
+        $said = try { Get-Content -Raw -LiteralPath $outFile -ErrorAction Stop } catch { '' }
+        if ($said -match 'Open:\s+(http://127\.0\.0\.1:\d+)/') {
             try {
-                $html = Invoke-WebRequest -Uri "http://127.0.0.1:$try/" -TimeoutSec 2 -UseBasicParsing
-                if ($html.Content -match 'const TOKEN="([a-f0-9]+)"') {
-                    $base = "http://127.0.0.1:$try"
-                    $token = $Matches[1]
-                    break
-                }
+                $html = Invoke-WebRequest -Uri "$($Matches[1])/" -TimeoutSec 2 -UseBasicParsing
+                if ($html.Content -match 'const TOKEN="([a-f0-9]+)"') { $base = ($said | Select-String 'Open:\s+(http://127\.0\.0\.1:\d+)/').Matches[0].Groups[1].Value; $token = $Matches[1] }
             } catch { }
         }
+        if ($proc.HasExited) { break }
         if (-not $token) { Start-Sleep -Milliseconds 500 }
     }
     if (-not $token) { "  FAIL  server did not come up within 60s"; exit 1 }
@@ -303,6 +305,19 @@ try {
     Check ($imp2.ok -eq $true) 'CSV import with an empty null marker succeeds' ($imp2 | ConvertTo-Json -Compress)
     Check ((Scalar "SELECT note IS NULL FROM csv_live_rt WHERE id=3" 'nobs_test') -eq '1') 'an empty marker makes blank cells NULL again'
 
+    # A CSV from the Tauri edition writes an empty binary value as the bare "0x". The hex rule
+    # needed at least one digit, so it used to be stored as the two characters 0x (hex 3078).
+    $csv3 = Join-Path $csvDir "nobs-live-csv3-$PID.csv"
+    Set-Content -LiteralPath $csv3 -Encoding ascii -Value @('id,b,t', '1,0x,0x', '2,0x00FF,0x00FF', '3,\N,\N')
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_bin' } | Out-Null
+    Api '/api/exec' @{ conn = $conn; sql = 'CREATE TABLE nobs_test.csv_live_bin (id INT PRIMARY KEY, b VARBINARY(8) NULL, t VARCHAR(8) NULL)' } | Out-Null
+    $imp3 = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = 'csv_live_bin'; file = $csv3; hasHeader = $true; nullValue = '\N' }
+    Check ($imp3.ok -eq $true) 'CSV import with binary values succeeds' ($imp3 | ConvertTo-Json -Compress)
+    $binShape = Scalar "SELECT GROUP_CONCAT(CONCAT_WS('|', id, IFNULL(HEX(b),'N'), IFNULL(t,'N')) ORDER BY id SEPARATOR ';') FROM csv_live_bin" 'nobs_test'
+    Check ($binShape -ceq '1||0x;2|00FF|0x00FF;3|N|N') 'a bare 0x is an empty binary value, and text that reads 0x stays text' "got $binShape"
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_bin' } | Out-Null
+    Remove-Item -LiteralPath $csv3 -Force -ErrorAction SilentlyContinue
+
     # Replace-mode empties the table first. If the import then fails, that emptying must go too -
     # otherwise a botched import destroys the data it was supposed to replace. (TRUNCATE could not
     # deliver this: MySQL implicitly commits it. This path uses DELETE FROM inside the transaction
@@ -485,6 +500,22 @@ console.log(JSON.stringify(out));
     Check ($got.Count -eq 25) 'paging 25 rows at 10/page delivers all 25' "got $($got.Count): $($got -join ',')"
     Check ((@($got | Select-Object -Unique)).Count -eq 25) 'no row is delivered twice'
 
+    # --- values holding CR / LF, and NULL-looking text, come back as themselves --------------------
+    # mysql --batch escapes LF but not CR, and rows used to be cut with ReadLine(), which also stops
+    # at CR - so such a row split in two and every later column shifted. And the NULL marker was
+    # matched ignoring case, so a value of one line feed (escaped as \n) read as NULL, as did 'null'.
+    $cr = Api '/api/query' @{ conn = $conn; sql = "SELECT CONCAT('a',CHAR(10),'b',CHAR(13),'c') AS t, 0x0A0D AS b, 0x0A AS lf, 'null' AS n, 'x' AS after UNION ALL SELECT '', NULL, NULL, 'Null', 'y'" }
+    Check ($cr.ok -and @($cr.rows).Count -eq 2) 'a CR inside a value does not split its row' "rows=$(@($cr.rows).Count)"
+    if ($cr.ok -and @($cr.rows).Count -eq 2) {
+        $r0 = $cr.rows[0]
+        Check ($r0[0] -ceq "a`nb`rc")      'text with LF and CR arrives intact' ([string]$r0[0])
+        Check ($r0[1] -ceq "`n`r")         'binary 0x0A0D arrives intact'
+        Check ($r0[2] -ceq "`n")           'a value of one line feed is not NULL'
+        Check ($r0[3] -ceq 'null' -and $cr.rows[1][3] -ceq 'Null') "the text 'null' is not NULL"
+        Check ($r0[4] -ceq 'x' -and $cr.rows[1][4] -ceq 'y') 'the column after them is still in place'
+        Check ($cr.rows[1][0] -ceq '' -and $null -eq $cr.rows[1][1]) 'empty string and NULL stay distinct'
+    }
+
     # --- the CA certificate is actually used, not just written down ------------------------------
     # Writing ssl-ca= into the options file proves nothing on its own: the client could ignore it
     # and the connection would still succeed, which is exactly the shape of failure that makes a
@@ -609,6 +640,14 @@ console.log(JSON.stringify(out));
 }
 finally {
     if ($token -and $base) {
+        # The compare check saves a profile into the user's REAL connection store, because compare
+        # resolves servers by saved name. Its inline delete only runs if nothing between the two
+        # threw - and an earlier run that died there left "nobs_live_cmp_<pid>" behind in a real
+        # connection list. Deleting here as well makes that impossible; deleting twice is harmless.
+        if ($cn) {
+            try { Invoke-RestMethod -Uri "$base/api/conn-delete" -Method Post -ContentType 'application/json' -TimeoutSec 5 `
+                    -Body (@{ token = $token; name = $cn } | ConvertTo-Json) | Out-Null } catch { }
+        }
         try { Invoke-RestMethod -Uri "$base/api/quit" -Method Post -ContentType 'application/json' -Body "{""token"":""$token""}" -TimeoutSec 5 | Out-Null } catch { }
     }
     Start-Sleep -Milliseconds 800

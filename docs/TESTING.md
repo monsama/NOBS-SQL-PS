@@ -1,6 +1,6 @@
 # Testing
 
-Nine test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
+Thirteen test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
 the file that actually ships rather than a copy of it.
 
 ```powershell
@@ -9,8 +9,12 @@ pwsh -NoProfile -File tests/Get-CnfSafe.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/SslLines.Tests.ps1           ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/PluginDir.Tests.ps1          ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/BatchFailureNote.Tests.ps1   ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/DumpTarget.Tests.ps1         ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/ResultRows.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UiParses.Tests.ps1           ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ConnSslCa.Tests.ps1          ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/TableDesigner.Tests.ps1      ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/DdlRecreate.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
@@ -26,16 +30,27 @@ not — see below.
 | `SslLines` | the SSL options written into the `.cnf`, per client dialect | nothing |
 | `PluginDir` | where the client looks for its authentication plugins | nothing |
 | `BatchFailureNote` | what a failed batch may honestly claim about rollback | nothing |
+| `DumpTarget` | restoring a dump into a chosen target database, not the one it came from | nothing |
+| `ResultRows` | cutting result rows out of `mysql --batch` output: CR in values, NULL vs text | nothing |
 | `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
 | `ConnSslCa` | that every save and load of a connection carries its CA certificate | `node` on PATH |
+| `TableDesigner` | that editing a column keeps everything the designer does not show | `node` on PATH |
+| `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
-The four node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
+The node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
 cannot lift their subject out with the PowerShell AST. They extract it by brace-matching and run it
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
+
+`ConnSslCa`, `TableDesigner` and `DdlRecreate` embed the very same test files the Tauri edition
+runs (`tests/ui/*.test.mjs` in NOBS-SQL-Editor), pointed at this file through `NOBS_UI_SOURCE`.
+They are generated from those files - regenerate rather than edit them by hand.
+
+`DumpTarget` and `ResultRows` compile the script's small C# helper, so they also prove it builds
+on whichever PowerShell runs them; run them under Windows PowerShell 5.1 as well as pwsh.
 
 `SslLines` and `PluginDir` are about the client binary rather than the server, so they need no
 database: `SslLines` asks the real client to parse the options it would be given (`--version` is

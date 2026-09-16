@@ -23,7 +23,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$t,[ref]$e)
 if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB','Get-CnfSafe')},$true) |
+                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB','Get-CnfSafe','Friendly-TlsErr','Test-MySqlHexIdentified')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
@@ -80,6 +80,29 @@ Check (Get-SslLines 'verify-ca' $false)                   'ssl-mode=VERIFY_CA'  
 # MariaDB's has none, so verify-ca must map to the STRICTER full verification - never to less.
 Check (Get-SslLines 'verify-ca' $true 'C:\certs\ca.pem') 'ssl,ssl-verify-server-cert,ssl-ca=C:\\certs\\ca.pem' 'MariaDB client, verify-ca maps to full verification'
 Check ((Get-SslLines 'verify-ca' $true) -join ',') ((Get-SslLines 'verify' $true) -join ',') 'MariaDB client: verify-ca is never weaker than verify'
+
+"`n-- a failed verifying connection says which of the three things went wrong --"
+# Real messages from the MariaDB client 15.2 and the MySQL client 8.0.46 against MySQL 8.0.46.
+$tls = "ERROR 2026 (HY000): TLS/SSL error: Server certificate validation failed. A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider."
+$script:MysqlPath = $null; $script:ClientIsMariaDB = @{ Path = ""; Maria = $true }
+$m = Friendly-TlsErr $tls ([pscustomobject]@{ ssl = "verify-ca"; sslCa = "" })
+Check ([int]($m -match "Set ""CA certificate""")) "1" "no CA: points at the CA setting"
+$m = Friendly-TlsErr $tls ([pscustomobject]@{ ssl = "verify"; sslCa = "C:ca.pem" })
+Check ([int]($m -match "could not be validated against it" -and $m -match "mysql.exe")) "1" "CA given, MariaDB client: explains the host-name check and the way round it"
+$script:ClientIsMariaDB = @{ Path = ""; Maria = $false }
+$m = Friendly-TlsErr "ERROR 2026 (HY000): SSL connection error: CA certificate is required if ssl-mode is VERIFY_CA or VERIFY_IDENTITY" ([pscustomobject]@{ ssl = "verify"; sslCa = "" })
+Check ([int]($m -match "refuses SSL mode")) "1" "MySQL client without a CA: says it refuses to start"
+$m = Friendly-TlsErr "ERROR 2026 (HY000): SSL connection error: error:0A000086:SSL routines::certificate verify failed" ([pscustomobject]@{ ssl = "verify"; sslCa = "C:ca.pem" })
+Check ([int]($m -match "verify-ca")) "1" "MySQL client, verify with a CA: points at verify-ca for the host name"
+# Anything else passes through unchanged.
+Check (Friendly-TlsErr $tls ([pscustomobject]@{ ssl = "required"; sslCa = "" })) $tls "not a verifying mode: unchanged"
+Check (Friendly-TlsErr "ERROR 1045 (28000): Access denied" ([pscustomobject]@{ ssl = "verify"; sslCa = "" })) "ERROR 1045 (28000): Access denied" "not a TLS failure: unchanged"
+$script:ClientIsMariaDB = $null
+
+"`n-- user transfer prints MySQL password hashes as 0x literals where the server can --"
+foreach ($c in @(@('8.0.46',$true),@('8.0.17',$true),@('9.1.0',$true),@('8.0.16',$false),@('5.7.44-log',$false),@('12.2.2-MariaDB',$false),@('',$false))) {
+  Check ([string](Test-MySqlHexIdentified $c[0])) ([string]$c[1]) "print_identified_with_as_hex for '$($c[0])'"
+}
 
 "`n-- the SERVER type must not influence the flags: it is the client that parses them --"
 $script:ServerIsMariaDB = $false
