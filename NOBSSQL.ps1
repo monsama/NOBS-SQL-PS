@@ -6324,7 +6324,7 @@ refreshConns().then(async () => {
 toggleOverview();
 libLoad();
 let _pingFails = 0;
-function _ping(){ return fetch('/api/ping', { method:'POST', keepalive:true }).then(()=>{_pingFails=0;}).catch(()=>{_pingFails++; if(_pingFails>=2) showDead();}); }
+function _ping(){ return fetch('/api/ping', { method:'POST', keepalive:true, headers:{'Content-Type':'application/json'}, body:JSON.stringify({token:TOKEN}) }).then(()=>{_pingFails=0;}).catch(()=>{_pingFails++; if(_pingFails>=2) showDead();}); }
 setInterval(_ping, 5000);
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) _ping(); });
 document.body.classList.add('disconnected');
@@ -6469,7 +6469,17 @@ $RequestHandler = {
     param($client, $Token, $Html)
     try {
         $req = Read-Request $client
-        if ($req.path -eq '/api/ping') { $SharedState.LastPing = Get-Date; Send-Json $client '{"ok":true}'; return }
+        if ($req.path -eq '/api/ping') {
+            # Token-checked like every other /api/* route. Ping refreshes LastPing, which is what
+            # the idle-shutdown check below reads - so while this was unauthenticated, any web
+            # page the user happened to have open could hold the server (and the live database
+            # connections and credentials it holds) open indefinitely with a periodic cross-origin
+            # POST to this fixed, predictable port. It could not read the reply, but it did not
+            # need to: the side effect was the whole point. The real page already knows the token.
+            $data=$null; try { if($req.body){ $data=$req.body | ConvertFrom-Json } } catch { }
+            if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
+            $SharedState.LastPing = Get-Date; Send-Json $client '{"ok":true}'; return
+        }
         if ($req.path -eq '/' -or $req.path -eq '/index.html') { Send-Http $client '200 OK' 'text/html; charset=utf-8' ([Text.Encoding]::UTF8.GetBytes($Html)); return }
         if ($req.path -eq '/api/quit') {
             # Same token check every other /api/* route gets below - without it, any local
