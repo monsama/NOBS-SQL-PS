@@ -152,6 +152,58 @@ eq(H.looksLikePastedHex('the 0xAB flag is set'), false, 'text mentioning a short
 eq(H.looksLikePastedHex('value: 0x1234 and 0x5678'), false, 'short hex numbers in prose are left alone');
 eq(H.looksLikePastedHex(pxText), false, 'the decoded value itself must never warn');
 
+
+// --- copy/paste safety: no route may corrupt --------------------------------------------------
+// Two blobs in a real database were lost to the same move - copy a cell, paste it into another
+// cell - twice over, because each fix covered only one shape of it. This walks every combination
+// of what "Copy value" produces and where it can be pasted, and asserts each is either exactly
+// right or refused. Nothing in between.
+const mSrc = ['strLit','lit','bytesToHex','textToHex','hexToBytes','hexToStrictText',
+              'normalizeHexInput','looksLikePastedHex','hexCellValueForSave','cellCopyValue']
+  .map(n => extractFunction(src, n)).join('\n');
+const M = new Function('MAX_HEXTEXT_BYTES', mSrc +
+  '\nreturn {cellCopyValue,looksLikePastedHex,normalizeHexInput,hexCellValueForSave,textToHex};')(1 << 20);
+
+const mkHex = (t) => '0x' + [...new TextEncoder().encode(t)].map(b => b.toString(16).padStart(2,'0')).join('');
+const textLike = mkHex('$7$C6..../....RYngpNxf');
+const realBinary = '0x00ff10fe';
+
+// Returns the bytes that would land, or null when the app refuses to save.
+const saveAs = (mode, box) => {
+  if (M.looksLikePastedHex(box) && mode === 'text') {
+    const whole = M.normalizeHexInput(box);
+    if (whole === null) return null;
+    mode = 'hex'; box = whole;
+  }
+  if (mode === 'hex' && M.normalizeHexInput(box) === null) return null;
+  return M.hexCellValueForSave(mode, box);
+};
+const bytesOf = (v) => v === '' ? '' : (/^0x/.test(v) ? v.toLowerCase() : M.textToHex(v).toLowerCase());
+
+let routeBad = [];
+for (const [label, cell] of [['text-like binary', textLike], ['non-UTF-8 binary', realBinary]]) {
+  const copied = M.cellCopyValue(cell);
+  for (const mode of ['text', 'hex']) {
+    const stored = saveAs(mode, copied);
+    if (stored === null) continue;
+    if (bytesOf(stored) !== cell.toLowerCase()) routeBad.push(label + ' -> ' + mode + ' tab');
+  }
+  const asHex = saveAs('hex', cell);
+  if (bytesOf(asHex) !== cell.toLowerCase()) routeBad.push(label + ' -> copy-as-hex');
+}
+eq(routeBad.join(', '), '', 'every copy-then-paste route round-trips exactly or is refused');
+
+// The move that actually caused the loss: hex pasted alongside an existing value.
+eq(saveAs('text', textLike + '$7$C6..../....RYngpNxf'), null, 'hex pasted in front of the old value is refused');
+eq(saveAs('text', '$7$C6..../....RYngpNxf' + textLike), null, 'hex pasted after the old value is refused');
+eq(saveAs('text', 'ordinary text value'), M.textToHex('ordinary text value'), 'an ordinary text value still saves untouched');
+
+// And what the clipboard actually gets.
+eq(M.cellCopyValue('0x6869'), 'hi', 'text-like bytes copy as their text');
+eq(M.cellCopyValue('0x00ff10fe'), '0x00ff10fe', 'bytes that are not text keep the hex');
+eq(M.cellCopyValue('plain'), 'plain', 'a non-binary cell is copied untouched');
+eq(M.cellCopyValue(null), '', 'NULL copies as empty, not the word null');
+
 process.exit(fail ? 1 : 0);
 '@
 
