@@ -1065,7 +1065,17 @@ function Api-Export { param($conn,$data)
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
                     $a+=$d; $a+="--result-file=$file"
                     $r=Run-Proc $script:MysqldumpPath $a $null $jobId
-                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") } else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                    # Cancelling kills mysqldump, which comes back as exit -1 with nothing on
+                    # stderr. Without this check that fell through to the generic FAILED branch
+                    # below and logged "FAILED (-1) <db> routines/events : " - a failure with no
+                    # reason given, for something the user themselves just cancelled. Every other
+                    # step in this export already distinguishes the two; this one did not.
+                    if($job.Cancelled){
+                        if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
+                        [void]$log.Add("CANCELLED (routines/events for $d stopped)")
+                    }
+                    elseif($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB, routines/events)") }
+                    else { [void]$log.Add("FAILED ($($r.exit)) $d routines/events : "+(Friendly-DumpErr (FirstErr $r.err))) }
                 }
             }
         }
