@@ -108,3 +108,34 @@ a cancel during the table loop skips that step entirely, the test excludes every
 routines/events is the only work left, then sweeps short delays — and **asserts that it actually
 reached the step**, so it cannot pass by never getting there. An earlier version of the test, using
 fixed delays and no such assertion, passed against the unfixed code.
+
+## Checking real data for corruption
+
+`tools/Check-BlobIntegrity.ps1` audits a live server for the corruption signatures this app has
+actually produced. It is read-only — it runs SELECTs and writes nothing.
+
+```powershell
+pwsh -NoProfile -File tools/Check-BlobIntegrity.ps1 -Dsn '127.0.0.1:3306:root:yourpassword'
+pwsh -NoProfile -File tools/Check-BlobIntegrity.ps1 -Dsn '...' -Schema just_this_one
+```
+
+Exit code 0 means nothing was found, 1 means it has findings to look at, 2 means it could not run.
+
+| signature | what it means |
+|---|---|
+| `hex-text` | the value begins with the two **characters** `0` and `x` — a binary cell is displayed as `0x..`, so a copied one pastes back as hex, and stored as text it becomes the characters rather than the bytes |
+| `embedded-hex` | a `0x` run of 16+ hex digits sits inside other content — a paste that landed alongside the cell's existing value instead of replacing it |
+| `bare-hex` | the whole value is hex digits with no prefix, and long enough not to be coincidence |
+| `replacement` | the value contains U+FFFD, which nothing stores on purpose — some layer decoded and re-encoded the data |
+| `nul-in-text` | a NUL byte inside a text column, occasionally the tail of a binary value written to the wrong place |
+
+Findings are candidates, not verdicts. A column that legitimately holds hex text will be reported
+and should be — the row count and sample are there to tell the difference. Two worked examples
+from this codebase:
+
+- A `mediumblob` holding `0x2437…` followed by a crypt hash was a real loss, and recovered by
+  un-hexing the leading run.
+- A migration log holding one U+FFFD inside a column comment, **identical on two separate
+  servers**, was baked into the migration script itself. Nothing to fix.
+
+Worth running after any session of hand-editing binary columns, and before trusting a backup.
