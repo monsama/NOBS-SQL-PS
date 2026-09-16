@@ -73,6 +73,35 @@ Every check is a regression test for a bug that actually shipped:
 - **Compare reports rows that exist only on the target**, including when nothing is missing —
   the case that otherwise reads as "no row differences".
 - **Paging a cursor delivers every row exactly once**, with no row dropped at a page boundary.
+- **Every kind of input stores exactly the bytes it should.** The byte-fidelity matrix, below.
+
+### The byte-fidelity matrix
+
+Three binary-fidelity bugs shipped in a single week, in code that read correctly and passed the
+tests that existed at the time: the stdout reader destroying every byte that was not valid UTF-8,
+hex pasted into the value editor's Text tab being stored as the characters `0x24…` rather than the
+bytes they denote, and an emptied cell storing the two characters `0x` instead of nothing. None
+were found by reasoning about the code. All three were found by putting a value in, reading it
+back, and comparing bytes — so that comparison is a test now.
+
+It builds each statement with the **real** editor functions lifted out of `NOBSSQL.ps1`
+(`textToHex`, `normalizeHexInput`, `hexCellValueForSave`, `lit`), sends it through the app's own
+API, and compares `HEX(col)` against the bytes that went in. Twenty-two inputs: quotes,
+backslashes including a trailing one, four-byte emoji, CJK, RTL, embedded newlines and tabs,
+injection-shaped text, 64 KB, text that looks like hex, and on the hex side app-style,
+Workbench-spaced, line-wrapped, unprefixed, uppercase, a lone NUL byte, bytes that are not valid
+UTF-8, and empty.
+
+Two of those cases guard specific fixes and are worth not weakening:
+
+- **64 KB** guards `New-SqlArg`. SQL used to go to `mysql.exe` as a single `-e` argument, and
+  Windows caps a command line at about 32767 characters — so a value over roughly 8 KB became a
+  hex literal too long to pass, and `Process.Start` threw. What the user saw was a raw .NET
+  exception naming `mysql.exe`, with nothing in it about SQL or size. Oversized statements now go
+  to a temp file that mysql is told to `source`. Raise `New-SqlArg`'s threshold so it never
+  triggers and this case fails.
+- **empty** guards `hexCellValueForSave`. Both tabs produce a digit-less `0x` for an empty box,
+  which is not valid SQL and which `lit()` would quote — storing the characters `0` and `x`.
 
 The export-cancel case needs the cancel to land while the routines/events dump is in flight. Since
 a cancel during the table loop skips that step entirely, the test excludes every table so
