@@ -62,6 +62,12 @@ jobs:
         shell: pwsh
         run: ./tests/PluginDir.Tests.ps1 ./NOBSSQL.ps1
 
+      # The CA certificate has to survive every save and load path; the bug that actually happens is
+      # one of them rebuilding the connection from parts and quietly dropping it.
+      - name: Run connection CA certificate tests
+        shell: pwsh
+        run: ./tests/ConnSslCa.Tests.ps1 ./NOBSSQL.ps1
+
       # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
       # windows-latest has none (GitHub's service containers are Linux-only, while this app
       # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would

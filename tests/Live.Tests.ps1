@@ -485,6 +485,66 @@ console.log(JSON.stringify(out));
     Check ($got.Count -eq 25) 'paging 25 rows at 10/page delivers all 25' "got $($got.Count): $($got -join ',')"
     Check ((@($got | Select-Object -Unique)).Count -eq 25) 'no row is delivered twice'
 
+    # --- the CA certificate is actually used, not just written down ------------------------------
+    # Writing ssl-ca= into the options file proves nothing on its own: the client could ignore it
+    # and the connection would still succeed, which is exactly the shape of failure that makes a
+    # security setting worthless. So point "verify" at a real, well-formed CA that did NOT sign
+    # this server's certificate - it has to be refused - and then at the same CA under "required",
+    # which verifies nothing and so must still connect.
+    $bogusCa = Join-Path $env:TEMP ("nobs-bogus-ca-" + [Guid]::NewGuid().ToString('N') + ".pem")
+    # Defined here and not borrowed from the block below: this one runs first, and relying on a
+    # variable set further down the file is how it ran with a null client path the first time.
+    $caClient = Join-Path $env:APPDATA 'NOBSSQL\bin\mysql.exe'
+    if (-not (Test-Path $caClient)) { "  skip  no mysql client found for the CA checks" } else {
+    try {
+        $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+        $req = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            'CN=NOBS Test Bogus CA', $rsa,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+        $req.CertificateExtensions.Add(
+            [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true,$false,0,$true))
+        $bc = $req.CreateSelfSigned([DateTimeOffset]::UtcNow.AddDays(-1), [DateTimeOffset]::UtcNow.AddYears(5))
+        ("-----BEGIN CERTIFICATE-----`n" + [Convert]::ToBase64String($bc.RawData,'InsertLineBreaks') +
+         "`n-----END CERTIFICATE-----`n") | Set-Content -Path $bogusCa -Encoding ascii
+
+        # This file drives the app over HTTP and so does not otherwise have its functions in scope.
+        # These two checks are about what New-Cnf writes, so they need the real thing rather than a
+        # restatement of it - load the definitions out of the script the same way the offline tests
+        # do, into a child scope so nothing here leaks into the HTTP-driven checks above.
+        $caOk = & {
+            $pe=$null;$pt=$null
+            $pa=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$pt,[ref]$pe)
+            $pa.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]},$true) |
+                ForEach-Object { Invoke-Expression $_.Extent.Text }
+            $script:ToolsDir  = Split-Path -Parent $caClient
+            $script:MysqlPath = $caClient
+            $try = {
+                param($mode, $ca)
+                $c = [pscustomobject]@{ host=$conn.host; port=$conn.port; user=$conn.user; password=$conn.password; ssl=$mode; sslCa=$ca }
+                $cnf = New-Cnf $c
+                try { (Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-B","-e","SELECT 1")).exit -eq 0 }
+                finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+            }
+            $serverCa = $env:NOBS_TEST_SERVER_CA
+            [pscustomobject]@{
+                verify   = (& $try 'verify' $bogusCa)
+                verifyCa = (& $try 'verify-ca' $bogusCa)
+                required = (& $try 'required' $bogusCa)
+                # The decisive one: same modes, the server's OWN CA. Without it, "refused with the
+                # wrong CA" cannot be told apart from "refused because the CA is ignored".
+                rightCa  = if ($serverCa -and (Test-Path $serverCa)) { & $try 'verify-ca' $serverCa } else { $null }
+            }
+        }
+        Check (-not $caOk.verify)   'ssl=verify refuses a CA that did not sign the server certificate'
+        Check (-not $caOk.verifyCa) 'ssl=verify-ca refuses it too - it relaxes the host name, not the chain'
+        Check $caOk.required        'ssl=required ignores the CA and still connects'
+        # See the Tauri repo's docs/TESTING.md for pulling the server's CA off the wire with openssl.
+        if ($null -eq $caOk.rightCa) { "  skip  NOBS_TEST_SERVER_CA not set - the right-CA check did not run" }
+        else { Check $caOk.rightCa 'ssl=verify-ca connects with the server''s own CA' }
+    } finally { Remove-Item $bogusCa -Force -ErrorAction SilentlyContinue }
+    }
+
     # --- losing the connection halfway through an apply ------------------------------------------
     # Staged grid edits go to /api/script with transaction:true. That protects against a statement
     # FAILING; this is the other way a batch stops halfway, and the one a lid-close or a VPN drop
@@ -556,4 +616,24 @@ finally {
     Remove-Item $outFile, $errFile -ErrorAction SilentlyContinue
 }
 
-if ($script:fail) { "`n  $script:fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }
+# A suite that prints "all passed" underneath a red stack trace is the exact failure this file's
+# header warns about, and it happened: a block called a function that was not in scope, errored,
+# skipped every one of its checks, and the run still reported success. A second block ran with a
+# null path for the same reason.
+#
+# Not all of $Error, though. Plenty in here is expected and deliberately swallowed - a dump process
+# that has already exited, a temp path already cleaned up - and failing on those would make the
+# suite useless. What is NEVER expected is the test itself being wrong: a command that does not
+# exist in scope, or an argument that arrived null. Those two are programming errors in this file,
+# and they are precisely the ones that silently skip checks.
+$unexpected = @($Error | Where-Object {
+    $_.Exception -is [System.Management.Automation.CommandNotFoundException] -or
+    $_.Exception -is [System.Management.Automation.ParameterBindingException]
+})
+if ($unexpected.Count) {
+    "`n  $($unexpected.Count) unexpected error(s) - checks may have been skipped:"
+    $unexpected | Select-Object -First 5 | ForEach-Object { "    $($_.ToString().Split("`n")[0])" }
+}
+if ($script:fail -or $unexpected.Count) {
+    "`n  $($script:fail) FAILED$(if($unexpected.Count){" + $($unexpected.Count) error(s)"})"; exit 1
+} else { "`n  all passed"; exit 0 }

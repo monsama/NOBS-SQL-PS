@@ -23,7 +23,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$t,[ref]$e)
 if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB')},$true) |
+                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB','Get-CnfSafe')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
@@ -47,6 +47,39 @@ Check (Get-SslLines 'default' $false) '' 'default, MySQL client'
 Check (Get-SslLines ''        $true)  '' 'empty mode'
 Check (Get-SslLines $null     $true)  '' 'null mode'
 Check (Get-SslLines 'bogus'   $true)  '' 'an unrecognised mode writes nothing rather than guessing'
+
+"`n-- the CA certificate, which is what makes 'verify' usable at all against a private server --"
+# Both MariaDB and MySQL generate a self-signed certificate when none is configured, and no system
+# trust store will ever accept one - so without a CA, 'verify' cannot succeed against an ordinary
+# private server. MySQL's client is blunter still: it refuses to start without one at all.
+Check (Get-SslLines 'verify' $true  'C:\certs\ca.pem') 'ssl,ssl-verify-server-cert,ssl-ca=C:\\certs\\ca.pem' 'MariaDB client, verify with a CA'
+Check (Get-SslLines 'verify' $false 'C:\certs\ca.pem') 'ssl-mode=VERIFY_IDENTITY,ssl-ca=C:\\certs\\ca.pem'  'MySQL client, verify with a CA'
+# Backslashes are doubled because the option-file parser treats them as escape characters - an
+# undoubled Windows path would be silently mangled before the client ever saw it.
+Check (Get-SslLines 'verify' $true 'C:\a\b\ca.pem') 'ssl,ssl-verify-server-cert,ssl-ca=C:\\a\\b\\ca.pem' 'backslashes are doubled for the option-file parser'
+
+# The other modes verify nothing, so a CA there would imply a check that is not happening.
+Check (Get-SslLines 'required' $true  'C:\certs\ca.pem') 'ssl'               'a CA is ignored for required (nothing is verified)'
+Check (Get-SslLines 'disabled' $true  'C:\certs\ca.pem') 'skip-ssl'          'a CA is ignored for disabled'
+Check (Get-SslLines 'default'  $true  'C:\certs\ca.pem') ''                  'a CA is ignored for default'
+Check (Get-SslLines 'required' $false 'C:\certs\ca.pem') 'ssl-mode=REQUIRED' 'a CA is ignored for required, MySQL dialect'
+
+# And no CA means no line at all, rather than an empty one the client would choke on.
+Check (Get-SslLines 'verify' $true '')    'ssl,ssl-verify-server-cert' 'an empty CA writes no line'
+Check (Get-SslLines 'verify' $true $null) 'ssl,ssl-verify-server-cert' 'a null CA writes no line'
+
+# A newline in the path would start a fresh directive in the options file - the same injection
+# Get-CnfSafe exists to stop, and it has to apply here too.
+Check (Get-SslLines 'verify' $true "C:\ca.pem`npager=calc.exe") 'ssl,ssl-verify-server-cert,ssl-ca=C:\\ca.pempager=calc.exe' 'a newline in the CA path cannot inject another directive'
+
+"`n-- verify-ca: the chain, not the host name --"
+# The certificate MariaDB and MySQL generate for themselves never names a real host, so 'verify'
+# refuses it even given exactly the right CA. MySQL's client has a chain-only mode for this.
+Check (Get-SslLines 'verify-ca' $false 'C:\certs\ca.pem') 'ssl-mode=VERIFY_CA,ssl-ca=C:\\certs\\ca.pem' 'MySQL client, verify-ca with a CA'
+Check (Get-SslLines 'verify-ca' $false)                   'ssl-mode=VERIFY_CA'                         'MySQL client, verify-ca without a CA'
+# MariaDB's has none, so verify-ca must map to the STRICTER full verification - never to less.
+Check (Get-SslLines 'verify-ca' $true 'C:\certs\ca.pem') 'ssl,ssl-verify-server-cert,ssl-ca=C:\\certs\\ca.pem' 'MariaDB client, verify-ca maps to full verification'
+Check ((Get-SslLines 'verify-ca' $true) -join ',') ((Get-SslLines 'verify' $true) -join ',') 'MariaDB client: verify-ca is never weaker than verify'
 
 "`n-- the SERVER type must not influence the flags: it is the client that parses them --"
 $script:ServerIsMariaDB = $false
@@ -76,7 +109,7 @@ if (-not $client) {
 } else {
   $maria = ((& $client --version 2>&1 | Out-String) -match 'MariaDB')
   "  using $client (dialect: $(if($maria){'MariaDB'}else{'MySQL'}))"
-  foreach ($mode in 'disabled','required','verify') {
+  foreach ($mode in 'disabled','required','verify','verify-ca') {
     $cnf = Join-Path ([IO.Path]::GetTempPath()) ("ssltest-" + [Guid]::NewGuid().ToString('N') + ".cnf")
     try {
       ("[client]`n" + ((Get-SslLines $mode $maria) -join "`n")) | Set-Content -Encoding ascii $cnf

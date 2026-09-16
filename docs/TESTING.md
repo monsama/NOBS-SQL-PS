@@ -1,6 +1,6 @@
 # Testing
 
-Eight test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
+Nine test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
 the file that actually ships rather than a copy of it.
 
 ```powershell
@@ -10,6 +10,7 @@ pwsh -NoProfile -File tests/SslLines.Tests.ps1           ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/PluginDir.Tests.ps1          ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/BatchFailureNote.Tests.ps1   ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UiParses.Tests.ps1           ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/ConnSslCa.Tests.ps1          ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
@@ -26,11 +27,12 @@ not — see below.
 | `PluginDir` | where the client looks for its authentication plugins | nothing |
 | `BatchFailureNote` | what a failed batch may honestly claim about rollback | nothing |
 | `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
+| `ConnSslCa` | that every save and load of a connection carries its CA certificate | `node` on PATH |
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
-The last three offline scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
+The four node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
 cannot lift their subject out with the PowerShell AST. They extract it by brace-matching and run it
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
@@ -80,6 +82,17 @@ pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
 ```
 
 The suite is expected to pass unchanged against MariaDB 12.x and MySQL 8.x alike.
+
+### The CA certificate checks
+
+Set `NOBS_TEST_SERVER_CA` to the test server's own CA to run the one check that matters most:
+`verify-ca` connecting with it. Without that, the remaining CA checks only show that a *wrong* CA
+is refused — and a CA being silently ignored would be refused in exactly the same way against a
+self-signed server. The script says when it skipped this. The Tauri repo's `docs/TESTING.md`
+shows how to take the CA off the wire with `openssl`, no access to the server's files needed.
+
+`ConnSslCa.Tests.ps1` embeds the same JavaScript test file the Tauri edition runs
+(`tests/ui/conn-ssl-ca.test.mjs` there). Keep the two copies in step.
 
 **Without `NOBS_TEST_DSN` the script prints `SKIPPED` and exits 0.** That is deliberate, and so is
 how loud it is about it: a test that quietly reports success for work it never did is worse than

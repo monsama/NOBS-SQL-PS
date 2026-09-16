@@ -187,13 +187,29 @@ function Test-ClientIsMariaDB {
 }
 
 # Build the SSL-related lines for the temporary my.cnf options file.
+#
+# $Ca is an optional path to a PEM certificate to trust as the root, and is only meaningful for
+# 'verify' - the other modes check nothing, so writing it there would imply a verification that is
+# not happening. It is what makes 'verify' usable at all against an ordinary private server: both
+# MariaDB and MySQL generate a self-signed certificate when none is configured, and no system trust
+# store will ever accept one. MySQL's client is blunter still and refuses to start without it -
+# "CA certificate is required if ssl-mode is VERIFY_CA or VERIFY_IDENTITY".
 function Get-SslLines {
-    param($Mode, $Maria)
+    param($Mode, $Maria, $Ca)
     if (-not $Mode -or $Mode -eq 'default') { return @() }
     if ($null -eq $Maria) { $Maria = Test-ClientIsMariaDB }
-    if ($Maria) { switch ($Mode) { 'disabled'{return @('skip-ssl')} 'required'{return @('ssl')} 'verify'{return @('ssl','ssl-verify-server-cert')} } }
-    else        { switch ($Mode) { 'disabled'{return @('ssl-mode=DISABLED')} 'required'{return @('ssl-mode=REQUIRED')} 'verify'{return @('ssl-mode=VERIFY_IDENTITY')} } }
-    return @()
+    $lines = @()
+    # 'verify-ca' checks the certificate chain but not the host name - which is what a CA needs to
+    # be any use against the certificate MariaDB and MySQL generate for themselves, since its name
+    # never matches a host. MySQL's client has exactly that (VERIFY_CA). MariaDB's does not: once a
+    # CA is supplied it checks the name too (bar loopback), and nothing on its command line turns
+    # that off without also putting the chain check in doubt. So on the MariaDB client verify-ca gets
+    # the full, STRICTER verification. A setting that asks for verification must never quietly get
+    # less; getting more only means failing where a looser client would have connected.
+    if ($Maria) { switch ($Mode) { 'disabled'{$lines=@('skip-ssl')} 'required'{$lines=@('ssl')} 'verify'{$lines=@('ssl','ssl-verify-server-cert')} 'verify-ca'{$lines=@('ssl','ssl-verify-server-cert')} } }
+    else        { switch ($Mode) { 'disabled'{$lines=@('ssl-mode=DISABLED')} 'required'{$lines=@('ssl-mode=REQUIRED')} 'verify'{$lines=@('ssl-mode=VERIFY_IDENTITY')} 'verify-ca'{$lines=@('ssl-mode=VERIFY_CA')} } }
+    if (($Mode -eq 'verify' -or $Mode -eq 'verify-ca') -and $Ca) { $lines += "ssl-ca=$((Get-CnfSafe ([string]$Ca)) -replace '\\','\\')" }
+    return $lines
 }
 # Where the client should look for authentication plugins.
 #
@@ -247,7 +263,7 @@ function New-Cnf {
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
     if ($conn.password) { [void]$sb.AppendLine("password=$((Get-CnfSafe $conn.password) -replace '\\','\\')") }
-    foreach ($l in (Get-SslLines $conn.ssl)) { [void]$sb.AppendLine($l) }
+    foreach ($l in (Get-SslLines $conn.ssl $null $conn.sslCa)) { [void]$sb.AppendLine($l) }
     $pluginDir = Get-PluginDir
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
     # Create the file empty first, then lock its ACL down to the current user only,
@@ -1568,7 +1584,7 @@ function Api-ConnSetPrimary { param($data)
     $name=[string]$data.name
     $list = Load-Conns | ForEach-Object {
         $pass = if($_.pass){ [string]$_.pass } else { '' }
-        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
+        [pscustomobject]@{name=$_.name;host=$_.host;port=$_.port;user=$_.user;ssl=$_.ssl;sslCa=[string]$_.sslCa;pass=$pass;primary=($name -ne '' -and $_.name -eq $name);accent=[string]$_.accent;env=[string]$_.env;readonly=[bool]$_.readonly}
     }
     Save-Conns @($list); '{"ok":true}'
 }
@@ -1751,7 +1767,7 @@ function Api-ConnList {
     # decrypt, so this never needs to touch the actual DPAPI-protected secret just to report
     # whether one exists. Lets the connection dropdown show which saved connections will prompt
     # for a password on connect versus which already have one stored on this machine.
-    $items = Load-Conns | ForEach-Object { $pr = if($_.primary){'true'}else{'false'}; $ro = if($_.readonly){'true'}else{'false'}; $hp = if($_.pass){'true'}else{'false'}; '{"name":'+(J-Str $_.name)+',"host":'+(J-Str $_.host)+',"port":'+(J-Str $_.port)+',"user":'+(J-Str $_.user)+',"ssl":'+(J-Str $_.ssl)+',"primary":'+$pr+',"accent":'+(J-Str ([string]$_.accent))+',"env":'+(J-Str ([string]$_.env))+',"readonly":'+$ro+',"hasPassword":'+$hp+'}' }
+    $items = Load-Conns | ForEach-Object { $pr = if($_.primary){'true'}else{'false'}; $ro = if($_.readonly){'true'}else{'false'}; $hp = if($_.pass){'true'}else{'false'}; '{"name":'+(J-Str $_.name)+',"host":'+(J-Str $_.host)+',"port":'+(J-Str $_.port)+',"user":'+(J-Str $_.user)+',"ssl":'+(J-Str $_.ssl)+',"sslCa":'+(J-Str ([string]$_.sslCa))+',"primary":'+$pr+',"accent":'+(J-Str ([string]$_.accent))+',"env":'+(J-Str ([string]$_.env))+',"readonly":'+$ro+',"hasPassword":'+$hp+'}' }
     '{"ok":true,"items":['+($items -join ',')+']}'
 }
 # Look up a saved connection by name (host/port/user/ssl/password/readonly) - used by the
@@ -1762,7 +1778,7 @@ function Resolve-SavedConn { param($name)
     if(-not $c){ return $null }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; password=$pass; readonly=[bool]$c.readonly }
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly }
 }
 # Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
 # every table in the given schema, via one information_schema query (cheap, single round trip).
@@ -2408,7 +2424,7 @@ function Api-ConnGet { param($data)
     if(-not $c){ return '{"ok":false}' }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
+    $ro = if($c.readonly){'true'}else{'false'}; '{"ok":true,"conn":{"host":'+(J-Str $c.host)+',"port":'+(J-Str $c.port)+',"user":'+(J-Str $c.user)+',"ssl":'+(J-Str $c.ssl)+',"sslCa":'+(J-Str ([string]$c.sslCa))+',"password":'+(J-Str $pass)+',"accent":'+(J-Str ([string]$c.accent))+',"env":'+(J-Str ([string]$c.env))+',"readonly":'+$ro+'}}'
 }
 function Api-ConnSave { param($data)
     $name=[string]$data.name; if(-not $name){ return '{"ok":false,"error":"name required"}' }
@@ -2431,7 +2447,7 @@ function Api-ConnSave { param($data)
     if($data.PSObject.Properties['env']){ $env=[string]$data.env } elseif($prevObj){ $env=[string]$prevObj.env } else { $env='' }
     if($data.PSObject.Properties['readonly']){ $ro=[bool]$data.readonly } elseif($prevObj -and $prevObj.readonly){ $ro=$true } else { $ro=$false }
     $list=@($before | Where-Object { $_.name -ne $name })
-    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
+    $list+=[pscustomobject]@{name=$name;host=$c.host;port=$c.port;user=$c.user;ssl=$c.ssl;sslCa=[string]$c.sslCa;pass=$enc;primary=$prevPrimary;accent=$accent;env=$env;readonly=$ro}
     Save-Conns $list
     '{"ok":true}'
 }
@@ -2621,7 +2637,8 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  </div>
  <div class="barrow" id="connFormRow">
   <span class="fld">Host <input id="host" class="h" value="127.0.0.1" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Port <input id="port" class="s" value="3306" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">User <input id="user" class="s" style="width:80px" value="root" autocomplete="off" name="mwt_user" data-lpignore="true" onkeydown="if(event.key==='Enter')connect()"></span><span class="fld">Pass <input id="pass" class="p" type="password" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="mwt_secret" data-lpignore="true" data-form-type="other" onkeydown="if(event.key==='Enter')connect()"></span>
-  <select id="ssl"><option value="default">default</option><option value="disabled">disabled</option><option value="required">required</option><option value="verify">verify</option></select>
+  <select id="ssl" onchange="sslCaToggle()"><option value="default">default</option><option value="disabled">disabled</option><option value="required">required</option><option value="verify">verify</option><option value="verify-ca">verify-ca</option></select>
+  <span class="fld" id="sslcaWrap" style="display:none">CA <input id="sslca" class="s" style="width:150px" placeholder="CA certificate (.pem)" title="The CA certificate that signed this server's certificate. Needed for &quot;verify&quot; against a server using a private or self-signed certificate - which is what MariaDB and MySQL generate by default, and which no system trust store accepts. Leave empty to verify against the system trust store instead." onkeydown="if(event.key==='Enter')connect()"><button class="sm" title="Browse for the CA certificate file" onclick="browse({title:'Select CA certificate',filter:'*.pem',mode:'file',onPick:pp=>$('sslca').value=pp})">...</button></span>
   <button class="primary" title="Connect to the server with the details above" onclick="connect()">Connect</button><button class="sm" title="Disconnect and lock the UI" onclick="disconnect()">Disconnect</button>
   <span style="flex:1"></span>
  </div>
@@ -2900,7 +2917,10 @@ function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._con
 function hexA(hex,a){hex=(hex||'').replace('#','');if(hex.length===3)hex=hex.split('').map(c=>c+c).join('');const v=parseInt(hex,16);if(isNaN(v)||hex.length!==6)return '';return 'rgba('+((v>>16)&255)+','+((v>>8)&255)+','+(v&255)+','+a+')';}
 function applyAccent(color){const bar=$('bar');if(!bar)return;if(!color){bar.style.borderTop='';bar.style.borderBottom='';bar.style.boxShadow='';return;}bar.style.borderTop='2px solid '+color;bar.style.borderBottom='';bar.style.boxShadow='';}
 window.curAccent='';
-function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value};}
+function getConn(){return {host:$('host').value,port:$('port').value,user:$('user').value,password:$('pass').value,ssl:$('ssl').value,sslCa:$('sslca').value};}
+// The CA only does anything for "verify" - the other modes check nothing - so it only appears for
+// that one, rather than sitting there inviting someone to fill in a box that will be ignored.
+function sslCaToggle(){const w=$('sslcaWrap');if(w)w.style.display=(/^verify(-ca)?$/.test($('ssl').value))?'inline-flex':'none';}
 function logLineCls(l){
  if(/^OK\s+with\s+\d+\s+error/i.test(l))return 'warn';
  if(/^OK\b/.test(l))return 'ok';
@@ -3209,6 +3229,17 @@ function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').t
    // could show (and then persist) Chrome's own stale remembered password instead of the real one.
    inp.autocomplete='new-password';inp.setAttribute('autocorrect','off');inp.setAttribute('autocapitalize','off');inp.spellcheck=false;inp.name='mwt_secret';inp.setAttribute('data-lpignore','true');inp.setAttribute('data-form-type','other');
    if(f.value!=null)inp.value=f.value;inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};const eye=document.createElement('span');eye.textContent='\u{1F441}';eye.title='Show/hide password';eye.style.cssText='position:absolute;right:6px;top:50%;transform:translateY(-50%);cursor:pointer;font-size:13px;user-select:none;opacity:.7';eye.onclick=()=>{inp.type=(inp.type==='password')?'text':'password';};wrap.appendChild(inp);wrap.appendChild(eye);w.appendChild(lb);w.appendChild(wrap);box.appendChild(w);return;}
+  // A path field: a plain text input plus the app's own file browser. Not <input type="file">,
+  // which hands back a File object and deliberately never a real path - and a path is exactly
+  // what has to be written into the options file. The button is a <button>, so inpOk()'s
+  // "read every input/textarea/select" sweep picks up the field and ignores this.
+  if(f.type==='file'){const wrap=document.createElement('div');wrap.style.cssText='display:flex;gap:6px';
+   const inp=document.createElement('input');inp.id='inp_'+f.key;inp.type='text';inp.style.flex='1';inp.style.minWidth='0';
+   if(f.value!=null)inp.value=f.value;if(f.placeholder)inp.placeholder=f.placeholder;
+   inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();inpOk();}else if(e.key==='Escape'){e.preventDefault();inpCancel();}};
+   const b=document.createElement('button');b.className='sm';b.textContent='Browse...';b.style.flex='none';
+   b.onclick=()=>browse({title:f.browseTitle||('Select '+(f.label||f.key)),filter:f.filter||'*.*',mode:'file',onPick:pp=>{inp.value=pp;}});
+   wrap.appendChild(inp);wrap.appendChild(b);w.appendChild(lb);w.appendChild(wrap);box.appendChild(w);return;}
   const isTa=(f.type==='textarea');const inp=document.createElement(isTa?'textarea':'input');inp.id='inp_'+f.key;if(!isTa)inp.type=f.type||'text';inp.style.width='100%';if(isTa){inp.rows=Math.min(16,Math.max(5,String(f.value||'').split('\n').length+1));inp.style.fontFamily='"Cascadia Code",Consolas,"SF Mono",Menlo,"DejaVu Sans Mono",monospace';inp.style.fontSize='12px';inp.style.boxSizing='border-box';
    // A textarea field fills whatever room the dialog actually has (both directions) instead of
    // sitting at a small fixed row-count with dead space below it - #inpFields is a flex column
@@ -3253,7 +3284,7 @@ function connTitle(){const s=$('connlist');if(s)s.title=(s.selectedIndex>0?s.opt
 // --- Connections: dropdown, New/Save/pick, and the 'primary' (auto-open) flag.
 function updatePrimeBtn(){const b=$('primeBtn');if(!b)return;const n=$('connlist').value;const isP=(n&&n===window._primaryConn);b.textContent=(isP?'\u2605':'\u2606')+' Primary';b.style.color=isP?'#f5c518':'';b.title=isP?'This is the primary connection (opens on startup). Click to unset.':'Set as primary connection (opens automatically on startup)';}
 function connMenu(e){e.stopPropagation();if(!$('connlist').value){toast('Select a saved connection first.',true);return;}const b=e.currentTarget.getBoundingClientRect();const isP=($('connlist').value===window._primaryConn);const items=[['Edit\u2026',()=>editConn()],['Clone\u2026',()=>cloneConn()],[(isP?'Unset primary':'Set as primary'),()=>setPrimary()],['Clear password',()=>forgetPassword()]];if(!document.body.classList.contains('disconnected')){items.push('-');items.push(['Connect with different details\u2026',()=>toggleConnForm()]);}items.push('-');items.push(['Delete\u2026',()=>delConn()]);menu(b.left,b.bottom+2,items);}
-async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will type it on next connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,password:''},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if($('connlist').value===n)setPass('');}else toast(r.error||'Failed',true);}
+async function forgetPassword(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}if(!(await ask('Remove the saved password for "'+n+'"? You will type it on next connect.')))return;const g=await api('/api/conn-get',{name:n});if(!g.ok){toast('Could not load connection.',true);return;}const r=await api('/api/conn-save',{name:n,conn:{host:g.conn.host,port:g.conn.port,user:g.conn.user,ssl:g.conn.ssl,sslCa:g.conn.sslCa,password:''},savepw:false});if(r.ok){log('Removed saved password for '+n+'.');if($('connlist').value===n)setPass('');}else toast(r.error||'Failed',true);}
 async function setPrimary(){const n=$('connlist').value;if(!n){toast('Select a connection first.',true);return;}const target=(n===window._primaryConn)?'':n;const r=await api('/api/conn-primary',{name:target});if(!r.ok){toast(r.error||'Failed',true);return;}await refreshConns();$('connlist').value=n;updatePrimeBtn();log(target?('Primary connection set: '+n+' (opens on startup)'):'Primary connection cleared.');}
 async function refreshConns(){const r=await api('/api/conn-list');const sel=$('connlist');sel.innerHTML='<option value="" disabled hidden>Connections</option>';const n=(r.ok&&r.items)?r.items.length:0;window._primaryConn='';window._connMeta={};if(r.ok)r.items.forEach(c=>{if(c.primary)window._primaryConn=c.name;window._connMeta[c.name]={accent:c.accent||'',env:c.env||'',readonly:!!c.readonly};const o=document.createElement('option');o.value=c.name;
   // Only READ-ONLY here: the environment label has its own chip (envChip) beside the
@@ -3265,7 +3296,7 @@ async function refreshConns(){const r=await api('/api/conn-list');const sel=$('c
 // hides it by default at that point - see the CSS comment above body:not(.disconnected) for
 // the reasoning. Purely a visibility toggle; doesn't touch any saved connection data.
 function toggleConnForm(){document.body.classList.toggle('show-connform');}
-function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
+function newConn(){$('connlist').value='';$('host').value='127.0.0.1';$('port').value='3306';$('user').value='';$('pass').value='';$('ssl').value='default';$('sslca').value='';sslCaToggle();window.curAccent='';applyAccent('');window.readOnly=false;window.curEnv='';const ec=$('envChip');if(ec)ec.style.display='none';const pwc=$('pwChip');if(pwc)pwc.style.display='none';document.body.classList.add('show-connform');document.body.classList.remove('ro');connTitle();$('user').focus();log('New connection - enter details and Save.');}
 function setPass(pw){const el=$('pass');if(el)el.value=pw;}
 async function pickConnGuarded(){
   if (anyPending() && !(await ask('You have unsaved grid edits open. Switching connections will leave them orphaned. Switch anyway?'))) return;
@@ -3287,6 +3318,8 @@ async function pickConn() {
         $('port').value = r.conn.port;
         $('user').value = r.conn.user;
         $('ssl').value = r.conn.ssl;
+        $('sslca').value = r.conn.sslCa || '';
+        sslCaToggle();
         const _pw = r.conn.password || '';
         setPass(_pw);
         window._connMeta = window._connMeta || {};
@@ -3332,17 +3365,18 @@ async function saveConn(){
   {key:'port',label:'Port',value:$('port').value},
   {key:'user',label:'User',value:$('user').value},
   {key:'password',label:'Password',type:'password',value:$('pass').value},
-  {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify'}],value:$('ssl').value},
+  {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:$('ssl').value},
+  {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:$('sslca').value},
   {key:'color',label:'Accent color (tell servers apart at a glance)',type:'color',value:n0?(accMap()[n0]||'#3b82f6'):'#3b82f6'},
   {key:'env',label:'Environment label (e.g. Production, Dev) - optional',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (unchecked = type it each time)',type:'checkbox',value:n0?!!$('pass').value:true}
  ]});
  if(!res||!res.name.trim())return;const n=res.name.trim();
- const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
+ const r=await api('/api/conn-save',{name:n,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});
  if(!r.ok){toast(r.error,true);return;}
  window.curAccent=res.color;applyAccent(res.color);log('Saved connection: '+n);await refreshConns();$('connlist').value=n;applyEnv(n);
- $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;setPass(res.password);
+ $('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();setPass(res.password);
  const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';
 }
 // Edits a saved connection entirely within its own dialog - host/port/user/password/ssl are
@@ -3359,23 +3393,24 @@ async function editConn(){const n0=$('connlist').value;if(!n0){toast('Select a s
   {key:'port',label:'Port',value:g.conn.port},
   {key:'user',label:'User',value:g.conn.user},
   {key:'password',label:'Password',type:'password',value:g.conn.password||''},
-  {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify'}],value:g.conn.ssl},
+  {key:'ssl',label:'SSL',type:'select',options:[{value:'default',label:'default'},{value:'disabled',label:'disabled'},{value:'required',label:'required'},{value:'verify',label:'verify (CA and host name)'},{value:'verify-ca',label:'verify-ca (CA only - for auto-generated server certificates)'}],value:g.conn.ssl},
+  {key:'sslCa',label:'CA certificate - only used by SSL "verify"; leave empty to use the system trust store',type:'file',filter:'*.pem',browseTitle:'Select CA certificate',placeholder:'e.g. C:\\certs\\server-ca.pem',value:g.conn.sslCa||''},
   {key:'color',label:'Accent color',type:'color',value:accMap()[n0]||'#3b82f6'},
   {key:'env',label:'Environment label (optional)',value:m0.env||'',maxlength:40},
   {key:'ro',label:'Read-only / safe mode (block all writes)',type:'checkbox',value:!!m0.readonly},
   {key:'savepw',label:'Save password (uncheck to remove the saved password)',type:'checkbox',value:!!(g.ok&&g.conn.password)}
  ]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
- const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
+ const r=await api('/api/conn-save',{name:nn,conn:{host:res.host,port:res.port,user:res.user,password:res.password,ssl:res.ssl,sslCa:res.sslCa},accent:res.color,env:(res.env||'').trim(),readonly:!!res.ro,savepw:!!res.savepw});if(!r.ok){toast(r.error,true);return;}
  if(nn!==n0){await api('/api/conn-delete',{name:n0});}
  window.curAccent=res.color;applyAccent(res.color);await refreshConns();$('connlist').value=nn;applyEnv(nn);
  // If this connection is the one currently loaded into the (largely internal, now rarely
  // shown) inline form, keep it in sync with what was just saved - otherwise a subsequent
  // Connect click would silently use stale values from before the edit.
- if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
+ if($('connlist').value===nn){$('host').value=res.host;$('port').value=res.port;$('user').value=res.user;$('ssl').value=res.ssl;$('sslca').value=res.sslCa||'';sslCaToggle();setPass(res.password);const pwc=$('pwChip');if(pwc)pwc.style.display=res.password?'inline':'none';}
  log('Updated connection: '+nn);}
 async function cloneConn(){const n0=$('connlist').value;
- if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('pass').value=g.conn.password;}}
+ if(n0){const g=await api('/api/conn-get',{name:n0});if(g.ok){$('host').value=g.conn.host;$('port').value=g.conn.port;$('user').value=g.conn.user;$('ssl').value=g.conn.ssl;$('sslca').value=g.conn.sslCa||'';sslCaToggle();$('pass').value=g.conn.password;}}
  const base=n0||($('user').value+'@'+$('host').value);
  const res=await inputBox({title:'Clone connection',okText:'Clone',fields:[{key:'name',label:'New connection name',value:base+' (copy)',maxlength:60}]});
  if(!res||!res.name.trim())return;const nn=res.name.trim();
