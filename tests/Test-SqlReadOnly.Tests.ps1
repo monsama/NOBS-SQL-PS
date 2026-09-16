@@ -11,7 +11,7 @@ param([Parameter(Mandatory)][string]$ScriptPath)
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$t,[ref]$e)
 if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
-$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Strip-Parens')},$true) |
+$ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($n.Name -eq 'Test-SqlReadOnly' -or $n.Name -eq 'Split-OffKeyword' -or $n.Name -eq 'Strip-Parens')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 $fail = 0
 function Check($sql, $expected, $label) {
@@ -41,4 +41,40 @@ Check 'ANALYZE FORMAT=JSON SELECT * FROM t' $true 'ANALYZE FORMAT=JSON SELECT al
 Check 'ANALYZE DELETE FROM t' $false 'ANALYZE-wrapped DELETE blocked'
 Check 'ANALYZE INSERT INTO t VALUES (1)' $false 'ANALYZE-wrapped INSERT blocked'
 Check 'ANALYZE FORMAT=JSON DELETE FROM t' $false 'ANALYZE FORMAT=JSON DELETE blocked'
+
+# Account management. The Users dialog builds these client-side and sends them through the same
+# /api/exec route as any other statement, so read-only has to stop them here - there is nothing
+# else between that dialog and the server. None of these verbs are on the allow-list, so they are
+# blocked by default; these pin that, because an allow-list gaining a new entry is exactly the
+# kind of change that would quietly let them through.
+Check "CREATE USER 'u'@'%' IDENTIFIED BY 'p'" $false 'CREATE USER blocked'
+Check "DROP USER 'u'@'%'" $false 'DROP USER blocked'
+Check "ALTER USER 'u'@'%' ACCOUNT LOCK" $false 'ALTER USER blocked'
+Check "GRANT SELECT ON d.* TO 'u'@'%'" $false 'GRANT blocked'
+Check "REVOKE SELECT ON d.* FROM 'u'@'%'" $false 'REVOKE blocked'
+Check 'FLUSH PRIVILEGES' $false 'FLUSH PRIVILEGES blocked'
+Check "SET PASSWORD FOR 'u'@'%' = PASSWORD('x')" $false 'SET PASSWORD blocked - SET is allow-listed, this form must not be'
+Check "SET PASSWORD = PASSWORD('x')" $false 'SET PASSWORD for the current user blocked too'
+Check "SET DEFAULT ROLE admin FOR 'u'@'%'" $false 'SET DEFAULT ROLE blocked'
+
+# MariaDB's SET STATEMENT <assignments> FOR <statement> EXECUTES the statement it wraps, exactly
+# like the ANALYZE form below. Verified against a live server: "... FOR DELETE FROM t" emptied the
+# table while read-only mode reported the statement as allowed.
+Check 'SET STATEMENT max_statement_time=1 FOR DELETE FROM t' $false 'SET STATEMENT-wrapped DELETE blocked'
+Check 'SET STATEMENT max_statement_time=1 FOR DROP TABLE t' $false 'SET STATEMENT-wrapped DROP blocked'
+Check 'SET STATEMENT a=1, b=2 FOR UPDATE t SET x=1' $false 'SET STATEMENT-wrapped UPDATE blocked'
+Check 'SET STATEMENT max_statement_time=1 FOR SELECT 1' $true 'SET STATEMENT-wrapped SELECT still allowed'
+Check 'SET STATEMENT max_statement_time=1' $false 'SET STATEMENT with no FOR is refused, not guessed at'
+Check "SET STATEMENT x='FOR' FOR DELETE FROM t" $false 'a FOR inside a string is not the separator'
+
+# The guard is worthless if it makes read-only mode unusable for real work.
+Check 'SET NAMES utf8mb4' $true 'SET NAMES allowed'
+Check 'SET @x = 1' $true 'user variable allowed'
+
+# Schema changes from the table designer and the DDL editor, which take the same route.
+Check 'ALTER TABLE t ADD COLUMN c INT' $false 'designer ALTER blocked'
+Check 'ALTER TABLE t DROP COLUMN c' $false 'designer DROP COLUMN blocked'
+Check 'RENAME TABLE a TO b' $false 'RENAME TABLE blocked'
+Check 'CREATE TABLE t (a INT)' $false 'designer CREATE TABLE blocked'
+Check 'SHOW CREATE TABLE t' $true 'reading a table DDL is still allowed'
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

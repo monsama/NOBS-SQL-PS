@@ -727,6 +727,41 @@ function Strip-Parens { param([string]$s)
     }
     return $out.ToString()
 }
+# Returns whatever follows the first top-level occurrence of $Keyword, or $null if it never appears
+# outside a quoted string. Used to unwrap MariaDB's "SET STATEMENT <assignments> FOR <statement>",
+# where the part after FOR is a whole statement that really executes. A FOR inside a string literal
+# - SET STATEMENT x='FOR' FOR SELECT 1 - is not the separator and must not be taken for one.
+function Split-OffKeyword {
+    param([string]$Sql, [string]$Keyword)
+    if (-not $Sql) { return $null }
+    $up = $Sql.ToUpper()
+    $kw = $Keyword.ToUpper()
+    $quote = $null
+    $escaped = $false
+    $i = 0
+    while ($i -lt $Sql.Length) {
+        $c = $Sql[$i]
+        if ($null -ne $quote) {
+            if ($escaped) { $escaped = $false }
+            elseif ($c -eq '\') { $escaped = $true }
+            elseif ($c -eq $quote) { $quote = $null }
+            $i++
+            continue
+        }
+        if ($c -eq "'" -or $c -eq '"' -or $c -eq '`') { $quote = $c; $i++; continue }
+        # Match on word boundaries, so FORMAT - or a column named for_id - is not read as FOR.
+        $beforeOk = ($i -eq 0) -or -not ([char]::IsLetterOrDigit($Sql[$i-1]) -or $Sql[$i-1] -eq '_')
+        if ($beforeOk -and ($i + $kw.Length) -le $up.Length -and $up.Substring($i, $kw.Length) -eq $kw) {
+            $after = $i + $kw.Length
+            if ($after -ge $up.Length -or -not ([char]::IsLetterOrDigit($Sql[$after]) -or $Sql[$after] -eq '_')) {
+                return $Sql.Substring($after).Trim()
+            }
+        }
+        $i++
+    }
+    return $null
+}
+
 function Test-SqlReadOnly { param([string]$sql)
     if(-not $sql){ return $true }
     # /*! ... */ and /*!50000 ... */ are NOT comments: MySQL executes their contents. Stripping
@@ -750,6 +785,24 @@ function Test-SqlReadOnly { param([string]$sql)
             $up = $t.ToUpper()
             $second = ($up -split '\s+')[1]
             if($second -match '^(GLOBAL|PERSIST)' -or $up -match '@@(GLOBAL|PERSIST)'){ return $false }
+            # SET is allow-listed for session variables, but several SET forms are not variable
+            # assignments at all. These three write, and were reaching the server on a connection
+            # the user had marked read-only:
+            #   SET PASSWORD FOR 'u'@'%' = ...   changes any account's credentials, root included
+            #   SET DEFAULT ROLE admin FOR ...   grants a role to an account
+            #   SET STATEMENT x=1 FOR <stmt>     MariaDB: EXECUTES the statement it wraps, so
+            #                                    "... FOR DELETE FROM t" really does delete
+            # The last is the same shape as the ANALYZE wrapper handled below - a read-only looking
+            # prefix carrying an arbitrary statement - so it gets the same treatment: unwrap it and
+            # judge the statement that is actually going to run.
+            if($second -eq 'PASSWORD'){ return $false }
+            if($second -eq 'DEFAULT' -and ($up -split '\s+')[2] -eq 'ROLE'){ return $false }
+            if($second -eq 'STATEMENT'){
+                $inner = Split-OffKeyword $t 'FOR'
+                # No FOR at all is not a form we recognise; refuse rather than guess.
+                if($null -eq $inner){ return $false }
+                if(-not (Test-SqlReadOnly $inner)){ return $false }
+            }
         }
         # A CTE only stays read-only if it's actually prefixing a SELECT/TABLE/VALUES - MySQL
         # 8.0.19+/MariaDB also allow "WITH x AS (...) DELETE/UPDATE FROM t ...", which the leading
@@ -4915,7 +4968,15 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  const r=await api('/api/script',{sql:S.join('\n'),transaction:true});
  if(r.ok){log('Applied '+S.length+' change(s).');toast('Applied '+S.length+' change(s).','ok');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);toast('Apply failed: '+r.error,true);}}
 
-async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const r=await api('/api/script',{sql:$('ed_'+id).value,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl)loadObjects(t.ddl.db);}else{st.className='status err';st.textContent=r.error;log('APPLY ERROR: '+r.error);}}
+function ddlFailureNote(err, sql){
+ const e = String(err || "");
+ // Only worth saying when more than one statement could have run: a single failed statement
+ // applied nothing, and adding the caveat there would be alarming and wrong.
+ const stmts = String(sql || "").split(";").filter(s => s.trim().length).length;
+ if (stmts < 2) return e;
+ return e + "\n\nDDL is not transactional: any statements before this one have already been applied and cannot be rolled back. Check the object before re-running.";
+}
+async function applyDdl(id){if(roBlock())return;const t=T(id);const st=$('st_'+id);st.className='status';st.textContent='Applying...';const r=await api('/api/script',{sql:$('ed_'+id).value,db:(t.ddl&&t.ddl.db)||dbOf(t)});if(r.ok){st.textContent='Applied OK.';log('APPLY OK: '+t.title);if(t.ddl)loadObjects(t.ddl.db);}else{st.className='status err';const _n=ddlFailureNote(r.error,$('ed_'+id).value);st.textContent=_n;log('APPLY ERROR: '+_n);}}
 
 function bTSV(cols,rows){return cols.join('\t')+'\n'+rows.map(r=>r.map(v=>v===null?'NULL':v).join('\t')).join('\n');}
 // How a NULL is written to CSV. A NULL and an empty string both used to come out as an empty
@@ -5504,8 +5565,8 @@ async function killProcess(pid){
 }
 async function openUsers(){const r=await api('/api/query',{sql:"SELECT User,Host FROM mysql.user ORDER BY User,Host"});const sel=$('userSel');sel.innerHTML='';$('grantsBox').textContent='';window._selUser='';
  if(!r.ok){toast(r.error,true);return;}r.rows.forEach(u=>{const d=document.createElement('div');d.className='uitem';d.textContent=u[0]+'@'+u[1];d.dataset.v=u[0]+'\x01'+u[1];d.onclick=()=>{[...sel.children].forEach(c=>c.classList.remove('sel'));d.classList.add('sel');window._selUser=d.dataset.v;showGrants();};sel.appendChild(d);});show('mUsers');}
-async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+lit(u)+"@"+lit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
-async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+lit(res.user.trim())+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw),'Created user'))openUsers();}
+async function showGrants(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');const r=await api('/api/query',{sql:"SHOW GRANTS FOR "+strLit(u)+"@"+strLit(h)});$('grantsBox').textContent=r.ok?r.rows.map(x=>x[0]).join('\n'):r.error;}
+async function newUser(){const res=await inputBox({title:'New user',okText:'Create',fields:[{key:'user',label:'User name'},{key:'host',label:'Host',value:'%'},{key:'pw',label:'Password',type:'password'}]});if(!res||!res.user.trim())return;const h=res.host.trim()||'%';if(await exec("CREATE USER "+strLit(res.user.trim())+"@"+strLit(h)+" IDENTIFIED BY "+strLit(res.pw),'Created user'))openUsers();}
 // Common privilege combos, similar to what Workbench's own privilege list offers - not exhaustive
 // (there's dozens of individual MySQL privileges), just the handful actually reached for often. The
 // free-text field underneath stays the source of truth: picking a preset/schema/table just (re)writes
@@ -5554,8 +5615,8 @@ async function grantRevokeDialog(mode){
  await refreshTables();
  return await p;
 }
-async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await grantRevokeDialog('revoke');if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+lit(u)+"@"+lit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
-async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+lit(u)+"@"+lit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
+async function revokeUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await grantRevokeDialog('revoke');if(!res||!res.g.trim())return;if(await exec("REVOKE "+res.g.trim()+" FROM "+strLit(u)+"@"+strLit(h),'Revoked')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
+async function lockUser(lock){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const verb=lock?'LOCK':'UNLOCK';if(await exec("ALTER USER "+strLit(u)+"@"+strLit(h)+" ACCOUNT "+verb,(lock?'Locked ':'Unlocked ')+u+'@'+h)){showGrants();}}
 async function changePassword(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const parts=v.split('\x01');const u=parts[0],h=parts[1];
  const res=await inputBox({title:'Change password for '+u+'@'+h,okText:'Change',fields:[{key:'pw',label:'New password',type:'password',value:''},{key:'pw2',label:'Confirm new password',type:'password',value:''}]});
  if(!res)return;if(!res.pw){toast('Password cannot be empty.',true);return;}if(res.pw!==res.pw2){toast('Passwords do not match.',true);return;}
@@ -5563,12 +5624,12 @@ async function changePassword(){const v=window._selUser;if(!v){toast('Select a u
  // lit()'s hex-literal passthrough is meant for cell values, not a password field, and a plain
  // quote-double (no backslash escaping first) let a value ending in a backslash close the literal
  // one character early.
- const sql="ALTER USER "+lit(u)+"@"+lit(h)+" IDENTIFIED BY "+strLit(res.pw)+";";
+ const sql="ALTER USER "+strLit(u)+"@"+strLit(h)+" IDENTIFIED BY "+strLit(res.pw)+";";
  const r=await api('/api/exec',{sql:sql});
  if(r.ok){log('Password changed for '+u+'@'+h+'.');toast('Password changed for '+u+'@'+h+'.','ok');}else{toast('Failed: '+(r.error||'unknown'),true);}}
-async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+lit(u)+"@"+lit(h),'Dropped user'))openUsers();}
+async function dropUser(){const v=window._selUser;if(!v)return;const[u,h]=v.split('\x01');if(!(await ask('DROP USER '+u+'@'+h+' ?')))return;if(await exec("DROP USER "+strLit(u)+"@"+strLit(h),'Dropped user'))openUsers();}
 async function grantUser(){const v=window._selUser;if(!v){toast('Select a user first.',true);return;}const[u,h]=v.split('\x01');const res=await grantRevokeDialog('grant');if(!res||!res.g.trim())return;
- const sql="GRANT "+res.g.trim()+" TO "+lit(u)+"@"+lit(h)+(res.wgo?' WITH GRANT OPTION':'');
+ const sql="GRANT "+res.g.trim()+" TO "+strLit(u)+"@"+strLit(h)+(res.wgo?' WITH GRANT OPTION':'');
  if(await exec(sql,'Granted')){await exec('FLUSH PRIVILEGES','Flush');showGrants();}}
 
 // ---- table designer ----
@@ -5591,7 +5652,7 @@ function dMark(){dEdited=true;$('dEditNote').textContent='\u270E manually edited
 function dReadCols(){return [...$('dCols').children].map(tr=>({name:tr.querySelector('.dn').value.trim(),type:tr.querySelector('.dt').value,len:tr.querySelector('.dl').value.trim(),nn:tr.querySelector('.dnn').checked,ai:tr.querySelector('.dai').checked,pk:tr.querySelector('.dpk').checked,def:tr.querySelector('.dd').value,comment:tr.querySelector('.dc').value.trim()})).filter(c=>c.name);}
 function colDef(c){let s=qid(c.name)+' '+c.type;if(c.len)s+='('+c.len+')';if(c.nn)s+=' NOT NULL';if(c.ai)s+=' AUTO_INCREMENT';
  if(c.def!==''&&c.def!=null){s+=' DEFAULT '+(/^(CURRENT_TIMESTAMP|NULL|TRUE|FALSE|\d+(\.\d+)?)$/i.test(c.def)?c.def:lit(c.def));}
- if(c.comment)s+=' COMMENT '+lit(c.comment);return s;}
+ if(c.comment)s+=' COMMENT '+strLit(c.comment);return s;}
 function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.trim(),name=$('dName').value.trim();const cols=dReadCols();const pk=cols.filter(c=>c.pk).map(c=>qid(c.name));
  if(!name){$('dSql').value='-- enter a table name';return;}const tbl=qid(db)+'.'+qid(name);
  if(!dOrig){let s='CREATE TABLE '+tbl+' (\n  '+cols.map(colDef).join(',\n  ');if(pk.length)s+=',\n  PRIMARY KEY ('+pk.join(',')+')';s+='\n);';$('dSql').value=s;dEdited=false;$('dEditNote').textContent='';return;}
@@ -5602,7 +5663,7 @@ function dGen(force){if(dEdited&&!force)return;const db=$('dSchema').value.trim(
  const oldPk=dOrig.filter(c=>c.pk).map(c=>c.name).join(','),newPk=cols.filter(c=>c.pk).map(c=>c.name).join(',');
  if(oldPk!==newPk){if(oldPk)alt.push('DROP PRIMARY KEY');if(newPk)alt.push('ADD PRIMARY KEY ('+pk.join(',')+')');}
  $('dSql').value=alt.length?('ALTER TABLE '+tbl+'\n  '+alt.join(',\n  ')+';'):'-- no changes detected';dEdited=false;$('dEditNote').textContent='';}
-async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});if(r.ok){$('dLog').textContent='Applied OK.';log('DESIGN OK');if(curSchema)loadObjects(curSchema);}else{$('dLog').textContent=r.error;log('DESIGN error: '+r.error);}}
+async function dApply(){if(roBlock())return;const sql=$('dSql').value;$('dLog').textContent='Applying...';const r=await api('/api/script',{sql,db:curSchema});if(r.ok){$('dLog').textContent='Applied OK.';log('DESIGN OK');if(curSchema)loadObjects(curSchema);}else{const _n=ddlFailureNote(r.error,sql);$('dLog').textContent=_n;log('DESIGN error: '+_n);}}
 
 // ---- export/import ----
 const EXPOPTS=[

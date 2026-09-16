@@ -28,6 +28,11 @@ jobs:
       # viewIndices decides the order every result grid is displayed in. It is JavaScript embedded
       # in NOBSSQL.ps1, so the test extracts it and runs it under node rather than the PowerShell
       # AST the other two use. windows-latest already ships node, so there is nothing to install.
+      # The Users dialog builds CREATE USER / GRANT / DROP USER client-side as text, so the
+      # quoting it does is the only thing standing between a user name and the server.
+      - name: Run Users-dialog SQL tests
+        shell: pwsh
+        run: ./tests/UserSql.Tests.ps1 ./NOBSSQL.ps1
       - name: Run viewIndices tests
         shell: pwsh
         run: ./tests/ViewIndices.Tests.ps1 ./NOBSSQL.ps1
