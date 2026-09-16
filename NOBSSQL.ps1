@@ -778,6 +778,19 @@ function Test-SqlReadOnly { param([string]$sql)
         if(-not $t){ continue }
         $w = (($t -split '\s+',2)[0]).ToUpper()
         if($allow -notcontains $w){ return $false }
+        # SELECT ... INTO OUTFILE / INTO DUMPFILE writes a file on the DATABASE SERVER's
+        # filesystem, as the mysqld user. It changes no table data, which is presumably why it was
+        # never considered here - but a connection the user marked "read-only / safe mode" being
+        # able to drop files on the server is not read-only. Verified against a live MariaDB whose
+        # secure_file_priv was empty: the statement was reported as read-only and the file appeared
+        # on disk. Only the OUTFILE/DUMPFILE forms are refused; SELECT ... INTO @var is an ordinary
+        # variable assignment, and an INTO inside a string literal is not a clause at all - which
+        # is why this looks for the keyword outside quotes.
+        $afterInto = Split-OffKeyword $t 'INTO'
+        if ($null -ne $afterInto) {
+            $head = (($afterInto -split '\s+')[0]).ToUpper()
+            if ($head -eq 'OUTFILE' -or $head -eq 'DUMPFILE') { return $false }
+        }
         # SET is allowed because a session variable is harmless, but SET GLOBAL / SET PERSIST -
         # and their @@GLOBAL. / @@PERSIST. spellings - reconfigure the server for every
         # connection, which a read-only connection should not be able to do.
@@ -1227,7 +1240,13 @@ function Send-Json { param($client,[string]$json) Send-Http $client '200 OK' 'ap
 
 # Endpoint: import a CSV file into a table.
 function Api-ImportCsv { param($conn,$data)
-    $nullMarker = if($data.nullValue){[string]$data.nullValue}else{'\N'}
+    # An EMPTY null marker is a real setting - it means "a blank cell is NULL" - and is exactly
+    # what the CSV dialog sends when the user clears the NULL value box. PowerShell treats the
+    # empty string as false, so the old truthiness test could not tell "not supplied" from
+    # "supplied as empty" and quietly substituted \N for both, leaving blank cells as empty
+    # strings instead of NULL. Test for the property being absent instead. The Tauri edition
+    # already draws this distinction - its unwrap_or only applies when the field is missing.
+    $nullMarker = if($null -ne $data.nullValue){[string]$data.nullValue}else{'\N'}
     $file=[string]$data.file
     if(-not $file -or -not (Test-Path $file)){ return '{"ok":false,"error":"CSV file not found."}' }
     $fsz = (Get-Item $file).Length

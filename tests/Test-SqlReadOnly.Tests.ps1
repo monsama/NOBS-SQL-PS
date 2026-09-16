@@ -42,6 +42,21 @@ Check 'ANALYZE DELETE FROM t' $false 'ANALYZE-wrapped DELETE blocked'
 Check 'ANALYZE INSERT INTO t VALUES (1)' $false 'ANALYZE-wrapped INSERT blocked'
 Check 'ANALYZE FORMAT=JSON DELETE FROM t' $false 'ANALYZE FORMAT=JSON DELETE blocked'
 
+# SELECT is allow-listed, and INTO OUTFILE / INTO DUMPFILE hang off a SELECT. They write no table
+# data - they write a FILE, on the database server, as the mysqld user. Verified against a live
+# MariaDB with an empty secure_file_priv: read-only mode called the statement allowed and the file
+# appeared on disk with the expected contents.
+Check "SELECT * FROM t INTO OUTFILE '/tmp/x.csv'" $false 'SELECT INTO OUTFILE blocked'
+Check "SELECT * FROM t INTO DUMPFILE '/tmp/x.bin'" $false 'SELECT INTO DUMPFILE blocked'
+Check "select 1 into outfile '/tmp/x'" $false 'lower-case INTO OUTFILE blocked'
+Check "SELECT * INTO OUTFILE '/tmp/x' FROM t" $false 'INTO OUTFILE before FROM blocked'
+Check "WITH x AS (SELECT 1) SELECT * FROM x INTO OUTFILE '/tmp/x'" $false 'CTE-prefixed INTO OUTFILE blocked'
+Check "SELECT 1; SELECT * FROM t INTO OUTFILE '/tmp/x'" $false 'INTO OUTFILE in a later statement blocked'
+# ...but an assignment, a string that merely contains the words, and a column of that name are fine.
+Check 'SELECT COUNT(*) INTO @n FROM t' $true 'SELECT INTO @var still allowed'
+Check "SELECT 'INTO OUTFILE' AS s" $true 'the words inside a string are not a clause'
+Check 'SELECT outfile FROM t' $true 'a column called outfile is not the clause'
+
 # Account management. The Users dialog builds these client-side and sends them through the same
 # /api/exec route as any other statement, so read-only has to stop them here - there is nothing
 # else between that dialog and the server. None of these verbs are on the allow-list, so they are
