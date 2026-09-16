@@ -98,6 +98,27 @@ h = harness({ selected: null });
 await h.fns.dropUser(); await h.fns.grantUser(); await h.fns.revokeUser(); await h.fns.lockUser(true);
 eq(h.sql.length, 0, 'nothing is sent when no user is selected');
 
+
+// --- binary cell editing: hex in, hex out ---------------------------------------------------
+// A blob in a real database was found holding 307 bytes of hex-dump TEXT where a 102-byte hash
+// belonged. The editor opens a binary cell in Text mode when the bytes decode as UTF-8, and Text
+// mode runs textToHex() over the box - so hex pasted there stores the characters, not the bytes.
+const hexSrc = ['normalizeHexInput', 'looksLikePastedHex'].map(n => extractFunction(src, n)).join('\n');
+const H = new Function(hexSrc + '\nreturn {normalizeHexInput,looksLikePastedHex};')();
+
+eq(H.normalizeHexInput('0x00FF10'), '0x00ff10', 'hex copied from this app is accepted');
+// Workbench separates bytes and wraps long values; neither should matter, nor the missing 0x.
+eq(H.normalizeHexInput('24 37 24 43'), '0x24372443', 'Workbench-style spaced hex is accepted');
+eq(H.normalizeHexInput('2437\n2443'), '0x24372443', 'hex split across lines is accepted');
+eq(H.normalizeHexInput('24372443'), '0x24372443', 'hex without the 0x prefix is accepted');
+// hexToBytes() parseInts each pair, so 'zz' used to become byte 0 - a hole in the data.
+eq(H.normalizeHexInput('0xzz'), null, 'non-hex input is rejected, not mangled into zero bytes');
+eq(H.normalizeHexInput('0x123'), null, 'an odd number of digits is half a byte, so rejected');
+eq(H.normalizeHexInput(''), '0x', 'an empty box means an empty value, not an error');
+eq(H.looksLikePastedHex('0x24372443362e2e2e'), true, 'hex pasted into the Text tab is recognised');
+eq(H.looksLikePastedHex('$7$C6..../....RYngpNxf'), false, 'the decoded value itself is not flagged');
+eq(H.looksLikePastedHex('d41d8cd98f00b204e9800998ecf8427e'), false, 'a bare MD5-looking value is not flagged');
+
 process.exit(fail ? 1 : 0);
 '@
 
