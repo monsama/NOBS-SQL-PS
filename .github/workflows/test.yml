@@ -30,6 +30,12 @@ jobs:
       # AST the other two use. windows-latest already ships node, so there is nothing to install.
       # The Users dialog builds CREATE USER / GRANT / DROP USER client-side as text, so the
       # quoting it does is the only thing standing between a user name and the server.
+      # The app is one file and the UI is inline JavaScript inside it. A file-level syntax
+      # error takes the entire page down - no theme, no connections, nothing clickable - and the
+      # per-function tests below cannot see it, because they evaluate functions in isolation.
+      - name: Run UI parse check
+        shell: pwsh
+        run: ./tests/UiParses.Tests.ps1 ./NOBSSQL.ps1
       - name: Run Users-dialog SQL tests
         shell: pwsh
         run: ./tests/UserSql.Tests.ps1 ./NOBSSQL.ps1
