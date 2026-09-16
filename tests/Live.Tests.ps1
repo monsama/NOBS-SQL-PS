@@ -484,6 +484,64 @@ console.log(JSON.stringify(out));
     }
     Check ($got.Count -eq 25) 'paging 25 rows at 10/page delivers all 25' "got $($got.Count): $($got -join ',')"
     Check ((@($got | Select-Object -Unique)).Count -eq 25) 'no row is delivered twice'
+
+    # --- losing the connection halfway through an apply ------------------------------------------
+    # Staged grid edits go to /api/script with transaction:true. That protects against a statement
+    # FAILING; this is the other way a batch stops halfway, and the one a lid-close or a VPN drop
+    # actually produces. The connection is severed for real (a second session KILLs the one running
+    # the batch) because what is being checked is as much the server's behaviour as the app's.
+    $mysql = Join-Path $env:APPDATA 'NOBSSQL\bin\mysql.exe'
+    if (-not (Test-Path $mysql)) {
+        "  skip  no mysql client found for the connection-loss test"
+    } else {
+        $cnf = Join-Path $env:TEMP ("livetx-" + [Guid]::NewGuid().ToString('N') + ".cnf")
+        "[client]`nhost=$($conn.host)`nport=$($conn.port)`nuser=$($conn.user)`npassword=$($conn.password)" |
+            Set-Content -NoNewline -Encoding ascii $cnf
+        function Sql($q) { & $mysql "--defaults-extra-file=$cnf" -N -B -e $q 2>&1 }
+        try {
+            Sql "CREATE DATABASE IF NOT EXISTS nobs_test" | Out-Null
+            Sql "DROP TABLE IF EXISTS nobs_test.tx_drop" | Out-Null
+            Sql "CREATE TABLE nobs_test.tx_drop (id INT PRIMARY KEY) ENGINE=InnoDB" | Out-Null
+
+            # Two rows land, then the batch parks on a SLEEP long enough to be killed from outside,
+            # then a third row that must never be reached.
+            $batch = "INSERT INTO nobs_test.tx_drop VALUES (1);`n" +
+                     "INSERT INTO nobs_test.tx_drop VALUES (2);`n" +
+                     "SELECT SLEEP(30) /*nobs_kill_me*/;`n" +
+                     "INSERT INTO nobs_test.tx_drop VALUES (3);"
+            $job = Start-ThreadJob -ScriptBlock {
+                param($base,$token,$batch)
+                try {
+                    Invoke-RestMethod -Uri "$base/api/script" -Method Post -ContentType 'application/json' -TimeoutSec 60 -Body (
+                        @{ token=$token; sql=$batch; db='nobs_test'; transaction=$true;
+                           conn=$using:conn } | ConvertTo-Json -Depth 5)
+                } catch { @{ ok = $false; error = "$_" } }
+            } -ArgumentList $base, $token, $batch
+
+            # Wait for the batch to show up, then kill whichever connection is running it.
+            $killed = $false
+            for ($i = 0; $i -lt 100 -and -not $killed; $i++) {
+                $ids = Sql "SELECT ID FROM information_schema.PROCESSLIST WHERE INFO LIKE '%nobs_kill_me%' AND INFO NOT LIKE '%PROCESSLIST%'"
+                foreach ($id in @($ids)) {
+                    if ("$id".Trim() -match '^\d+$') { Sql "KILL $($id.Trim())" | Out-Null; $killed = $true }
+                }
+                if (-not $killed) { Start-Sleep -Milliseconds 50 }
+            }
+            Check $killed 'the mid-apply batch was found and its connection killed'
+
+            $res = Receive-Job $job -Wait -AutoRemoveJob
+            $left = "$(Sql 'SELECT COUNT(*) FROM nobs_test.tx_drop')".Trim()
+            # The two rows that had already been inserted must be gone: the transaction never
+            # reached its COMMIT, and the server discards an open one when the connection dies.
+            Check ($left -eq '0') 'a connection lost mid-apply leaves no partial rows behind' "$left row(s) survived"
+            # And it has to say so. Reporting success here is the worst of the outcomes: the user
+            # closes the dialog believing the edits are saved.
+            Check (-not $res.ok) 'a batch whose connection was killed is reported as failed' "got ok=$($res.ok)"
+        } finally {
+            Sql "DROP TABLE IF EXISTS nobs_test.tx_drop" | Out-Null
+            Remove-Item $cnf -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 finally {
     if ($token -and $base) {

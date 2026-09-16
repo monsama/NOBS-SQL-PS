@@ -373,6 +373,23 @@ function FirstErr { param($e)
     $err=$lines | Where-Object{ $_ -match '(?i)error' } | Select-Object -First 1
     if($err){ $err } elseif($lines.Count){ $lines[0] } else { '' }
 }
+# What a batch wrapped in START TRANSACTION/COMMIT can honestly claim after mysql.exe exits
+# non-zero. Two quite different things end up here.
+#
+# A statement failed - a duplicate key, a bad type, a missing column. mysql.exe stops at the first
+# error by default, so it never reached the COMMIT, and the server discards the open transaction
+# when the connection closes. Nothing was applied, and saying so is true.
+#
+# The connection died. Then the exit code tells us only that we stopped hearing back. If it broke
+# while the COMMIT was in flight, the server may have completed it and had nowhere to send the
+# acknowledgement. "Rolled back" there is a guess dressed as a fact, and the reassuring guess at
+# that - the one that invites someone to apply the same changes a second time.
+function Get-BatchFailureNote { param([string]$Err)
+    if ($Err -match '(?i)lost connection|server has gone away|can.t connect|broken pipe|connection reset') {
+        return "The changes may or may not have been saved - the connection dropped, and if it did so while the commit was in flight the server may have completed it anyway. Check the table before applying these changes again."
+    }
+    return "No rows were updated - the batch was rolled back."
+}
 # mysqldump/mysql print exactly this wording (no "ERROR NNNN" prefix, so FirstErr returns it
 # verbatim) when a flag the binary doesn't recognise is passed - which happens whenever an
 # export/import option only supported by one dump-tool flavor (MySQL vs MariaDB, or an older
@@ -2149,7 +2166,7 @@ function Api-CompareRowsApplyDiff { param($data)
             return '{"ok":true,"log":'+(J-Arr $log)+'}'
         } else {
             [void]$log.Add("FAILED : "+(FirstErr $r2.err))
-            [void]$log.Add("No rows were updated - the batch was rolled back.")
+            [void]$log.Add((Get-BatchFailureNote (FirstErr $r2.err)))
             return '{"ok":false,"log":'+(J-Arr $log)+'}'
         }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }

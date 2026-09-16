@@ -50,6 +50,12 @@ jobs:
         shell: pwsh
         run: ./tests/SslLines.Tests.ps1 ./NOBSSQL.ps1
 
+      # A batch that comes back non-zero may have stopped at a bad statement (nothing applied) or
+      # lost its connection (nobody knows). Only one of those can be described with confidence.
+      - name: Run batch failure message tests
+        shell: pwsh
+        run: ./tests/BatchFailureNote.Tests.ps1 ./NOBSSQL.ps1
+
       # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
       # windows-latest has none (GitHub's service containers are Linux-only, while this app
       # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would
