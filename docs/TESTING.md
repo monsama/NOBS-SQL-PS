@@ -1,29 +1,44 @@
 # Testing
 
-Four test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
+Eight test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
 the file that actually ships rather than a copy of it.
 
 ```powershell
-pwsh -NoProfile -File tests/Test-SqlReadOnly.Tests.ps1 ./NOBSSQL.ps1
-pwsh -NoProfile -File tests/Get-CnfSafe.Tests.ps1     ./NOBSSQL.ps1
-pwsh -NoProfile -File tests/ViewIndices.Tests.ps1     ./NOBSSQL.ps1
-pwsh -NoProfile -File tests/Live.Tests.ps1            ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/Test-SqlReadOnly.Tests.ps1   ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/Get-CnfSafe.Tests.ps1        ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/SslLines.Tests.ps1           ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/PluginDir.Tests.ps1          ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/BatchFailureNote.Tests.ps1   ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/UiParses.Tests.ps1           ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
-The first three need nothing set up and run in CI on every push. The fourth needs a database and
-does not — see below.
+All but the last need nothing set up and run in CI on every push. `Live` needs a database and does
+not — see below.
 
 | Script | Covers | Needs |
 |---|---|---|
 | `Test-SqlReadOnly` | the read-only/safe-mode guard, as a pure function | nothing |
 | `Get-CnfSafe` | newline injection into the generated `.cnf` | nothing |
+| `SslLines` | the SSL options written into the `.cnf`, per client dialect | nothing |
+| `PluginDir` | where the client looks for its authentication plugins | nothing |
+| `BatchFailureNote` | what a failed batch may honestly claim about rollback | nothing |
+| `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
+| `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
-`ViewIndices` tests JavaScript embedded in `NOBSSQL.ps1`, so unlike the other two offline scripts
-it cannot lift its subject out with the PowerShell AST. It extracts the function by brace-matching
-and runs it under `node`, which the `windows-latest` CI image already ships. If `node` is missing
-it **fails** rather than skipping.
+The last three offline scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
+cannot lift their subject out with the PowerShell AST. They extract it by brace-matching and run it
+under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
+rather than skipping.
+
+`SslLines` and `PluginDir` are about the client binary rather than the server, so they need no
+database: `SslLines` asks the real client to parse the options it would be given (`--version` is
+enough — the options file is read before a socket is opened), and `PluginDir` works on a throwaway
+directory tree.
 
 ## The live tests
 
@@ -43,6 +58,28 @@ mysql -u root -p < ..\NOBS-SQL-Editor\tests\fixtures\seed.sql
 
 It creates only `nobs_test` and touches no other schema. The live tests restore what they change,
 so running them twice in a row behaves the same as running them once.
+
+### Run it against MySQL too, not just MariaDB
+
+The two behave differently in ways that only surface against the real thing, and every one of
+these was found that way rather than by reading:
+
+- MySQL authenticates with `caching_sha2_password` by default. That is a *client-side* plugin, and
+  the app could not connect to a stock MySQL 8 server at all until the downloaded tools started
+  shipping it — see `PluginDir`.
+- MySQL and MariaDB name their SSL client options mutually exclusively, so the wrong dialect is not
+  a weaker connection but no connection — see `SslLines`.
+- MySQL cannot reference the same `TEMPORARY` table twice in one statement, which is why the shared
+  fixture builds `bulk_rows` from a plain table.
+- `SLEEP()` interrupted by `KILL QUERY` *returns 1* on MySQL and the statement succeeds; MariaDB
+  raises an error. Anything testing cancellation needs a real query, not a sleep.
+
+```powershell
+$env:NOBS_TEST_DSN = '127.0.0.1:3308:root:yourpassword'   # a MySQL 8 instance
+pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
+```
+
+The suite is expected to pass unchanged against MariaDB 12.x and MySQL 8.x alike.
 
 **Without `NOBS_TEST_DSN` the script prints `SKIPPED` and exits 0.** That is deliberate, and so is
 how loud it is about it: a test that quietly reports success for work it never did is worse than
