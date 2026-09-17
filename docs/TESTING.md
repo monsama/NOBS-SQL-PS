@@ -21,8 +21,8 @@ pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
-All but the last need nothing set up and run in CI on every push. `Live` needs a database and does
-not — see below.
+All but the last need nothing set up. `Live` needs a database. CI runs all of them on every push,
+`Live` against a MariaDB and a MySQL server it starts itself (see below).
 
 | Script | Covers | Needs |
 |---|---|---|
@@ -142,12 +142,18 @@ shows how to take the CA off the wire with `openssl`, no access to the server's 
 how loud it is about it: a test that quietly reports success for work it never did is worse than
 no test, and this project has been bitten by exactly that before.
 
-### Why this one is not in CI
+### In CI
 
-`windows-latest` has no database, and GitHub's service containers are Linux-only while this app
-targets Windows. Wiring it up would mean either installing and seeding MariaDB on the Windows
-runner, or porting the suite to Linux — where the app shells out to `mysql.exe` by name. Until
-then these are a local gate, run before releasing.
+GitHub's service containers are Linux-only while this app targets Windows, so the `live` job in
+`.github/workflows/test.yml` starts the servers itself. It checks out NOBS-SQL-Editor and runs
+`tests/ci/start-test-servers.ps1` from there (see that repo's `docs/TESTING.md`):
+
+- It downloads and starts MariaDB and MySQL and loads the shared fixture.
+- MySQL is unpacked where a real installation lives, so this app finds MySQL's own client there.
+- MariaDB's client tools and plugins go where this app's own download puts them.
+
+The suite then runs once per server. On the MySQL run `NOBS_TEST_REMOTE_HOST` is the runner's
+own network address, so the `verify-ca` check runs too.
 
 ### What it covers
 

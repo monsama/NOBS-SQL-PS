@@ -97,8 +97,51 @@ jobs:
         shell: pwsh
         run: ./tests/DdlRecreate.Tests.ps1 ./NOBSSQL.ps1
 
-      # tests/Live.Tests.ps1 is deliberately NOT run here: it needs a real database, and
-      # windows-latest has none (GitHub's service containers are Linux-only, while this app
-      # targets Windows). Without NOBS_TEST_DSN it prints SKIPPED and exits 0, so adding it would
-      # turn a green check into a claim about work that never ran. It is a local gate instead -
-      # see docs/TESTING.md.
+  # The live suite against real MariaDB and MySQL servers, started on this runner by the setup
+  # script in NOBS-SQL-Editor (which also holds the shared fixture). MySQL is unpacked where a real
+  # installation lives, so the app finds MySQL's own client there, and MariaDB's client tools go
+  # where the app's own download puts them.
+  live:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out NOBS-SQL-Editor (setup script and fixture)
+        uses: actions/checkout@v7
+        with:
+          repository: monsama/NOBS-SQL-Editor
+          path: editor
+
+      - name: Cache server downloads
+        uses: actions/cache@v4
+        with:
+          path: C:\nobs-ci\cache
+          key: nobs-ci-servers-${{ hashFiles('editor/tests/ci/start-test-servers.ps1') }}
+
+      - name: Start MariaDB and MySQL
+        shell: pwsh
+        run: ./editor/tests/ci/start-test-servers.ps1
+
+      - name: Live tests against MariaDB
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_CI_MARIADB_DSN
+          $env:NOBS_TEST_SERVER_CA = $env:NOBS_CI_MARIADB_CA
+          ./tests/Live.Tests.ps1 ./NOBSSQL.ps1
+
+      # NOBS_TEST_REMOTE_HOST adds verify-ca over this runner's own network address, which only
+      # MySQL's client can do against MySQL's self-generated certificate.
+      - name: Live tests against MySQL
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_CI_MYSQL_DSN
+          $env:NOBS_TEST_SERVER_CA = $env:NOBS_CI_MYSQL_CA
+          $env:NOBS_TEST_REMOTE_HOST = $env:NOBS_CI_REMOTE_HOST
+          ./tests/Live.Tests.ps1 ./NOBSSQL.ps1
+
+      - name: Server logs
+        if: ${{ failure() }}
+        shell: pwsh
+        run: Get-Content C:\nobs-ci\mariadb.err, C:\nobs-ci\mysql.err -Tail 60 -ErrorAction SilentlyContinue
