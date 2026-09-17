@@ -566,6 +566,47 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Remove-Item $genDir -Recurse -Force -ErrorAction SilentlyContinue
     foreach ($s in @("DROP DATABASE IF EXISTS $gs", "DROP DATABASE IF EXISTS $gt")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
 
+    # The per-table export ran mysqldump once per table, so with writes going on its files came
+    # from different moments. A second request adds an order and its line in one transaction the
+    # whole time; restored, every order must still have its line and no line may lack its order.
+    $ss = 'nobs_live_snap_src'; $st = 'nobs_live_snap_tgt'
+    foreach ($s in @("DROP DATABASE IF EXISTS $ss", "DROP DATABASE IF EXISTS $st", "CREATE DATABASE $ss", "CREATE DATABASE $st",
+                     "CREATE TABLE $ss.a_orders (id INT PRIMARY KEY, pad TEXT)", "CREATE TABLE $ss.b_filler (id INT PRIMARY KEY, pad TEXT)",
+                     "CREATE TABLE $ss.c_lines (id INT PRIMARY KEY, order_id INT, pad TEXT)",
+                     "CREATE TABLE $ss.``x y`` (id INT PRIMARY KEY)", "CREATE TABLE $ss.x_y (id INT PRIMARY KEY)",
+                     "INSERT INTO $ss.``x y`` VALUES (1)", "INSERT INTO $ss.x_y VALUES (2)",
+                     "CREATE VIEW $ss.v_orders AS SELECT id FROM $ss.a_orders",
+                     "INSERT INTO $ss.b_filler SELECT id, REPEAT('x', 300) FROM nobs_test.bulk_rows WHERE id <= 60000")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $pairs = (1..40000 | ForEach-Object { "START TRANSACTION; INSERT INTO $ss.a_orders VALUES ($_, 'o'); INSERT INTO $ss.c_lines VALUES ($_, $_, 'l'); COMMIT;" }) -join "`n"
+    $writerId = "snap-writer-$PID"
+    $writer = Start-ThreadJob -ScriptBlock {
+        param($base, $token, $sql, $rid, $c)
+        try { Invoke-RestMethod -Uri "$base/api/script" -Method Post -ContentType 'application/json' -TimeoutSec 600 -Body (@{ token = $token; sql = $sql; requestId = $rid; conn = $c } | ConvertTo-Json -Depth 5) }
+        catch { @{ ok = $false; error = "$_" } }
+    } -ArgumentList $base, $token, $pairs, $writerId, $conn
+    $waited = 0
+    while ([int](Scalar "SELECT COUNT(*) FROM $ss.a_orders") -lt 20 -and $waited -lt 100) { Start-Sleep -Milliseconds 100; $waited++ }
+    $snapDir = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-snap-$PID"
+    Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue
+    $se = Api '/api/export' @{ conn = $conn; dbs = @($ss); folder = $snapDir; mode = 'table'
+                              options = @{ charset = 'utf8mb4'; singletx = $true; quick = $true; triggers = $true; extinsert = $true } }
+    Api '/api/cancel-query' @{ conn = $conn; requestId = $writerId } | Out-Null
+    $null = $writer | Wait-Job -Timeout 60; $writer | Remove-Job -Force
+    $written = Scalar "SELECT COUNT(*) FROM $ss.a_orders"
+    $nameList = [string[]]@(Get-ChildItem -LiteralPath $snapDir -Filter '*.sql' | ForEach-Object Name); [Array]::Sort($nameList, [StringComparer]::Ordinal); $names = $nameList -join ','
+    Check ($se.ok -and -not (@($se.log) -match '^FAILED') -and $names -eq "$ss.a_orders.sql,$ss.b_filler.sql,$ss.c_lines.sql,$ss.v_orders.sql,$ss.x_y.sql,$ss.x_y_2.sql") 'a per-table export writes one file per table and view, two for look-alike names' "$names $($se | ConvertTo-Json -Compress)"
+    $order = @('a_orders', 'b_filler', 'c_lines', 'x_y', 'x_y_2', 'v_orders') | ForEach-Object { Join-Path $snapDir "$ss.$_.sql" }
+    $si = Api '/api/import' @{ conn = $conn; files = $order; targetDb = $st }
+    $shape = Scalar ("SELECT CONCAT((SELECT COUNT(*) FROM $st.a_orders), '/', (SELECT COUNT(*) FROM $st.c_lines), '/', " +
+                     "(SELECT COUNT(*) FROM $st.a_orders o LEFT JOIN $st.c_lines l ON l.order_id = o.id WHERE l.id IS NULL) + (SELECT COUNT(*) FROM $st.c_lines l LEFT JOIN $st.a_orders o ON o.id = l.order_id WHERE o.id IS NULL), '/', " +
+                     "(SELECT COUNT(*) FROM $st.``x y``) + (SELECT COUNT(*) FROM $st.x_y))")
+    $parts = "$shape" -split '/'
+    Check ($si.ok -and $parts.Count -eq 4 -and [int]$parts[0] -gt 0 -and $parts[0] -eq $parts[1] -and $parts[2] -eq '0' -and $parts[3] -eq '2') "its files restore to one moment: every order with its line ($shape of $written written)" ($si | ConvertTo-Json -Compress)
+    Remove-Item $snapDir -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($s in @("DROP DATABASE IF EXISTS $ss", "DROP DATABASE IF EXISTS $st")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
     # extra rows used to read as "no row differences" - the wrong answer when checking production

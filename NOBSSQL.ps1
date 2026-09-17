@@ -1693,7 +1693,10 @@ function Api-Export { param($conn,$data)
             }
         }
         else {
-            # PER TABLE (default): dump every table/view to its own file, like Workbench's Dump Project Folder.
+            # PER TABLE (default): every table/view to its own file, like Workbench's Dump Project
+            # Folder - cut from one dump of the database, so all of them come from the same moment
+            # (see NobsDumpDb.SplitByTable).
+            Initialize-DumpDb
             :dbloop foreach($d in $dbs){
                 if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining databases skipped)"); break }
                 $q=Run-Query2 $conn ("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA="+(SqlLit $d)+" ORDER BY TABLE_NAME") $null
@@ -1701,20 +1704,35 @@ function Api-Export { param($conn,$data)
                 $tabs=@($q.rows | ForEach-Object { [string]$_[0] })
                 $dsafe=($d -replace '[^\w\.\-]','_')
                 if($tabs.Count -eq 0){ [void]$log.Add("(no tables) $d") }
-                foreach($t in $tabs){
+                $wanted = @(); $skipped = @()
+                foreach($t in $tabs){ if($excl.ContainsKey("$d.$t")){ [void]$log.Add("(excluded) $d.$t"); $skipped += $t } else { $wanted += $t } }
+                if($wanted.Count){
                     if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining tables skipped)"); break dbloop }
-                    if($excl.ContainsKey("$d.$t")){ [void]$log.Add("(excluded) $d.$t"); continue }
-                    $tsafe=($t -replace '[^\w\.\-]','_'); $file=Join-Path $folder "$dsafe.$tsafe$stamp.sql"
+                    $whole = Join-Path $folder ".$dsafe$stamp.whole.sql.tmp"
                     $a=@()+$common
                     if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
-                    $a+=@($d,$t); $a+="--result-file=$file"
+                    # The excluded tables are left out; when they are most of the database, the
+                    # wanted ones are named instead, which keeps the command line short.
+                    if($skipped.Count -gt $wanted.Count){ $a+=$d; $a+=$wanted } else { foreach($t in $skipped){ $a+=("--ignore-table=$d.$t") }; $a+=$d }
+                    $a+="--result-file=$whole"
                     $r=Run-Proc $dump $a $null $jobId
-                    if($job.Cancelled){
-                        if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
-                        [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
-                        break dbloop
-                    }
-                    if($r.exit -eq 0 -and (Test-Path $file)){ if($o.nodefiner){ Strip-DefinerFile $file }; $mb=[math]::Round((Get-Item $file).Length/1MB,2); [void]$log.Add("OK  $file ($mb MB)") } else { [void]$log.Add("FAILED ($($r.exit)) $d.$t : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                    try {
+                        if($job.Cancelled){ [void]$log.Add("CANCELLED $d"); break dbloop }
+                        if($r.exit -eq 0 -and (Test-Path $whole)){
+                            if($o.nodefiner){ Strip-DefinerFile $whole }
+                            $files = $null
+                            try { $files = [NobsDumpDb]::SplitByTable($whole, $folder, "$dsafe.", "$stamp.sql") }
+                            catch { [void]$log.Add("FAILED $d : could not split the dump into tables: " + (Get-InnerMessage $_)) }
+                            if($null -ne $files){
+                                $pathOf = New-Object 'System.Collections.Generic.Dictionary[string,string]'
+                                foreach($f in $files){ $pathOf[$f[0]] = $f[1] }
+                                foreach($t in $wanted){
+                                    if($pathOf.ContainsKey($t)){ $p=$pathOf[$t]; $mb=[math]::Round((Get-Item -LiteralPath $p).Length/1MB,2); [void]$log.Add("OK  $p ($mb MB)") }
+                                    else { [void]$log.Add("FAILED $d.$t : not in the dump") }
+                                }
+                            }
+                        } else { [void]$log.Add("FAILED ($($r.exit)) $d : "+(Friendly-DumpErr (FirstErr $r.err))) }
+                    } finally { Remove-Item -LiteralPath $whole -Force -ErrorAction SilentlyContinue }
                 }
                 if($job.Cancelled){ break }
                 # Routines + events are database-level, so they go in one extra file per database.
@@ -1738,6 +1756,8 @@ function Api-Export { param($conn,$data)
                 }
             }
         }
+        # A cancel that arrived after the last step had finished still answers the click.
+        if($job.Cancelled -and -not (@($log) -match '^CANCELLED')){ [void]$log.Add('CANCELLED (after the last step had finished - the files listed above are complete)') }
         if($job.Cancelled){ '{"ok":true,"cancelled":true,"log":'+(J-Arr $log)+'}' } else { '{"ok":true,"log":'+(J-Arr $log)+'}' }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($jobId){ $null=$script:RunningJobs.TryRemove($jobId,[ref]$null) } }
 }
@@ -2147,6 +2167,128 @@ public static class NobsDumpDb {
     }
     // Copies a dump to a process's stdin with the database renamed. Stops quietly when the reader
     // goes away - a failed statement ends mysql.exe, and that failure is reported from its stderr.
+    // Splits a whole-database dump into one file per table or view, each with the dump's own
+    // opening and closing lines, so each restores on its own - the files the per-table export
+    // writes. That export used to run mysqldump once per table, and --single-transaction makes one
+    // run consistent, not several: with writes going on, the files came from different moments.
+    // One dump is one snapshot; splitting it keeps that. Files are named prefix + name + suffix,
+    // with characters a file name cannot hold replaced; two names that come out the same get
+    // _2, _3. Returns {name, path} in dump order. The dump is streamed, never held in memory.
+    public static List<string[]> SplitByTable(string src, string folder, string prefix, string suffix) {
+        long off = 0, prevOff = 0, first = -1, lastSection = 0, tz = -1, mode = -1;
+        bool prevDashes = false;
+        using (var fs = File.OpenRead(src)) {
+            var r = new ByteLines(fs);
+            while (r.Next()) {
+                int n = r.Length;
+                if (SectionName(r.Line, n) != null) { if (first < 0) first = prevDashes ? prevOff : off; lastSection = off; }
+                if (LineIs(r.Line, n, "/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;")) tz = off;
+                if (LineIs(r.Line, n, "/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;")) mode = off;
+                prevDashes = LineIs(r.Line, n, "--");
+                prevOff = off;
+                off += n;
+            }
+        }
+        long total = off;
+        var result = new List<string[]>();
+        if (first < 0) return result;
+        // The closing lines restore what the opening ones set; they start with the time zone (when
+        // --tz-utc set one) or the SQL mode. A view's own closing lines look alike but come earlier.
+        long closing = (tz > lastSection && tz < mode) ? tz : (mode > lastSection ? mode : total);
+        byte[] header = new byte[first], footer = new byte[total - closing];
+        using (var fs = File.OpenRead(src)) {
+            ReadFully(fs, header);
+            fs.Position = closing;
+            ReadFully(fs, footer);
+        }
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var pathOf = new Dictionary<string, string>(StringComparer.Ordinal);
+        FileStream cur = null;
+        byte[] pending = null;
+        try {
+            using (var fs = File.OpenRead(src)) {
+                fs.Position = first;
+                var r = new ByteLines(fs);
+                long pos = first;
+                while (pos < closing && r.Next()) {
+                    int n = r.Length;
+                    pos += n;
+                    string name = SectionName(r.Line, n);
+                    if (name != null) {
+                        if (cur != null) { cur.Dispose(); cur = null; }
+                        string path;
+                        if (!pathOf.TryGetValue(name, out path)) {
+                            string safe = System.Text.RegularExpressions.Regex.Replace(name, @"[^\w\.\-]", "_");
+                            path = Path.Combine(folder, prefix + safe + suffix);
+                            for (int i = 2; !used.Add(path); i++) path = Path.Combine(folder, prefix + safe + "_" + i + suffix);
+                            File.WriteAllBytes(path, header);
+                            pathOf[name] = path;
+                            result.Add(new[] { name, path });
+                        }
+                        cur = new FileStream(path, FileMode.Append, FileAccess.Write);
+                        if (pending != null) { cur.Write(pending, 0, pending.Length); pending = null; }
+                        cur.Write(r.Line, 0, n);
+                        continue;
+                    }
+                    // A "--" line belongs to the section it heads, so it waits for the next line.
+                    if (pending != null) { if (cur != null) cur.Write(pending, 0, pending.Length); pending = null; }
+                    if (LineIs(r.Line, n, "--")) { pending = new byte[n]; Array.Copy(r.Line, pending, n); }
+                    else if (cur != null) cur.Write(r.Line, 0, n);
+                }
+                if (pending != null && cur != null) cur.Write(pending, 0, pending.Length);
+            }
+        } finally { if (cur != null) cur.Dispose(); }
+        foreach (var e in result) using (var f = new FileStream(e[1], FileMode.Append, FileAccess.Write)) f.Write(footer, 0, footer.Length);
+        return result;
+    }
+    static readonly string[] SectionHeads = { "-- Table structure for table ", "-- Temporary view structure for view ",
+                                               "-- Temporary table structure for view ", "-- Final view structure for view " };
+    static readonly Encoding StrictUtf8 = new UTF8Encoding(false, true);
+    static int TrimEol(byte[] b, int n) { while (n > 0 && (b[n - 1] == 10 || b[n - 1] == 13)) n--; return n; }
+    static bool LineIs(byte[] b, int n, string text) {
+        n = TrimEol(b, n);
+        if (n != text.Length) return false;
+        for (int i = 0; i < n; i++) if (b[i] != (byte)text[i]) return false;
+        return true;
+    }
+    // The name in a mysqldump section heading, or null for any other line. Data never looks like
+    // this: every data line is a statement, and a line break inside a value is written as \n.
+    public static string SectionName(byte[] b, int n) {
+        if (n < 3 || b[0] != 45 || b[1] != 45 || b[2] != 32) return null;
+        n = TrimEol(b, n);
+        string s;
+        try { s = StrictUtf8.GetString(b, 0, n); } catch (DecoderFallbackException) { return null; }
+        foreach (var h in SectionHeads) {
+            if (!s.StartsWith(h, StringComparison.Ordinal)) continue;
+            string rest = s.Substring(h.Length);
+            if (rest.Length < 2 || rest[0] != '`' || rest[rest.Length - 1] != '`') return null;
+            return rest.Substring(1, rest.Length - 2).Replace("``", "`");
+        }
+        return null;
+    }
+    static void ReadFully(Stream s, byte[] buf) {
+        int got = 0;
+        while (got < buf.Length) { int k = s.Read(buf, got, buf.Length - got); if (k <= 0) throw new EndOfStreamException(); got += k; }
+    }
+    sealed class ByteLines {
+        readonly Stream s;
+        readonly byte[] buf = new byte[1 << 16];
+        int pos, len;
+        public byte[] Line = new byte[256];
+        public int Length;
+        public ByteLines(Stream s) { this.s = s; }
+        // The next line, its LF included; false at the end.
+        public bool Next() {
+            Length = 0;
+            while (true) {
+                if (pos >= len) { len = s.Read(buf, 0, buf.Length); pos = 0; if (len <= 0) { len = 0; return Length > 0; } }
+                byte c = buf[pos++];
+                if (Length == Line.Length) Array.Resize(ref Line, Line.Length * 2);
+                Line[Length++] = c;
+                if (c == 10) return true;
+            }
+        }
+    }
     public static void CopyRenamed(string path, Stream dst, string from, string to) {
         using (var f = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16)) {
             var r = new LineReader(f); var line = new MemoryStream();
@@ -3824,7 +3966,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="expDbs" style="max-height:150px;overflow:auto;border:1px solid var(--bd2);padding:6px"></div>
  <div class="row"><b>Options</b></div><div class="grid2" id="expOpts"></div>
  <div class="row"><label title="How a NULL is written to CSV. \N is what LOAD DATA reads back; blank makes NULL and an empty string indistinguishable in the file.">NULL value <input id="expNullVal" value="\N" style="width:52px;font-family:Consolas,monospace"></label> Charset <select id="expCharset"><option>utf8mb4</option><option>utf8</option><option>latin1</option><option>binary</option></select>
-  <label title="One .sql file per table - lets you restore a single table. Slower, more files (like Workbench Dump Project Folder)."><input type="radio" name="expmode" id="expTable" checked onchange="expSyncFilenameField()"> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer" onchange="expSyncFilenameField()"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle" onchange="expSyncFilenameField()"> single file</label>
+  <label title="One .sql file per table or view - lets you restore a single table (like Workbench Dump Project Folder). All files come from one dump of the database, so they are consistent with each other."><input type="radio" name="expmode" id="expTable" checked onchange="expSyncFilenameField()"> per table</label><label title="One .sql file per database."><input type="radio" name="expmode" id="expPer" onchange="expSyncFilenameField()"> per DB</label><label title="Everything in one combined .sql file."><input type="radio" name="expmode" id="expSingle" onchange="expSyncFilenameField()"> single file</label>
   <label title="Append a date-time stamp to each file name."><input type="checkbox" id="expStamp" checked onchange="expUpdateFilenamePreview()"> timestamp</label>
   <label title="mysqldump --max-allowed-packet. Raise this for very large rows or BLOBs (e.g. 1G).">max packet <input id="expMaxPacket" value="1G" style="width:56px"></label>
   <div id="expFilenameRow" title="Only applies to \u201Csingle file\u201D mode - db/table mode each produce one file per object, so a manual name has nowhere to go. Leave blank to keep the default (all_selected)." style="display:none;flex-direction:column;gap:2px">

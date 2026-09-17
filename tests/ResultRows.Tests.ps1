@@ -128,6 +128,48 @@ Check ($out[1][0] -ceq 'a b' -and $null -eq $out[1][3]) 'a row without NULs is u
 Check ($out[2][0] -ceq "c${nul}" -and $out[2][3] -ceq '') 'as is a value that is already right'
 ''
 
+"-- a whole-database dump split into one file per table (the per-table export) --"
+# Real dumps of one database (a table named a`b, a table with a trigger and a row whose text reads
+# like a section heading, and a view), by MariaDB's and MySQL's mysqldump.
+foreach ($fixture in 'dump-mariadb-12.sql', 'dump-mysql-8.sql') {
+    $src = Join-Path $PSScriptRoot "fixtures\$fixture"
+    $text = [IO.File]::ReadAllText($src)
+    $dir = Join-Path ([IO.Path]::GetTempPath()) "nobs-split-$PID"
+    Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory $dir | Out-Null
+    try {
+        $files = [NobsDumpDb]::SplitByTable($src, $dir, 'db.', '.sql')
+        $names = @($files | ForEach-Object { $_[0] }) -join ' | '
+        Check ($names -ceq 'a`b | t2 | v') "$fixture : one file per table and view, in dump order" $names
+        $headEnd = $text.IndexOf("-- Table structure") - 1
+        while ($headEnd -gt 0 -and $text[$headEnd - 1] -ne "`n") { $headEnd-- }
+        $footStart = $text.LastIndexOf('/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;')
+        $body = @($files | ForEach-Object { [IO.File]::ReadAllText($_[1]) })
+        Check (@($body | Where-Object { $_.StartsWith($text.Substring(0, $headEnd)) -and $_.EndsWith($text.Substring($footStart)) }).Count -eq 3) "$fixture : each file has the dump's opening and closing lines"
+        Check ($body[0].Contains('INSERT INTO `a``b` VALUES (1)') -and -not $body[0].Contains('`t2`')) "$fixture : a``b alone, named $([IO.Path]::GetFileName($files[0][1]))"
+        Check ($body[1].Contains('-- Table structure for table `fake`') -and $body[1].Contains('BEFORE INSERT ON') -and -not $body[1].Contains('VIEW `v`')) "$fixture : a value that reads like a heading stays in its row, the trigger with its table"
+        Check ($body[2].Contains('Final view structure for view `v`') -and $body[2].Contains('structure for view `v`') -and -not $body[2].Contains('CREATE TABLE')) "$fixture : both parts of the view"
+        $lines = { param($s) @($s -split "`r?`n" | Where-Object { $_ }).Count }
+        $inBody = & $lines $text.Substring($headEnd, $footStart - $headEnd)
+        $split = 0; foreach ($b in $body) { $split += & $lines $b.Substring($headEnd, $b.Length - $headEnd - ($text.Length - $footStart)) }
+        Check ($split -eq $inBody) "$fixture : every line of the dump is in exactly one file" "$split of $inBody"
+    } finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+}
+# Two names that make the same file name get two files.
+$dir = Join-Path ([IO.Path]::GetTempPath()) "nobs-split2-$PID"
+New-Item -ItemType Directory -Force $dir | Out-Null
+try {
+    $dump = "-- head`n`n--`n-- Table structure for table ``x y```n--`nCREATE TABLE ``x y`` (id int);`n`n--`n-- Table structure for table ``x_y```n--`nCREATE TABLE x_y (id int);`n/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;`n-- Dump completed`n"
+    [IO.File]::WriteAllText((Join-Path $dir 'all.tmp'), $dump)
+    $files = [NobsDumpDb]::SplitByTable((Join-Path $dir 'all.tmp'), $dir, 'db.', '.sql')
+    $got = @($files | ForEach-Object { "$($_[0])=$([IO.Path]::GetFileName($_[1]))" }) -join ' | '
+    Check ($got -ceq 'x y=db.x_y.sql | x_y=db.x_y_2.sql') 'names that make the same file name get two files' $got
+    Check ([IO.File]::ReadAllText((Join-Path $dir 'db.x_y_2.sql')) -ceq "-- head`n`n--`n-- Table structure for table ``x_y```n--`nCREATE TABLE x_y (id int);`n/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;`n-- Dump completed`n") 'a file is exactly its section between the opening and closing lines'
+    [IO.File]::WriteAllText((Join-Path $dir 'none.tmp'), "-- MySQL dump`n/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;`n")
+    Check (@([NobsDumpDb]::SplitByTable((Join-Path $dir 'none.tmp'), $dir, 'e.', '.sql')).Count -eq 0 -and -not (Test-Path (Join-Path $dir 'e.*'))) 'a dump without tables writes nothing'
+} finally { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+''
+
 "`n-- NobsLf, which reads that header line --"
 $r2 = New-Object IO.StreamReader((New-Object IO.MemoryStream(,[byte[]](0x61,0x0D,0x62,0x0A,0x63))), $script:RawEnc)
 Check (([NobsLf]::ReadLine($r2)) -ceq "a`rb") 'a line ends at LF, not at CR'
