@@ -92,6 +92,11 @@ jobs:
         shell: pwsh
         run: ./tests/ToolChoice.Tests.ps1 ./NOBSSQL.ps1
 
+      # The new-version notice: announced when newer, quiet when hidden, switched off or offline.
+      - name: Run update notice tests
+        shell: pwsh
+        run: ./tests/UpdateCheck.Tests.ps1 ./NOBSSQL.ps1
+
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
         shell: pwsh

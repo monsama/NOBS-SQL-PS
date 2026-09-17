@@ -123,6 +123,17 @@ exporting a table from the grid (CSV or INSERTs) refuses a table that has any an
 points to the Export tool, which copies them byte for byte. Exporting the result of
 an arbitrary query cannot check, so such a value is exported with the space.
 
+## Updates
+
+A few seconds after it starts, the app asks GitHub (`api.github.com`) for the latest release of
+[NOBS-SQL-PS](https://github.com/monsama/NOBS-SQL-PS/releases). If a newer version exists, a small
+notice with a link appears in the bottom-left corner. Nothing is downloaded or installed. The
+request carries nothing beyond what any web request does: your IP address and a user agent
+naming the app.
+
+Hide the notice with its **×** and it stays hidden until the next version. Switch the check off,
+or run it by hand, under **Settings → Updates**.
+
 ## License
 
 Free software under the **GNU General Public License version 2** (or, at your

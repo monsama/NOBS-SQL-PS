@@ -110,4 +110,15 @@ Check (@($seeded).Count -gt 10) 'the seed list was found' "found $(@($seeded).Co
 $missing = @($topLevel | Where-Object { $readInFunctions -contains $_ -and $seeded -notcontains $_ })
 Check ($missing.Count -eq 0) 'none is missing from it' ($missing -join ', ')
 
+"`n-- a release is newer only when its version is higher --"
+$ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-ReleaseIsNewer' }, $true) |
+    ForEach-Object { Invoke-Expression $_.Extent.Text }
+Check (Test-ReleaseIsNewer 'v1.3.0' '1.2.0')        'v1.3.0 is newer than 1.2.0'
+Check (Test-ReleaseIsNewer 'v1.10.0' '1.9.3')       'compared as numbers, not text'
+Check (-not (Test-ReleaseIsNewer 'v1.2.0' '1.2.0')) 'the same version is not an update'
+Check (-not (Test-ReleaseIsNewer 'v1.1.0' '1.2.0')) 'an older release is not an update'
+Check (-not (Test-ReleaseIsNewer 'v1.2' '1.2.0'))   '1.2 and 1.2.0 are the same version'
+Check (-not (Test-ReleaseIsNewer '' '1.2.0'))       'no tag, no update'
+Check (-not (Test-ReleaseIsNewer 'nightly' '1.2.0')) 'a tag that is not a version is not an update'
+
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

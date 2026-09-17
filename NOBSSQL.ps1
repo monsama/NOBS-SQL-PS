@@ -2321,6 +2321,33 @@ function Api-SaveConfig { param($data)
     if($db -and (Test-Path $db)){ $script:MysqldumpPath=$db }
     '{"ok":true}'
 }
+# ---------- update notice ----------
+# The app says when a newer release exists and links to it; it never downloads or installs
+# anything itself. The page asks once per start unless that is switched off in Settings.
+$script:ReleasesRepo = 'monsama/NOBS-SQL-PS'
+function Test-ReleaseIsNewer { param([string]$Latest, [string]$Current)
+    $a = $null; $b = $null
+    if (-not [version]::TryParse(([string]$Latest).Trim().TrimStart('v', 'V'), [ref]$a)) { return $false }
+    if (-not [version]::TryParse(([string]$Current).Trim().TrimStart('v', 'V'), [ref]$b)) { return $false }
+    # 1.2 and 1.2.0 are the same release; [version] would call the second one newer.
+    $norm = { param($v) [version]::new($v.Major, $v.Minor, [Math]::Max($v.Build, 0), [Math]::Max($v.Revision, 0)) }
+    return (& $norm $a) -gt (& $norm $b)
+}
+function Api-UpdateCheck {
+    $current = [string]$script:AppVersion
+    try {
+        # Windows PowerShell 5.1 does not offer TLS 1.2 by default, and GitHub requires it.
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch { }
+        $r = Invoke-RestMethod -Uri "https://api.github.com/repos/$($script:ReleasesRepo)/releases/latest" -UseBasicParsing `
+            -UserAgent 'NOBSSQL' -Headers @{ Accept = 'application/vnd.github+json' } -TimeoutSec 10 -ErrorAction Stop
+        $tag = [string]$r.tag_name
+        $newer = Test-ReleaseIsNewer $tag $current
+        '{"ok":true,"current":'+(J-Str $current)+',"latest":'+(J-Str $tag.TrimStart('v','V'))+',"url":'+(J-Str ([string]$r.html_url))+',"newer":'+$newer.ToString().ToLower()+'}'
+    } catch {
+        '{"ok":false,"current":'+(J-Str $current)+',"error":'+(J-Str $_.Exception.Message)+'}'
+    }
+}
+
 # ---------- MySQL's own client tools ----------
 # For machines without a MySQL installation: a MySQL server otherwise gets MariaDB's tools (see
 # Get-ToolFor). MySQL has no release API like MariaDB's, but its download page names the current
@@ -3403,6 +3430,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div id="bar">
  <div class="barrow">
   <b class="brand">NOBS SQL Editor</b>
+  <span id="updNote" style="display:none;position:fixed;left:16px;bottom:16px;z-index:9400;background:var(--panel2);border:1px solid var(--bd);border-left:4px solid var(--accent);border-radius:6px;padding:8px 12px;font-size:13px;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.3)"><a href="#" id="updLink" style="color:var(--accent)" onclick="openUpdatePage();return false"></a> <a href="#" title="Hide until the next version" style="color:var(--muted);text-decoration:none" onclick="dismissUpdate();return false">&times;</a></span>
 	<select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select>
   <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()">New</button><button class="sm" title="Save these connection details" onclick="saveConn()">Save</button><button id="mgrBtn" class="sm" title="Edit, clone, delete or set primary for the selected connection" onclick="connMenu(event)">Manage &#9662;</button>
   <span id="connStatusGroup" style="display:inline-flex;gap:6px;align-items:center;min-width:0;margin-left:4px"><span id="pwChip" title="This connection has a saved password" style="display:none;font-size:14px;cursor:default;flex:none">&#128274;</span><span id="connStatus" class="chip bad">Not connected</span><span id="envChip" class="chip bad" style="display:none"></span><span id="schemaBadge" class="chip ok" style="display:none"></span></span>
@@ -3608,6 +3636,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="muted" style="font-size:11px;line-height:1.4;margin:2px 0 0">{version} and {file_name} are filled in automatically from the latest MariaDB LTS release. Only change this if the download above fails (mariadb.org occasionally changes its layout) - the error message will show what actually happened.</div>
  <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
  <div id="cfgPaths" class="muted" style="font-size:11px;font-family:Consolas,monospace;margin-top:10px;border-top:1px solid var(--bd2);padding-top:8px;line-height:1.6"></div>
+ <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">UPDATES</div>
+ <div class="row"><label class="ck" style="font-size:12px"><input type="checkbox" id="cfgUpdateCheck" onchange="setUpdateCheck(this.checked)"> At startup, check whether a newer version has been released</label><button class="sm" onclick="checkForUpdate(true)">Check now</button></div>
+ <div class="muted" style="font-size:11px;line-height:1.4;margin:2px 0 0">Asks GitHub for the latest release and shows a notice in the top bar with a link. Nothing is downloaded or installed.</div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LOCAL DATA</div>
  <div class="row"><button class="warn" onclick="clearAllData()">Clear all app data</button></div>
  <hr style="border:none;border-top:1px solid var(--bd2);margin:10px 0">
@@ -4016,7 +4047,7 @@ if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
 // context menu
 function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n\u2022 saved connections (host / user / password)\n\u2022 the query library\n\u2022 caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
-async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}show('mSettings');refreshToolsStatus();}
+async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}if($('cfgUpdateCheck'))$('cfgUpdateCheck').checked=updateCheckOn();show('mSettings');refreshToolsStatus();}
 // Export and Import shell out to mysql.exe / mysqldump.exe. When the backend reports one
 // missing, the bare error leaves the user stuck - it names PATH and an environment variable but
 // not the dialog that actually fixes it - so pair it with a button that opens Settings, where the
@@ -7793,6 +7824,36 @@ function _ping(){ return fetch('/api/ping', { method:'POST', keepalive:true, hea
 setInterval(_ping, 5000);
 document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) _ping(); });
 document.body.classList.add('disconnected');
+
+// ---- update notice ----
+// A fixed card in the bottom-left corner, not part of the top bar: at common window widths the
+// bar has almost no room left, and a notice there pushed it onto a second line.
+// Says when a newer release exists and links to it; nothing is downloaded or installed. Asked once
+// per start unless switched off in Settings, and a version the user hid stays hidden.
+let _update=null;
+function updateCheckOn(){try{return localStorage.getItem('updateCheck')!=='off';}catch(e){return true;}}
+function setUpdateCheck(on){try{localStorage.setItem('updateCheck',on?'on':'off');}catch(e){}if(!on){const el=$('updNote');if(el)el.style.display='none';}}
+async function checkForUpdate(manual){
+ if(!manual&&!updateCheckOn())return null;
+ let r=null;try{r=await api('/api/update-check');}catch(e){}
+ if(!r||!r.ok){if(manual)toast('Could not check for a new version'+(r&&r.error?': '+r.error:'.'),true);return r;}
+ _update=r;
+ let hidden='';try{hidden=localStorage.getItem('updateDismissed')||'';}catch(e){}
+ const el=$('updNote'),a=$('updLink');
+ if(el&&a){
+  if(r.newer&&(manual||hidden!==r.latest)){a.textContent='Version '+r.latest+' available';a.title='You have '+r.current+'. Opens the release notes and download page.';el.style.display='';}
+  else el.style.display='none';
+ }
+ if(manual)toast(r.newer?('Version '+r.latest+' is available - you have '+r.current+'.'):('You have the latest version ('+r.current+').'),'ok');
+ return r;
+}
+async function openUpdatePage(){
+ if(!_update||!_update.url)return;
+ if(window.__TAURI__){const r=await api('/api/open-release-page',{url:_update.url});if(r&&!r.ok)toast(r.error||'Could not open the release page.',true);}
+ else window.open(_update.url,'_blank','noopener');
+}
+function dismissUpdate(){if(!_update)return;try{localStorage.setItem('updateDismissed',_update.latest);}catch(e){}const el=$('updNote');if(el)el.style.display='none';}
+setTimeout(()=>{checkForUpdate(false);},3000);
 window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.preventDefault();e.returnValue='';return '';}});
 (function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=280)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(280,window.innerWidth-320);w=Math.max(280,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
 </script></body></html>
@@ -7917,7 +7978,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -8000,6 +8061,7 @@ $RequestHandler = {
                 '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
                 '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
                 '/api/download-mysql-tools' { Send-Json $client (Api-DownloadMysqlTools) }
+                '/api/update-check' { Send-Json $client (Api-UpdateCheck) }
                 '/api/conn-list'   { Send-Json $client (Api-ConnList) }
                 '/api/conn-get'    { Send-Json $client (Api-ConnGet $data) }
                 '/api/conn-save'   { Send-Json $client (Api-ConnSave $data) }

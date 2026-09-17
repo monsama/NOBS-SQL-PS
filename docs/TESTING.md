@@ -1,6 +1,6 @@
 # Testing
 
-Fourteen test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
+Fifteen test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
 the file that actually ships rather than a copy of it.
 
 ```powershell
@@ -18,6 +18,7 @@ pwsh -NoProfile -File tests/DdlRecreate.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/UpdateCheck.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
@@ -39,6 +40,7 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
+| `UpdateCheck` | the new-version notice: shown when newer, quiet when hidden, switched off or offline | `node` on PATH |
 | `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page, and that every script-level value a request reads reaches the request threads | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
@@ -47,7 +49,7 @@ cannot lift their subject out with the PowerShell AST. They extract it by brace-
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
 
-`ConnSslCa`, `TableDesigner` and `DdlRecreate` embed the very same test files the Tauri edition
+`ConnSslCa`, `TableDesigner`, `DdlRecreate` and `UpdateCheck` embed the very same test files the Tauri edition
 runs (`tests/ui/*.test.mjs` in NOBS-SQL-Editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 
