@@ -3904,7 +3904,9 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 .toolcard.inuse{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 .toolcard-h{font-size:13px;font-weight:700;margin-bottom:4px;display:flex;align-items:center;gap:6px}
 .tooldot{width:10px;height:10px;border-radius:50%;display:inline-block;flex:none}
-.toolstatus{font-size:12px;margin:4px 0 8px;word-break:break-all}
+.toolstatus{font-size:12px;margin:4px 0 8px}
+.toolpath{display:flex;align-items:baseline;gap:6px;min-width:0}
+.toolpath>.p{font-family:Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
 .toolcard .row>span:first-child{flex:none}
 </style></head><body>
 <div id="deadOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.78);align-items:center;justify-content:center;flex-direction:column">
@@ -4103,7 +4105,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div class="modal floating" id="mRowForm"><div class="box" style="width:560px;max-width:94vw;top:70px;left:160px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mRowForm')" title="Drag to move"><h3 id="rfTitle" style="margin:0">Edit row</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mRowForm')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div id="rfFields" style="max-height:60vh;overflow:auto"></div>
  <div class="row" style="justify-content:flex-end;margin-top:6px"><button class="go" onclick="rfSave()">Save to pending</button><button onclick="hide('mRowForm')">Cancel</button></div></div></div>
-<div class="modal floating" id="mSettings"><div class="box" style="width:860px;max-width:94vw;top:40px;left:80px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mSettings')" title="Drag to move"><h3 style="margin:0">Client tools</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mSettings')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mSettings"><div class="box" style="width:1300px;max-width:96vw;top:40px;left:80px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mSettings')" title="Drag to move"><h3 style="margin:0">Client tools</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mSettings')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div class="muted" style="font-size:12px">Export, Import and multi-statement Run use the MySQL/MariaDB command-line tools.<br>They are not bundled - point to an existing install, or download them automatically.</div>
  <div style="margin:10px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">STATUS</div>
  <div id="cfgStatus" class="muted" style="font-size:12px;margin:2px 0 8px"></div>
@@ -4680,7 +4682,7 @@ function openAbout(){ show('mAbout'); }
 // downloaded"). Above them, which set the connected server uses.
 function renderToolsStatus(r){
  const row=(name,path,src,ver,none)=>{const ok=path&&path!=='(not found)';
-  return '<div style="margin:2px 0"><b>'+name+':</b> '+(ok?'<span style="font-family:Consolas,monospace">'+esc(path)+'</span> <span style="color:#3fb950">&#10003;</span><div class="muted" style="font-size:11px;margin-left:2px">'+esc((ver?ver+' - ':'')+(src||''))+'</div>':none)+'</div>';};
+  return '<div style="margin:2px 0"><div class="toolpath"><b>'+name+':</b>'+(ok?'<span class="p" title="'+esc(path)+'">'+esc(path)+'</span><span style="color:#3fb950">&#10003;</span></div><div class="muted" style="font-size:11px;margin-left:2px">'+esc((ver?ver+' - ':'')+(src||''))+'</div>':none+'</div>')+'</div>';};
  const missing='<span style="color:#e5534b">&#10007; not found</span>';
  const ma=$('cfgStatusMaria'),my=$('cfgStatusMysql');
  if(ma)ma.innerHTML=row('mysql',r.mysql,r.mysql_source,r.mysql_version,missing)+row('mysqldump',r.mysqldump,r.mysqldump_source,r.mysqldump_version,missing);
