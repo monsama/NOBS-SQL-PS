@@ -470,6 +470,46 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.rt_probe' } | Out-Null
     }
 
+    # --- 4f. export and import use the tools that match the server --------------------------------
+    # MariaDB's mysqldump writes values into a MySQL generated column, and MySQL refuses them on
+    # restore, so a MySQL server gets MySQL's own tools when there are any. The round trip below is
+    # the thing that matters: a table with a generated column comes back out of its own dump.
+    $tfc = Api '/api/tools-for-conn' @{ conn = $conn }
+    $tst = Api '/api/tools-status' @{}
+    Check ($tfc.ok -and $null -ne $tfc.serverIsMariadb) 'tools-for-conn knows what the server is' ($tfc | ConvertTo-Json -Compress)
+    $mysqlToolsHere = [bool]$tst.mysqldump_for_mysql
+    if ($tfc.serverIsMariadb) {
+        Check ($tfc.mysqldump -eq $tst.mysqldump) 'a MariaDB server keeps the default mysqldump' "$($tfc.mysqldump) vs $($tst.mysqldump)"
+    } elseif ($mysqlToolsHere) {
+        Check ($tfc.mysqldump -eq $tst.mysqldump_for_mysql -and $tfc.mysqldumpIsMariadb -eq $false) "a MySQL server gets MySQL's mysqldump" ($tfc | ConvertTo-Json -Compress)
+    } else {
+        "  skip  no MySQL client tools on this machine - a MySQL server keeps the default pair"
+    }
+    $gs = 'nobs_live_gen_src'; $gt = 'nobs_live_gen_tgt'
+    foreach ($s in @("DROP DATABASE IF EXISTS $gs", "DROP DATABASE IF EXISTS $gt", "CREATE DATABASE $gs", "CREATE DATABASE $gt",
+                     "CREATE TABLE $gs.t (id INT PRIMARY KEY, a INT, dbl INT GENERATED ALWAYS AS (a * 2) STORED, v VARCHAR(8) GENERATED ALWAYS AS (CONCAT('x', a)) VIRTUAL)",
+                     "INSERT INTO $gs.t (id, a) VALUES (1, 5), (2, 7)")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $genDir = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-gen-$PID"
+    Remove-Item $genDir -Recurse -Force -ErrorAction SilentlyContinue
+    $ge = Api '/api/export' @{ conn = $conn; dbs = @($gs); folder = $genDir; mode = 'db'
+                              options = @{ charset = 'utf8mb4'; singletx = $true; triggers = $true; extinsert = $true; createdb = $true } }
+    $refused = (-not $ge.ok) -and ([string]$ge.error -match 'generated columns')
+    if (-not $tfc.serverIsMariadb -and -not $mysqlToolsHere) {
+        Check $refused 'without MySQL tools, the export is refused rather than written unrestorable' ($ge | ConvertTo-Json -Compress)
+    } else {
+        Check ($ge.ok -and -not (@($ge.log) -match '^FAILED')) 'a table with generated columns exports' ($ge | ConvertTo-Json -Compress)
+        $gf = Get-ChildItem -LiteralPath $genDir -Filter '*.sql' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($gf) {
+            $gi = Api '/api/import' @{ conn = $conn; files = @($gf.FullName); targetDb = $gt }
+            Check ($gi.ok -and (@($gi.log) -match '^OK  ')) 'and its dump imports' ($gi | ConvertTo-Json -Compress)
+            Check ((Scalar "SELECT GROUP_CONCAT(CONCAT(id, ':', a, ':', dbl, ':', v) ORDER BY id) FROM $gt.t") -eq '1:5:10:x5,2:7:14:x7') 'with every value, generated ones included' (Scalar "SELECT GROUP_CONCAT(CONCAT(id, ':', a, ':', dbl, ':', v) ORDER BY id) FROM $gt.t")
+        } else { Check $false 'the export wrote a file' "nothing in $genDir" }
+    }
+    Remove-Item $genDir -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($s in @("DROP DATABASE IF EXISTS $gs", "DROP DATABASE IF EXISTS $gt")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+
     # --- 5. compare reports rows that exist only on the TARGET ---------------------------------
     # Neither "missing from target" nor the per-column diff covers those, so a target holding
     # extra rows used to read as "no row differences" - the wrong answer when checking production

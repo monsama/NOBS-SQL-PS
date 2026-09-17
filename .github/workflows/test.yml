@@ -86,6 +86,12 @@ jobs:
         shell: pwsh
         run: ./tests/TableDesigner.Tests.ps1 ./NOBSSQL.ps1
 
+      # MariaDB's mysqldump cannot make a restorable dump of a MySQL table with generated columns,
+      # so a MySQL server gets MySQL's own tools when there are any.
+      - name: Run tool choice tests
+        shell: pwsh
+        run: ./tests/ToolChoice.Tests.ps1 ./NOBSSQL.ps1
+
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
         shell: pwsh

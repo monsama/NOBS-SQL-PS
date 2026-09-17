@@ -87,6 +87,15 @@ Auto-detection checks, in order: saved configuration, the system PATH, then
 common install folders (`Program Files\MariaDB*`, `Program Files\MySQL`,
 XAMPP).
 
+**MySQL servers get MySQL's own tools** when there are any: the two optional
+"MySQL servers" paths in Settings, or else the newest MySQL Server installation
+(`Program Files\MySQL\MySQL Server *\bin`). Export and Import ask the server
+what it is and pick the pair to match; MariaDB servers, and MySQL servers on a
+machine without MySQL's tools, use the default pair. It matters because MariaDB's
+mysqldump writes values into a MySQL table's generated columns, which MySQL
+refuses when the dump is restored. Without MySQL's tools such an export is
+refused rather than written.
+
 Every query goes through `mysql.exe` too, and results are read from its `--xml
 --binary-as-hex` output, because XML is the only output format that tells NULL apart
 from the text `'NULL'`. That needs a client with `--binary-as-hex`: the MariaDB

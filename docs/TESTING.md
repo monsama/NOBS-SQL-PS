@@ -1,6 +1,6 @@
 # Testing
 
-Thirteen test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
+Fourteen test scripts, all plain PowerShell, all taking the path to `NOBSSQL.ps1` so they exercise
 the file that actually ships rather than a copy of it.
 
 ```powershell
@@ -17,6 +17,7 @@ pwsh -NoProfile -File tests/TableDesigner.Tests.ps1      ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/DdlRecreate.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
@@ -38,6 +39,7 @@ not — see below.
 | `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
+| `ToolChoice` | which client tools export and import use for a MariaDB or a MySQL server, and the options file written for them | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
 The node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
@@ -165,6 +167,9 @@ Every check is a regression test for a bug that actually shipped:
   characters `0x`), a binary key, CR/LF, a NUL inside text (which XML output turns into a space),
   BIT, spatial, and a latin1 target. The diff also sees NULL against `''` and `'null'` against
   `'NULL'`.
+- **Export and import use the tools that match the server**: MySQL's own for a MySQL server when
+  the machine has them, and a table with generated columns comes back whole from its own dump.
+  Without MySQL's tools the export must be refused instead.
 - **Paging a cursor delivers every row exactly once**, with no row dropped at a page boundary.
 - **Result values arrive as themselves**: NULL vs `'NULL'`, CR/LF inside text, empty vs NULL
   binary, markup characters, a 70,000-character value, column names of an empty result (asked for

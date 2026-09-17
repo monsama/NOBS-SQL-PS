@@ -175,7 +175,8 @@ function Resolve-Tools {
 # runspace, so deriving the dialect from it is deterministic everywhere.
 # Cached against the path it probed, so pointing Settings at a different client re-probes rather
 # than answering for the binary that used to be there.
-function Test-ClientIsMariaDB {
+function Test-ClientIsMariaDB { param([string]$Path)
+    if ($Path -and $Path -ne [string]$script:MysqlPath) { return Test-ToolIsMariaDB $Path }
     $path = [string]$script:MysqlPath
     if ($script:ClientIsMariaDB -and $script:ClientIsMariaDB.Path -eq $path) { return $script:ClientIsMariaDB.Maria }
     # The bundled client is MariaDB, so that is the safe assumption if the probe cannot run.
@@ -184,6 +185,19 @@ function Test-ClientIsMariaDB {
         try { $maria = ((& $path --version 2>&1 | Out-String) -match 'MariaDB') } catch { }
     }
     $script:ClientIsMariaDB = @{ Path = $path; Maria = $maria }
+    return $maria
+}
+
+# The same probe for any other tool - export and import may use a different pair (see
+# Get-ToolFor). One cache entry per path, so switching between the two does not re-probe.
+function Test-ToolIsMariaDB { param([string]$Path)
+    if (-not $script:ToolFlavor) { $script:ToolFlavor = @{} }
+    if ($script:ToolFlavor.ContainsKey($Path)) { return $script:ToolFlavor[$Path] }
+    $maria = $true
+    if ($Path -and (Test-Path $Path)) {
+        try { $maria = ((& $Path --version 2>&1 | Out-String) -match 'MariaDB') } catch { }
+    }
+    $script:ToolFlavor[$Path] = $maria
     return $maria
 }
 
@@ -230,9 +244,10 @@ function Get-SslLines {
 # Only for OUR copy. A client from a real MariaDB or MySQL installation sits in a proper bin/ with
 # its own lib/plugin next door and finds the right ones by itself - overriding that with a plugin
 # set from a different product is how you turn a working connection into a broken one.
-function Get-PluginDir {
-    if (-not $script:MysqlPath) { return $null }
-    $binDir = Split-Path -Parent $script:MysqlPath
+function Get-PluginDir { param([string]$Tool)
+    $exe = if ($Tool) { $Tool } else { [string]$script:MysqlPath }
+    if (-not $exe) { return $null }
+    $binDir = Split-Path -Parent $exe
     if (-not $binDir -or -not $script:ToolsDir) { return $null }
     if ($binDir.TrimEnd('\') -ne ([string]$script:ToolsDir).TrimEnd('\')) { return $null }
     $p = Join-Path $script:ToolsDir 'plugin'
@@ -258,8 +273,10 @@ $script:ClientAuthPlugins = @(
 # it does nothing for an actual embedded newline character, which this strips outright since none
 # of these fields have any legitimate use for one.
 function Get-CnfSafe { param([string]$s) if(-not $s){ return $s }; return ($s -replace "[\r\n]", '') }
+# -Tool: the binary the file is for, when it is not the default mysql.exe. SSL option names and
+# the plugin directory both depend on which client reads the file.
 function New-Cnf {
-    param($conn)
+    param($conn, [string]$Tool)
     $tmp = Join-Path $env:TEMP ("mysqlcnf_" + [Guid]::NewGuid().ToString('N') + ".cnf")
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('[client]'); [void]$sb.AppendLine("host=$(Get-CnfSafe $conn.host)"); [void]$sb.AppendLine("port=$(Get-CnfSafe $conn.port)"); [void]$sb.AppendLine("user=$(Get-CnfSafe $conn.user)")
@@ -269,8 +286,9 @@ function New-Cnf {
     # letter was refused by a latin1 column, and stored as other characters elsewhere. MariaDB's
     # client happens to default to utf8mb4. A --default-character-set on the command line still takes precedence.
     [void]$sb.AppendLine('default-character-set=utf8mb4')
-    foreach ($l in (Get-SslLines $conn.ssl $null $conn.sslCa)) { [void]$sb.AppendLine($l) }
-    $pluginDir = Get-PluginDir
+    $maria = if ($Tool) { Test-ClientIsMariaDB $Tool } else { $null }
+    foreach ($l in (Get-SslLines $conn.ssl $maria $conn.sslCa)) { [void]$sb.AppendLine($l) }
+    $pluginDir = Get-PluginDir $Tool
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
@@ -1332,7 +1350,8 @@ function Strip-DefinerFile { param($file)
     } catch {}
 }
 # Whether a dump binary is MariaDB's, cached against its path like Test-ClientIsMariaDB.
-function Test-DumpIsMariaDB {
+function Test-DumpIsMariaDB { param([string]$Path)
+    if ($Path -and $Path -ne [string]$script:MysqldumpPath) { return Test-ToolIsMariaDB $Path }
     $path = [string]$script:MysqldumpPath
     if ($script:DumpIsMariaDB -and $script:DumpIsMariaDB.Path -eq $path) { return $script:DumpIsMariaDB.Maria }
     $maria = $true
@@ -1340,11 +1359,63 @@ function Test-DumpIsMariaDB {
     $script:DumpIsMariaDB = @{ Path = $path; Maria = $maria }
     return $maria
 }
+# Which tools export and import use for a server. MariaDB's and MySQL's are not interchangeable
+# against the other's server: MariaDB's mysqldump writes values into a MySQL generated column, so
+# the dump does not restore, and only MySQL's client can check a CA without the host name. The
+# configured (or downloaded) pair stays the default; a MySQL server gets MySQL's own tools when
+# there are any - set in Settings (mysql_bin_mysql / mysqldump_bin_mysql), or found in a MySQL
+# Server installation. The same rule as the Tauri edition's resolve_tool_for.
+#
+# The bin folders of MySQL Server installations under $Bases, newest version first.
+function Get-MysqlServerBinDirs { param([string[]]$Bases)
+    $found = foreach ($b in @($Bases)) {
+        if (-not $b) { continue }
+        $m = Join-Path $b 'MySQL'
+        if (-not (Test-Path -LiteralPath $m)) { continue }
+        foreach ($d in (Get-ChildItem -LiteralPath $m -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.Name -notmatch '^(?i)MySQL Server\s*(.*)$') { continue }
+            $v = [version]'0.0'; [void][version]::TryParse(($Matches[1] -replace '[^\d\.]', ''), [ref]$v)
+            [pscustomobject]@{ Ver = $v; Dir = (Join-Path $d.FullName 'bin') }
+        }
+    }
+    return @($found | Sort-Object -Property @{ Expression = 'Ver'; Descending = $true }, Dir | ForEach-Object { $_.Dir })
+}
+# The tool to use for a MySQL server, with where it came from, or $null for "the default pair".
+function Get-MysqlFlavorTool { param([string]$Base)
+    $cfg = Load-Cfg
+    $key = "$($Base)_bin_mysql"
+    if ($cfg -and $cfg.$key -and (Test-Path -LiteralPath ([string]$cfg.$key))) { return @{ Path = [string]$cfg.$key; Source = 'Saved configuration' } }
+    foreach ($d in (Get-MysqlServerBinDirs @($env:ProgramFiles, ${env:ProgramFiles(x86)}))) {
+        $f = Join-Path $d "$Base.exe"
+        if (Test-Path -LiteralPath $f) { return @{ Path = $f; Source = "Found in $(Split-Path -Parent $d)" } }
+    }
+    return $null
+}
+# $true for MariaDB, $false for MySQL, $null if the server could not be asked.
+function Get-ServerIsMariaDB { param($conn)
+    $v = Run-Query2 $conn 'SELECT VERSION()' $null $null
+    if (-not $v.ok -or @($v.rows).Count -eq 0) { return $null }
+    return ([string]$v.rows[0][0]) -match 'MariaDB'
+}
+# Only a server known to be MySQL switches; MariaDB, or a server that could not be asked, keeps
+# the default pair - which is also the fallback when there are no MySQL tools.
+function Select-Tool { param($ServerIsMariaDB, $MysqlTool, $Default)
+    if ($ServerIsMariaDB -is [bool] -and -not $ServerIsMariaDB -and $MysqlTool) { return $MysqlTool }
+    return $Default
+}
+function Get-ToolFor { param($conn, [string]$Base)
+    $default = if ($Base -eq 'mysqldump') { [string]$script:MysqldumpPath } else { [string]$script:MysqlPath }
+    $maria = Get-ServerIsMariaDB $conn
+    $my = $null
+    if ($maria -is [bool] -and -not $maria) { $t = Get-MysqlFlavorTool $Base; if ($t) { $my = $t.Path } }
+    return Select-Tool $maria $my $default
+}
+
 # Tables with a generated column in the given databases - only when the dump tool is MariaDB's and
 # the server is MySQL (MariaDB's tool understands MariaDB's own generated columns). Empty when the
 # check cannot be made, so the export goes ahead as before.
-function Get-MySqlGeneratedTables { param($conn, $dbs, $excl)
-    if (-not (Test-DumpIsMariaDB)) { return @() }
+function Get-MySqlGeneratedTables { param($conn, $dbs, $excl, [string]$Dump)
+    if (-not (Test-DumpIsMariaDB $Dump)) { return @() }
     $v = Run-Query2 $conn 'SELECT VERSION()' $null $null
     if (-not $v.ok -or ([string]$v.rows[0][0]) -match 'MariaDB') { return @() }
     $list = (@($dbs) | ForEach-Object { SqlLit $_ }) -join ','
@@ -1354,14 +1425,15 @@ function Get-MySqlGeneratedTables { param($conn, $dbs, $excl)
     return @($r.rows | ForEach-Object { "$($_[0]).$($_[1])" } | Where-Object { -not $excl.ContainsKey($_) })
 }
 function Api-Export { param($conn,$data)
-    if(-not $script:MysqldumpPath -or -not (Test-Path $script:MysqldumpPath)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
+    $dump = Get-ToolFor $conn 'mysqldump'
+    if(-not $dump -or -not (Test-Path $dump)){ return '{"ok":false,"error":"mysqldump.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
     $dbs=@($data.dbs); if($dbs.Count -eq 0){ return '{"ok":false,"error":"No databases selected."}' }
     $jobId=[string]$data.jobId
     $job=[pscustomobject]@{ Cancelled=$false; CurrentProcess=$null }
     if($jobId){ $script:RunningJobs[$jobId]=$job }
     $folder=[string]$data.folder
     if(-not (Test-Path $folder)){ try { New-Item -ItemType Directory -Path $folder -Force|Out-Null } catch { return '{"ok":false,"error":'+(J-Str ("Cannot create folder: "+$_.Exception.Message))+'}' } }
-    $o=$data.options; $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
+    $o=$data.options; $cnf=New-Cnf $conn -Tool $dump; $log=New-Object System.Collections.ArrayList
     $excl=@{}; if($data.excludes){ foreach($e in @($data.excludes)){ $excl[[string]$e]=$true } }
     # mode: 'table' (one file per table, the default), 'db' (one file per database), 'single' (one combined file)
     $mode=[string]$data.mode; if(-not $mode){ if($data.single){$mode='single'}else{$mode='table'} }
@@ -1371,7 +1443,7 @@ function Api-Export { param($conn,$data)
         # specified for generated column ... is not allowed"). MySQL's own mysqldump leaves those
         # columns out. Measured on MySQL 8.0.46: the export reported OK and the file could not be
         # restored. A backup that looks fine and is not is worse than none, so refuse up front.
-        $genTables = Get-MySqlGeneratedTables $conn $dbs $excl
+        $genTables = Get-MySqlGeneratedTables $conn $dbs $excl $dump
         if ($genTables.Count -gt 0) {
             return '{"ok":false,"error":'+(J-Str ("Not exported: $($genTables.Count) table(s) on this MySQL server have generated columns ($($genTables -join ', ')). The MariaDB dump tool writes values into those columns, which MySQL refuses when the file is restored - the dump would not restore. In Settings, point mysqldump at MySQL's own mysqldump.exe (for example C:\Program Files\MySQL\MySQL Server 8.0\bin\mysqldump.exe), or exclude those tables."))+'}'
         }
@@ -1401,7 +1473,7 @@ function Api-Export { param($conn,$data)
             if(-not $o.createdb){$a+='--no-create-db'}
             foreach($k in $excl.Keys){ $a+=("--ignore-table="+$k) }
             $a+=$dbs; $a+="--result-file=$file"
-            $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+            $r=Run-Proc $dump $a $null $jobId
             if($job.Cancelled){
                 if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                 [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
@@ -1419,7 +1491,7 @@ function Api-Export { param($conn,$data)
                 if(-not $o.createdb){$a+='--no-create-db'}
                 foreach($k in $excl.Keys){ if($k -like ($d+'.*')){ $a+=("--ignore-table="+$k) } }
                 $a+=$d; $a+="--result-file=$file"
-                $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                $r=Run-Proc $dump $a $null $jobId
                 if($job.Cancelled){
                     if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                     [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
@@ -1444,7 +1516,7 @@ function Api-Export { param($conn,$data)
                     $a=@()+$common
                     if($o.adddroptb){$a+='--add-drop-table'}else{$a+='--skip-add-drop-table'}
                     $a+=@($d,$t); $a+="--result-file=$file"
-                    $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                    $r=Run-Proc $dump $a $null $jobId
                     if($job.Cancelled){
                         if(Test-Path $file){ try{ Rename-Item $file ($file+'.partial') -Force }catch{} }
                         [void]$log.Add("CANCELLED (partial file kept as $([IO.Path]::GetFileName($file)).partial)")
@@ -1459,7 +1531,7 @@ function Api-Export { param($conn,$data)
                     $a=@()+$common+@('--no-create-info','--no-data','--no-create-db','--skip-triggers')
                     if($o.routines){$a+='--routines'}; if($o.events){$a+='--events'}
                     $a+=$d; $a+="--result-file=$file"
-                    $r=Run-Proc $script:MysqldumpPath $a $null $jobId
+                    $r=Run-Proc $dump $a $null $jobId
                     # Cancelling kills mysqldump, which comes back as exit -1 with nothing on
                     # stderr. Without this check that fell through to the generic FAILED branch
                     # below and logged "FAILED (-1) <db> routines/events : " - a failure with no
@@ -1835,7 +1907,9 @@ function Get-DumpPlan { param([string[]]$Names, [string]$Target)
 
 function Api-Import { param($conn,$data)
     $files=@($data.files); if($files.Count -eq 0){ return '{"ok":false,"error":"No files."}' }
-    $cnf=New-Cnf $conn; $log=New-Object System.Collections.ArrayList
+    $mysql = Get-ToolFor $conn 'mysql'
+    if(-not $mysql -or -not (Test-Path $mysql)){ return '{"ok":false,"error":"mysql.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
+    $cnf=New-Cnf $conn -Tool $mysql; $log=New-Object System.Collections.ArrayList
     # Statements mysql skipped because --force ("Continue on error") was in effect. Counted and
     # reported back so a failed restore cannot quietly present itself as a screen full of OK
     # lines - see the per-file logging below.
@@ -1845,7 +1919,7 @@ function Api-Import { param($conn,$data)
     if($jobId){ $script:RunningJobs[$jobId]=$job }
     try {
         $target=[string]$data.targetDb
-        if($target -and $data.createDb){ $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-e",('CREATE DATABASE IF NOT EXISTS '+(SqlId $target))); [void]$log.Add($(if($r.exit -eq 0){"Ensured database $target"}else{"Create DB failed: "+(FirstErr $r.err)})) }
+        if($target -and $data.createDb){ $r=Run-Proc $mysql @("--defaults-extra-file=$cnf","-e",('CREATE DATABASE IF NOT EXISTS '+(SqlId $target))); [void]$log.Add($(if($r.exit -eq 0){"Ensured database $target"}else{"Create DB failed: "+(FirstErr $r.err)})) }
         foreach($f in $files){
             if($job.Cancelled){ [void]$log.Add("CANCELLED (remaining files skipped)"); break }
             if(-not (Test-Path $f)){ [void]$log.Add("SKIP (missing): $f"); continue }
@@ -1862,12 +1936,12 @@ function Api-Import { param($conn,$data)
             if ($plan.Kind -eq 'Refuse') { [void]$log.Add("SKIPPED $short : "+$plan.Why); continue }
             $rename = $null
             if ($plan.Kind -eq 'Rename') { $rename = @{ From = $plan.From; To = $target }; [void]$log.Add("$short holds database '$($plan.From)' - restoring it into '$target' instead") }
-            $r=Run-Stdin $script:MysqlPath $a $null $f $jobId -Rename $rename
+            $r=Run-Stdin $mysql $a $null $f $jobId -Rename $rename
             if($job.Cancelled){ [void]$log.Add("CANCELLED"); break }
             $autoRetried = $false
             if ($r.exit -ne 0 -and -not $binMode -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
                 $a2=@("--defaults-extra-file=$cnf","--binary-mode"); if($data.force){$a2+='--force'}; if($maxPacket){$a2+="--max-allowed-packet=$maxPacket"}; if($data.fkOff){$a2+='--init-command=SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0'}; if($target){$a2+=$target}
-                $r=Run-Stdin $script:MysqlPath $a2 $null $f $jobId -Rename $rename
+                $r=Run-Stdin $mysql $a2 $null $f $jobId -Rename $rename
                 $autoRetried = $true
             }
             $retryNote = $(if($autoRetried){" (auto-retried with --binary-mode)"}else{""})
@@ -2141,7 +2215,20 @@ function Api-ToolsStatus {
     if($script:MysqldumpPath){
         try { $ver = & $script:MysqldumpPath --version 2>$null; if($ver -match '(?i)mariadb'){ $dumpIsMariaDb='true' } else { $dumpIsMariaDb='false' } } catch {}
     }
-    '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"mysqldump_is_mariadb":'+$dumpIsMariaDb+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
+    $myM = Get-MysqlFlavorTool 'mysql'; $myD = Get-MysqlFlavorTool 'mysqldump'
+    $forMysql = ',"mysql_for_mysql":'+(J-Str $myM.Path)+',"mysql_for_mysql_source":'+(J-Str $myM.Source)+',"mysqldump_for_mysql":'+(J-Str $myD.Path)+',"mysqldump_for_mysql_source":'+(J-Str $myD.Source)
+    '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"mysqldump_is_mariadb":'+$dumpIsMariaDb+$forMysql+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
+}
+# Endpoint: the tools export and import will use for the CONNECTED server, and whether that
+# mysqldump is MariaDB's - the export dialog greys out the options only MySQL's understands.
+function Api-ToolsForConn { param($conn)
+    $maria = Get-ServerIsMariaDB $conn
+    $m = Get-ToolFor $conn 'mysql'
+    $d = Get-ToolFor $conn 'mysqldump'
+    $dm = 'null'
+    if ($d -and (Test-Path $d)) { $dm = $(if (Test-DumpIsMariaDB $d) { 'true' } else { 'false' }) }
+    $sm = if ($maria -is [bool]) { $maria.ToString().ToLower() } else { 'null' }
+    '{"ok":true,"serverIsMariadb":'+$sm+',"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysqldumpIsMariadb":'+$dm+'}'
 }
 # Endpoint: return the current tool paths / config for the Settings dialog.
 function Api-GetConfig {
@@ -2149,7 +2236,9 @@ function Api-GetConfig {
     $mb = if($cfg -and $cfg.mysql_bin){[string]$cfg.mysql_bin}else{''}
     $db = if($cfg -and $cfg.mysqldump_bin){[string]$cfg.mysqldump_bin}else{''}
     $tpl = if($cfg -and $cfg.mariadb_download_url_template){[string]$cfg.mariadb_download_url_template}else{''}
-    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+',"mariadb_download_url_template":'+(J-Str $tpl)+'},"mariadbDownloadUrlDefault":'+(J-Str $script:DefaultMariaDbUrlTemplate)+'}'
+    $mbm = if($cfg -and $cfg.mysql_bin_mysql){[string]$cfg.mysql_bin_mysql}else{''}
+    $dbm = if($cfg -and $cfg.mysqldump_bin_mysql){[string]$cfg.mysqldump_bin_mysql}else{''}
+    '{"ok":true,"config":{"mysql_bin":'+(J-Str $mb)+',"mysqldump_bin":'+(J-Str $db)+',"mysql_bin_mysql":'+(J-Str $mbm)+',"mysqldump_bin_mysql":'+(J-Str $dbm)+',"mariadb_download_url_template":'+(J-Str $tpl)+'},"mariadbDownloadUrlDefault":'+(J-Str $script:DefaultMariaDbUrlTemplate)+'}'
 }
 # Endpoint: save tool paths from the Settings dialog.
 function Api-SaveConfig { param($data)
@@ -2158,7 +2247,7 @@ function Api-SaveConfig { param($data)
     # dialog saves all three together, but the Download button saves only the URL template, and
     # rebuilding from scratch would blank the tool paths it never sent.
     if($data.config){
-        foreach($k in @('mysql_bin','mysqldump_bin','mariadb_download_url_template')){
+        foreach($k in @('mysql_bin','mysqldump_bin','mysql_bin_mysql','mysqldump_bin_mysql','mariadb_download_url_template')){
             $prop = $data.config.PSObject.Properties[$k]
             if($prop){ $cfg | Add-Member -NotePropertyName $k -NotePropertyValue ([string]$prop.Value) -Force }
         }
@@ -3349,8 +3438,13 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div id="cfgStatus" style="background:var(--panel2);border:1px solid var(--bd);border-radius:6px;padding:8px 12px;font-size:12px"></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">PATHS</div>
  <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Auto-detection checks, in order: saved configuration &rarr; MYSQL_BIN / MYSQLDUMP_BIN environment variable &rarr; common install folders (Program Files\MariaDB*, Program Files\MySQL*, WAMP, XAMPP) &rarr; system PATH.</div>
+ <div style="font-size:12px;font-weight:600;margin:4px 0 2px">Default <span class="muted" style="font-weight:400">- MariaDB servers, and MySQL servers when there are no MySQL tools</span></div>
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysql" style="flex:1" placeholder="full path to mysql.exe (or mariadb.exe)"><button onclick="browse({title:'Select mysql.exe / mariadb.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysql').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
+ <div style="font-size:12px;font-weight:600;margin:10px 0 2px">MySQL servers <span class="muted" style="font-weight:400">- optional</span></div>
+ <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Export and Import use MySQL's own tools for a MySQL server: these two paths, or else the newest MySQL Server installation (Program Files\MySQL\MySQL Server *\bin). MariaDB's mysqldump cannot make a restorable dump of a MySQL table with generated columns, and only MySQL's client checks a CA without the host name. Leave empty to detect automatically.</div>
+ <div class="row"><span style="width:92px">mysql</span><input id="cfgMysqlMy" style="flex:1" placeholder="MySQL's mysql.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysql.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysqlMy').value=pp})">Browse...</button></div>
+ <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDumpMy" style="flex:1" placeholder="MySQL's mysqldump.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysqldump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDumpMy').value=pp})">Browse...</button></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
  <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB)</span></div>
  <div class="row" style="margin-top:6px"><span style="width:92px">Download URL</span><input id="cfgDownloadUrl" style="flex:1;font-family:Consolas,monospace;font-size:11px" placeholder="https://mirror.mariadb.org/mariadb-{version}/winx64-packages/{file_name}"><button onclick="resetDownloadUrl()" title="Reset to the built-in default">Reset</button></div>
@@ -3765,7 +3859,7 @@ if(localStorage.getItem('theme')!=='light')document.body.classList.add('dark');
 // context menu
 function _clearKeys(includeAll){const keys=[];for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(!k)continue;if(k.indexOf('overviewCache')===0||k.indexOf('tableSizes')===0){keys.push(k);}else if(includeAll&&['session','history','connmeta','accents','theme'].indexOf(k)>=0){keys.push(k);}}keys.forEach(k=>localStorage.removeItem(k));return keys.length;}
 async function clearAllData(){if(!(await ask('Clear ALL app data?\n\nThis permanently deletes:\n\u2022 saved connections (host / user / password)\n\u2022 the query library\n\u2022 caches, accent colors, environment labels, history and session tabs.\n\nThis cannot be undone.')))return;const n=_clearKeys(true);try{await api('/api/conn-clear');}catch(e){}try{await api('/api/lib-clear');}catch(e){}log('Cleared '+n+' local entr'+(n===1?'y':'ies')+' + saved connections + library. Reloading...');setTimeout(()=>location.reload(),500);}
-async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}show('mSettings');refreshToolsStatus();}
+async function openSettings(){$('cfgLog').textContent='';try{const r=await api('/api/get-config');const c=(r&&r.config)||{};$('cfgMysql').value=c.mysql_bin||'';$('cfgDump').value=c.mysqldump_bin||'';$('cfgMysqlMy').value=c.mysql_bin_mysql||'';$('cfgDumpMy').value=c.mysqldump_bin_mysql||'';window._mariadbDownloadUrlDefault=(r&&r.mariadbDownloadUrlDefault)||'';$('cfgDownloadUrl').value=c.mariadb_download_url_template||window._mariadbDownloadUrlDefault;}catch(e){}show('mSettings');refreshToolsStatus();}
 // Export and Import shell out to mysql.exe / mysqldump.exe. When the backend reports one
 // missing, the bare error leaves the user stuck - it names PATH and an environment variable but
 // not the dialog that actually fixes it - so pair it with a button that opens Settings, where the
@@ -3791,12 +3885,14 @@ function showToolError(logId,ownerModalId,msg){
 // api() treats any failed call as the server being gone - it calls showDead(), which would throw
 // a false "server down" overlay over the app just for opening the About box.
 function openAbout(){ show('mAbout'); }
-async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src)=>{const ok=path&&path!=='(not found)';return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};el.innerHTML=row('mysql',r.mysql,r.mysql_source)+row('mysqldump',r.mysqldump,r.mysqldump_source);
+async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src)=>{const ok=path&&path!=='(not found)';return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};const myRow=(name,path,src)=>'<div style="margin:2px 0"><b>'+name+':</b> '+(path?'<span style="font-family:Consolas,monospace">'+esc(path)+'</span> <span style="color:#3fb950">&#10003;</span><div class="muted" style="font-size:11px;margin-left:2px">'+esc(src||'')+'</div>':'<span class="muted">none - the default above is used</span>')+'</div>';
+ el.innerHTML=row('mysql',r.mysql,r.mysql_source)+row('mysqldump',r.mysqldump,r.mysqldump_source)
+  +'<div class="muted" style="font-size:11px;margin-top:6px">For MySQL servers:</div>'+myRow('mysql',r.mysql_for_mysql,r.mysql_for_mysql_source)+myRow('mysqldump',r.mysqldump_for_mysql,r.mysqldump_for_mysql_source);
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
  const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}
 function resetDownloadUrl(){$('cfgDownloadUrl').value=window._mariadbDownloadUrlDefault||'';}
-async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
+async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mysql_bin_mysql:$('cfgMysqlMy').value.trim(),mysqldump_bin_mysql:$('cfgDumpMy').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
 async function downloadTools(){try{await api('/api/save-config',{config:{mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});}catch(e){}$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
 let _inpResolve=null;
 function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').textContent=opts.title||'Input';const box=$('inpFields');box.innerHTML='';
@@ -6861,8 +6957,12 @@ const MYSQL_ONLY_EXPOPTS={
  colstats:'column-statistics is MySQL 8+ only - not supported by MariaDB\u2019s mysqldump.'
 };
 async function expApplyDumpFlavor(){
- let r; try{ r=await api('/api/tools-status'); }catch(e){ return; }
- const isMariaDb=!!(r&&r.ok&&r.mysqldump_is_mariadb===true);
+ // The dump tool depends on the server (MySQL's own for a MySQL server, when there is one), so
+ // ask for the connected one; the global status is the fallback for a backend that cannot say.
+ let r=null; try{ r=await api('/api/tools-for-conn'); }catch(e){}
+ let isMariaDb;
+ if(r&&r.ok&&r.mysqldumpIsMariadb!=null){ isMariaDb=r.mysqldumpIsMariadb===true; }
+ else{ try{ r=await api('/api/tools-status'); }catch(e){ return; } isMariaDb=!!(r&&r.ok&&r.mysqldump_is_mariadb===true); }
  Object.keys(MYSQL_ONLY_EXPOPTS).forEach(k=>{
   const el=$('eo_'+k); if(!el)return;
   const lbl=el.closest('label');
@@ -7729,6 +7829,7 @@ $RequestHandler = {
 				'/api/search-all-schemas' { Send-Json $client (Api-SearchAllSchemas $conn $data.term) }
                 '/api/browse'      { Send-Json $client (Api-Browse $data) }
                 '/api/tools-status'   { Send-Json $client (Api-ToolsStatus) }
+                '/api/tools-for-conn' { Send-Json $client (Api-ToolsForConn $conn) }
                 '/api/get-config'     { Send-Json $client (Api-GetConfig) }
                 '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
                 '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
