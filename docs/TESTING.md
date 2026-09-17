@@ -19,6 +19,7 @@ pwsh -NoProfile -File tests/UserSql.Tests.ps1            ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ViewIndices.Tests.ps1        ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/ToolChoice.Tests.ps1         ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/UpdateCheck.Tests.ps1        ./NOBSSQL.ps1
+pwsh -NoProfile -File tests/TableBinding.Tests.ps1       ./NOBSSQL.ps1
 pwsh -NoProfile -File tests/Live.Tests.ps1               ./NOBSSQL.ps1
 ```
 
@@ -33,14 +34,15 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `PluginDir` | where the client looks for its authentication plugins | nothing |
 | `BatchFailureNote` | what a failed batch may honestly claim about rollback | nothing |
 | `DumpTarget` | restoring a dump into a chosen target database, not the one it came from | nothing |
-| `ResultRows` | reading rows out of `mysql --xml` output, captured from both clients: NULL vs the text `'NULL'`, CR/LF, binary, empty results | nothing |
+| `ResultRows` | reading rows out of `mysql --xml` output, captured from both clients: NULL vs the text `'NULL'`, CR/LF, binary, empty results; putting back text values holding a NUL in a table grid | nothing |
 | `UiParses` | that every inline `<script>` in the page parses | `node` on PATH |
 | `ConnSslCa` | that every save and load of a connection carries its CA certificate | `node` on PATH |
 | `TableDesigner` | that editing a column keeps everything the designer does not show | `node` on PATH |
 | `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
-| `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
+| `UserSql` | the SQL the Users dialog and the grid build client-side, including the table grid query that reads text holding a NUL exactly | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `UpdateCheck` | the new-version notice: shown when newer, quiet when hidden, switched off or offline | `node` on PATH |
+| `TableBinding` | which database and table a result grid saves to (after a leading `USE`, or with another schema selected), and control characters shown in text | `node` on PATH |
 | `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page and a tool's version, release version comparison, and that every script-level value a request reads reaches the request threads | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
@@ -49,7 +51,7 @@ cannot lift their subject out with the PowerShell AST. They extract it by brace-
 under `node`, which the `windows-latest` CI image already ships. If `node` is missing they **fail**
 rather than skipping.
 
-`ConnSslCa`, `TableDesigner`, `DdlRecreate` and `UpdateCheck` embed the very same test files the Tauri edition
+`ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck` and `TableBinding` embed the very same test files the Tauri edition
 runs (`tests/ui/*.test.mjs` in NOBS-SQL-Editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 

@@ -750,6 +750,27 @@ function Run-Query2 {
 #  server loop, or a Cancel-triggered kill) clears it, via Close-QueryCursorProc.
 # ============================================================================
 
+# A table grid's query also asks for every text column of its table as hex, in columns named
+# __nobs_exact_0, _1, ... after the ones shown, wherever the value holds a NUL - which XML output
+# turns into a space (see exactTextQuery in the UI). $ExactText names those text columns in order.
+# Returns how many columns are shown, and for each text column the shown columns carrying its name;
+# or err when the result does not end in exactly those columns.
+function Get-ExactTextMap { param([string[]]$Names, [string[]]$ExactText)
+    $n = $ExactText.Count
+    $keep = $Names.Count - $n
+    if ($keep -lt 1) { return @{ err = 'The table query came back with fewer columns than it asked for.' } }
+    for ($i = 0; $i -lt $n; $i++) {
+        if ($Names[$keep + $i] -cne "__nobs_exact_$i") { return @{ err = "The table query came back without its column __nobs_exact_$i." } }
+    }
+    $targets = New-Object 'int[][]' $n
+    for ($i = 0; $i -lt $n; $i++) {
+        $l = New-Object 'System.Collections.Generic.List[int]'
+        for ($j = 0; $j -lt $keep; $j++) { if ([string]::Equals($Names[$j], $ExactText[$i], [StringComparison]::OrdinalIgnoreCase)) { $l.Add($j) } }
+        $targets[$i] = $l.ToArray()
+    }
+    return @{ keep = $keep; targets = $targets; names = @($Names[0..($keep - 1)]) }
+}
+
 # Reads up to $PageSize more data rows from a cursor's stream. NobsXmlRows reads one row past the
 # page and holds on to it, which is how hasMore is known without waiting on a row that may never
 # come. A result that cannot be parsed ends the page and is reported via ParseError.
@@ -794,7 +815,7 @@ function Close-QueryCursorProc {
 # and the still-open process/reader is registered in $script:OpenCursors for
 # Api-FetchCursorBatch to continue from.
 function Open-QueryCursor {
-    param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
+    param($conn,$sql,$db,$RequestId,[int]$PageSize=1000,[string[]]$ExactText)
     if ($PageSize -lt 1) { $PageSize = 1000 }
     Initialize-DumpDb
     $my = Get-Mysql $conn
@@ -821,9 +842,19 @@ function Open-QueryCursor {
         Process=$p; Reader=$p.StandardOutput; Rows=(New-Object NobsXmlRows $p.StandardOutput)
         ErrTask=$p.StandardError.ReadToEndAsync(); Entry=$entry; ParseError=$null
         Headers=$null; RequestId=$RequestId; Cnf=$cnf; SqlFile=$sqlArg.file
-        LastUsed=[DateTime]::UtcNow; Lock=[object]::new()
+        LastUsed=[DateTime]::UtcNow; Lock=[object]::new(); ExactMap=$null
     }
     $page = Read-CursorRows $cursor $PageSize
+    if ($ExactText.Count -gt 0 -and $cursor.Rows.Names.Count -gt 0) {
+        $cursor.ExactMap = Get-ExactTextMap @($cursor.Rows.Names) $ExactText
+        if ($cursor.ExactMap.err) {
+            try { if (-not $p.HasExited) { $p.Kill() } } catch {}
+            $null = Close-QueryCursorProc $cursor
+            return @{ ok=$false; err=$cursor.ExactMap.err }
+        }
+        $page.rows = [NobsXmlRows]::Exact($page.rows, $cursor.ExactMap.keep, $cursor.ExactMap.targets)
+    }
+    $shownNames = if ($cursor.ExactMap) { $cursor.ExactMap.names } else { @($cursor.Rows.Names) }
     if (-not $page.hasMore) {
         $r = Close-QueryCursorProc $cursor
         if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled.'; cancelled=$true } }
@@ -834,12 +865,17 @@ function Open-QueryCursor {
         if ($cursor.ParseError) { return @{ ok=$false; err=$cursor.ParseError } }
         # No result set at all: a statement that returns none.
         if (-not $cursor.Rows.HasResultSet) { return @{ ok=$true; columns=@(); rows=$page.rows; hasMore=$false } }
-        if ($page.rows.Count -gt 0) { return @{ ok=$true; columns=@($cursor.Rows.Names); rows=$page.rows; hasMore=$false } }
+        if ($page.rows.Count -gt 0) { return @{ ok=$true; columns=@($shownNames); rows=$page.rows; hasMore=$false } }
         $h = Get-ResultHeaders $conn $sql $db
         if ($null -eq $h) { return @{ ok=$true; columns=@(); rows=$page.rows; hasMore=$false; note=$script:NoHeadersNote } }
+        if ($ExactText.Count -gt 0) {
+            $m = Get-ExactTextMap $h $ExactText
+            if ($m.err) { return @{ ok=$false; err=$m.err } }
+            $h = $m.names
+        }
         return @{ ok=$true; columns=$h; rows=$page.rows; hasMore=$false }
     }
-    $cursor.Headers = @($cursor.Rows.Names)
+    $cursor.Headers = @($shownNames)
     $cursorId = [guid]::NewGuid().ToString()
     $script:OpenCursors[$cursorId] = $cursor
     return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$true; cursorId=$cursorId }
@@ -1270,11 +1306,11 @@ function Api-RowOp { param($conn,$data)
 # as-is: no LIMIT/OFFSET rewriting, no detection of whether it already has a LIMIT. If more rows
 # remain than fit in one page, the response carries hasMore:true and a cursorId for
 # Api-FetchCursorBatch to continue from; otherwise the cursor is already closed server-side.
-function Api-Query { param($conn,$sql,$db,$RequestId,$PageSize)
+function Api-Query { param($conn,$sql,$db,$RequestId,$PageSize,[string[]]$ExactText)
     if(-not $sql -or -not ([string]$sql).Trim()){ return '{"ok":false,"error":"Empty query."}' }
     $ps=[int]$PageSize; if($ps -lt 1){ $ps=1000 }
     $sw=[System.Diagnostics.Stopwatch]::StartNew()
-    $r=Open-QueryCursor $conn $sql $db $RequestId $ps
+    $r=Open-QueryCursor $conn $sql $db $RequestId $ps -ExactText $ExactText
     $sw.Stop()
     if(-not $r.ok){
         if($r.cancelled){ return '{"ok":false,"error":'+(J-Str $r.err)+',"cancelled":true}' }
@@ -1301,6 +1337,7 @@ function Api-FetchCursorBatch { param($data)
     try {
         $cursor.LastUsed = [DateTime]::UtcNow
         $page = Read-CursorRows $cursor $ps
+        if ($cursor.ExactMap) { $page.rows = [NobsXmlRows]::Exact($page.rows, $cursor.ExactMap.keep, $cursor.ExactMap.targets) }
         if (-not $page.hasMore) {
             $null = $script:OpenCursors.TryRemove($cid, [ref]$null)
             $r = Close-QueryCursorProc $cursor
@@ -1858,6 +1895,29 @@ public sealed class NobsXmlRows {
         return list;
     }
     public List<string[]> All() { return Page(int.MaxValue); }
+    // A grid query that also asked for each text column as hex wherever it holds a NUL (see
+    // Get-ExactTextMap): drops those hex columns and puts each exact value back in place of the
+    // one in which XML turned the NUL into a space. targets[i] lists the shown columns named after
+    // text column i. A value is replaced only where it is that value with its NULs shown as spaces,
+    // so an expression that merely shares the column's name keeps its own value.
+    public static List<string[]> Exact(List<string[]> rows, int keep, int[][] targets) {
+        var result = new List<string[]>(rows.Count);
+        foreach (var row in rows) {
+            var o = new string[keep];
+            Array.Copy(row, o, Math.Min(keep, row.Length));
+            for (int i = 0; i < targets.Length && keep + i < row.Length; i++) {
+                string hex = row[keep + i];
+                if (hex == null) continue;
+                var b = new byte[hex.Length / 2];
+                for (int k = 0; k < b.Length; k++) b[k] = Convert.ToByte(hex.Substring(k * 2, 2), 16);
+                string exact = Encoding.UTF8.GetString(b);
+                string shown = exact.Replace('\0', ' ');
+                foreach (int j in targets[i]) if (o[j] == shown) o[j] = exact;
+            }
+            result.Add(o);
+        }
+        return result;
+    }
 }
 public static class NobsDumpDb {
     static bool Kw(byte[] l, int n, ref int i, string w) {
@@ -3780,7 +3840,25 @@ function toast(msg,kind){
 function showDead(){const d=$('deadOverlay');if(d)d.style.display='flex';}
 function hideDead(){const d=$('deadOverlay');if(d)d.style.display='none';}
 // --- api(): the ONE way the UI talks to the server. Adds token + connection + read-only flag, returns parsed JSON, and shows the 'server down' overlay on failure.
-async function api(path,p,signal){p=p||{};p.token=TOKEN;
+// /api/query answers with its first 1000 rows and a cursor for the rest, which the grid reads as
+// you scroll. Every other caller wants the whole result, and got only that first page: in the
+// PowerShell edition exporting a table from the tree left out every row past 1000 without a word, and
+// lists such as a schema's tables or its column names for autocomplete stopped at 1000 in both.
+// Only the grid passes pageSize; for everyone else the remaining rows are read here.
+async function api(path,p,signal){
+ const r=await apiCall(path,p,signal);
+ if(path!=='/api/query'||!p||p.pageSize!=null||!r||!r.ok||!r.hasMore||!r.cursorId)return r;
+ // The desktop backend does not repeat cursorId in a fetch answer; the id stays the same.
+ const rows=r.rows,cid=r.cursorId;let cur=r;
+ while(cur.hasMore){
+  cur=await apiCall('/api/fetch-cursor-batch',{cursorId:cid,requestId:p.requestId,pageSize:5000},signal);
+  if(!cur||!cur.ok){apiCall('/api/close-cursor',{cursorId:cid});return cur||{ok:false,error:'Reading the rest of the result failed.'};}
+  for(const x of cur.rows)rows.push(x);
+ }
+ r.rows=rows;r.hasMore=false;delete r.cursorId;
+ return r;
+}
+async function apiCall(path,p,signal){p=p||{};p.token=TOKEN;
  // Every call goes to the server you are actually CONNECTED to, never to whatever profile happens
  // to be loaded in the form - so the connection is filled in here rather than trusted from the
  // caller. conn-save is the one exception, because its conn is not a server to talk to at all:
@@ -3996,7 +4074,7 @@ async function gridBinCols(id){
  const t=T(id);if(!t||!t.cols)return null;
  if(t.binCols&&t.binCols.length===t.cols.length)return t.binCols.map(Boolean);
  if(!t.table)return null;
- return tableBinCols(dbOf(t),t.table,t.cols);
+ return tableBinCols(t.db,t.table,t.cols);
 }
 // lit() decides from the value's shape, which is wrong both ways for row data: a text cell holding
 // 0x41 was written as the byte A, and an empty binary value - shown as the bare 0x - as the two
@@ -4012,15 +4090,53 @@ function litAs(v,bin){
 // This edition reads results from mysql.exe's XML output, which writes a NUL byte inside a text
 // value as a space. An export built from such a grid would carry the space, so exports of a table
 // check for it first and send the user to the Export tool (mysqldump), which copies bytes exactly.
+async function tableTextCols(db,table){
+ const r=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)+" AND DATA_TYPE IN ('char','varchar','tinytext','text','mediumtext','longtext') ORDER BY ORDINAL_POSITION"});
+ return r.ok?r.rows.map(x=>x[0]):null;
+}
+const nulIn=c=>"LOCATE(0x00,CAST(CONVERT("+qid(c)+" USING utf8mb4) AS BINARY))>0";
 async function tableNulTextCount(db,table){
  try{
-  const r=await api('/api/query',{sql:"SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)+" AND DATA_TYPE IN ('char','varchar','tinytext','text','mediumtext','longtext')"});
-  if(!r.ok)return null;
-  if(!r.rows.length)return 0;
-  const cond=r.rows.map(x=>"LOCATE(0x00,CAST(CONVERT("+qid(x[0])+" USING utf8mb4) AS BINARY))>0").join(' OR ');
+  const cols=await tableTextCols(db,table);
+  if(!cols)return null;
+  if(!cols.length)return 0;
+  const cond=cols.map(nulIn).join(' OR ');
   const c=await api('/api/query',{sql:'SELECT COUNT(*) FROM '+qid(db)+'.'+qid(table)+' WHERE '+cond});
   return c.ok&&c.rows.length?+c.rows[0][0]:null;
  }catch(e){return null;}
+}
+// Where the top-level FROM of a SELECT starts, skipping strings, quoted names, comments and
+// anything in parentheses; -1 if there is none.
+function topLevelFromAt(sql){
+ const s=String(sql);let depth=0;
+ for(let i=0;i<s.length;i++){
+  const c=s[i];
+  if(c==="'"||c==='"'||c==='`'){const q=c;i++;while(i<s.length){if(s[i]==='\\'&&q!=='`'){i+=2;continue;}if(s[i]===q){if(s[i+1]===q){i+=2;continue;}break;}i++;}continue;}
+  if(c==='#'||(c==='-'&&s[i+1]==='-'&&(i+2>=s.length||/\s/.test(s[i+2])))){const nl=s.indexOf('\n',i);if(nl<0)return -1;i=nl;continue;}
+  if(c==='/'&&s[i+1]==='*'){const e=s.indexOf('*/',i+2);if(e<0)return -1;i=e+1;continue;}
+  if(c==='(')depth++;
+  else if(c===')')depth--;
+  else if(depth===0&&(c==='f'||c==='F')&&/^from\b/i.test(s.slice(i,i+5))&&(i===0||!/[\w$]/.test(s[i-1])))return i;
+ }
+ return -1;
+}
+// This edition reads results from mysql.exe's XML output, which writes a NUL inside a text value as
+// a space. A table grid is what edits are made from - a key shown that way made Apply's WHERE match
+// a different row, one whose key really has a space there - so its query also asks for every text
+// column of the table as hex wherever the value holds a NUL, and the server puts the exact value
+// back (Get-ExactTextMap). q is the SQL to send, ending with lastStmt. Returns the SQL to send and
+// the text columns asked for, or null when that cannot be done - the grid is then not exact.
+async function exactTextQuery(q,lastStmt,bind){
+ const last=String(lastStmt).trim().replace(/;+\s*$/,'');
+ if(!q.endsWith(last))return null;
+ const at=topLevelFromAt(last);
+ if(at<0)return null;
+ const cols=await tableTextCols(bind.db,bind.table);
+ if(!cols)return null;
+ if(!cols.length)return {sql:q,cols:[]};
+ const conv=c=>'CONVERT('+qid(c)+' USING utf8mb4)';
+ const extra=cols.map((c,i)=>', IF(LOCATE(0x00, CAST('+conv(c)+' AS BINARY)) > 0, HEX('+conv(c)+'), NULL) AS '+qid('__nobs_exact_'+i)).join('');
+ return {sql:q.slice(0,q.length-last.length)+last.slice(0,at)+extra+' '+last.slice(at),cols};
 }
 async function refuseNulTextExport(db,table){
  const n=await tableNulTextCount(db,table);
@@ -5294,11 +5410,18 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
-    const r=await api('/api/query',{sql:_q,db:dbOf(t),requestId:reqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
+    // The database a bare table name in the query refers to: the last leading USE, which runs in
+    // the same call, or else the one the query is sent with.
+    const runDb=dbOf(t);
+    const tableDb=(leadingAreAllUse&&useTarget(stmts))||runDb;
+    const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
+    const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
+    if(!T(id))return;
+    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,exactText:exact&&exact.cols.length?exact.cols:undefined},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
     if(!T(id))return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
-    t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
+    t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.exact=!!exact;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
     // Direct clear (not updateEditBar) since a fresh query's table-ness isn't known yet - gives
     // instant feedback instead of showing stale buttons from whatever was loaded before while
     // this one is still fetching. Must also drop updateEditBar's own "nothing changed" cache
@@ -5310,7 +5433,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     t.cursorId=r.cursorId||null;t.hasMore=!!r.hasMore;t.cursorReqId=t.cursorId?reqId:null;
     if(!r.columns.length){st.textContent=r.message||'Query OK.';$('res_'+id).innerHTML='';updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';return;}
     const ra=$('resultActions_'+id);if(ra)ra.style.display='inline-flex';
-    refreshRunTableBinding(id,lastStmt);
+    refreshRunTableBinding(id,lastStmt,tableDb);
     if(t.table){const pk=await api('/api/pk',{db:t.db,table:t.table});if(pk.ok&&pk.pk.length){t.pk=pk.pk;t.pending={upd:{},del:new Set(),ins:[]};}
       const fk=await api('/api/fk',{db:t.db,table:t.table});if(fk.ok){t.fk=fk.fk||[];t.fkDetails=fk.fkDetails||[];}
       // Prime column-type info (and derive which columns are BIT) right away, alongside pk/fk -
@@ -5435,13 +5558,22 @@ function selBtnHtml(id,table){return table?'<button title="Toggle between your q
 // editing rows that were never really identified by the PK it thought it had. Called once per
 // run with the statement actually about to execute, so t.table always reflects the query that
 // produced what's on screen right now, not whatever the tab happened to start as.
-function refreshRunTableBinding(id,lastStmt){
+// fallbackDb is where the query itself looked for a table named without a database. Using the
+// tab's own database instead bound "USE b; SELECT * FROM t" - or an edited table tab run while
+// another schema was selected - to a different database's t, and Apply wrote to that table.
+function refreshRunTableBinding(id,lastStmt,fallbackDb){
  const t=T(id);if(!t||t.ddl)return;
- const m=parseSingleEditableTable(lastStmt,t.db||curSchema);
+ const m=parseSingleEditableTable(lastStmt,fallbackDb||t.db||curSchema);
  const newTable=m?m.table:null, newDb=m?m.db:(t.db||curSchema);
  if(t.table===newTable&&t.db===newDb)return;
  t.table=newTable;t.db=newDb;
  const sb=$('selbtn_'+id);if(sb)sb.innerHTML=selBtnHtml(id,t.table);
+}
+// The database the last "USE db" among these statements switches to, or null.
+function useTarget(stmts){
+ let db=null;
+ for(const s of stmts){const m=sqlHead(s).match(/^use\s+(`(?:[^`]|``)+`|[^\s;`]+)/i);if(m)db=m[1].startsWith('`')?m[1].slice(1,-1).replace(/``/g,'`'):m[1];}
+ return db;
 }
 // Conservative on purpose: only recognizes "SELECT ... FROM <one table>" with no JOIN/comma-join,
 // UNION, GROUP BY, DISTINCT, or bare aggregate call - any of those can produce a result that
@@ -5479,6 +5611,11 @@ function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
 // that hex form is what makes round-tripping a value with a real embedded NUL byte safe (a raw
 // NUL in the actual SQL text risks truncation when passed as a command-line argument).
 const CTRL_NAMES={0:'NUL',1:'SOH',2:'STX',3:'ETX',4:'EOT',5:'ENQ',6:'ACK',7:'BEL',8:'BS',11:'VT',12:'FF',14:'SO',15:'SI',16:'DLE',17:'DC1',18:'DC2',19:'DC3',20:'DC4',21:'NAK',22:'SYN',23:'ETB',24:'CAN',25:'EM',26:'SUB',27:'ESC',28:'FS',29:'GS',30:'RS',31:'US'};
+function ctrlBadge(b){return '<span style="background:#4a3a1f;color:#e8c589;border-radius:3px;padding:0 3px;font-size:10px;font-weight:600;margin:0 1px" title="Control character (0x'+b.toString(16).padStart(2,'0').toUpperCase()+') - not printable text">'+CTRL_NAMES[b]+'</span>';}
+// Text holding a control character (a NUL, say) showed it as nothing at all, so 'a<NUL>b' looked
+// like 'ab'. Marked the same way as above.
+const CTRL_RE=/[\x00-\x08\x0B\x0C\x0E-\x1F]/g;
+function textCellHtml(s,maxChars){const h=esc(clip(s,maxChars));return h.search(CTRL_RE)<0?h:h.replace(CTRL_RE,ch=>ctrlBadge(ch.charCodeAt(0)));}
 function decodeCtrlCharCell(hexStr,maxChars){
  const hex=hexStr.slice(2);const bytes=[];for(let i=0;i<hex.length;i+=2){bytes.push(parseInt(hex.substr(i,2),16));}
  const decoder=new TextDecoder('utf-8',{fatal:false});
@@ -5491,7 +5628,7 @@ function decodeCtrlCharCell(hexStr,maxChars){
     if(shown+segText.length>maxChars){html+=esc(segText.slice(0,Math.max(0,maxChars-shown)));shown=maxChars;truncated=true;}
     else{html+=esc(segText);shown+=segText.length;}
    }
-   if(isCtrl&&!truncated){html+='<span style="background:#4a3a1f;color:#e8c589;border-radius:3px;padding:0 3px;font-size:10px;font-weight:600;margin:0 1px" title="Control character (0x'+bytes[i].toString(16).padStart(2,'0').toUpperCase()+') - not printable text">'+CTRL_NAMES[bytes[i]]+'</span>';shown++;}
+   if(isCtrl&&!truncated){html+=ctrlBadge(bytes[i]);shown++;}
    segStart=i+1;
   }
   if(truncated)break;
@@ -5499,7 +5636,7 @@ function decodeCtrlCharCell(hexStr,maxChars){
  if(truncated)html+='\u2026';
  return html;
 }
-function cellHtml(v,isBit){if(v===null)return '<span style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return esc(clip(v,300));}
+function cellHtml(v,isBit){if(v===null)return '<span style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return textCellHtml(v,300);}
 function colgroupHtml(id){const t=T(id);const ed=!!t.pk;const hidden=t.hiddenCols||new Set();let h='<colgroup><col style="width:30px">'+(ed?'<col style="width:34px">':'');t.cols.forEach((c,ci)=>{h+='<col style="width:150px'+(hidden.has(ci)?';display:none':'')+'">';});return h+'<col></colgroup>';}
 // wireColResize(): drag a column edge to resize, double-click to auto-fit (widths saved per table).
 function wireColResize(id){const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const t=T(id);const off=(!!t.pk)?2:1;
@@ -6222,6 +6359,14 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  // Screened before any SQL is built, so a bad paste writes nothing at all rather than part of a
  // batch. Covers inline cell edits and new rows alike - the grid is the other way into a binary
  // column, and the value editor's guard never sees it.
+ if(!t.exact){
+  const n=await tableNulTextCount(t.db,t.table);
+  if(n!==0){
+   toast(n==null?'Nothing was saved: could not check '+t.db+'.'+t.table+' for text values holding a NUL byte.'
+    :'Nothing was saved. '+fmtCount(n)+' row(s) of '+t.db+'.'+t.table+' hold a NUL byte inside a text value, and this grid could not be read exactly, so a row could be mistaken for another. Run the table again from the tree and make the change there.',true);
+   return;
+  }
+ }
  const badPaste=pastedHexColumns(t);
  if(badPaste.length){
   toast('Nothing was saved. A hex value is mixed into other content in: '+badPaste.join(', ')
@@ -6377,8 +6522,8 @@ function copySel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!
 function copySelCsv(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bCSV(t.cols,rows)).then(()=>{csvNullHint(rows);}).then(()=>log('Copied '+rows.length+' selected row(s) (CSV).'));}
 function csvGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'csv');return;}dl(bCSV(t.cols,t.rows),'result.csv');}
 async function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const bc=await gridBinCols(id);const s=t.rows.map(r=>'INSERT IGNORE INTO `table` ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
-async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&await refuseNulTextExport(dbOf(t),t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
-async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&await refuseNulTextExport(dbOf(t),t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
+async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
+async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
 async function dl(text,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
  // Tauri: native Save As + backend write
@@ -8078,7 +8223,7 @@ $RequestHandler = {
                 '/api/ddl'     { Send-Json $client (Api-Ddl $conn $data.db $data.type $data.name) }
                 '/api/pk'      { Send-Json $client (Api-Pk $conn $data.db $data.table) }
                 '/api/fk'      { Send-Json $client (Api-Fk $conn $data.db $data.table) }
-                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize) }
+                '/api/query'   { Send-Json $client (Api-Query $conn $data.sql $data.db $data.requestId $data.pageSize $data.exactText) }
                 '/api/fetch-cursor-batch' { Send-Json $client (Api-FetchCursorBatch $data) }
                 '/api/close-cursor' { Send-Json $client (Api-CloseCursor $data) }
                 '/api/cancel-query' { Send-Json $client (Api-CancelQuery $data) }

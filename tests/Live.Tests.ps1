@@ -652,6 +652,32 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Api '/api/conn-delete' @{ name = $kn } | Out-Null
     $cn = $null
 
+    # --- 5d. a table grid reads text holding a NUL exactly ---------------------------------------
+    # XML output shows the NUL as a space, and Apply's WHERE then matched the row whose key really
+    # is 'a b'. The grid's query asks for such values as hex as well (exactTextQuery in the UI) and
+    # the server puts them back, on every page.
+    $xd = "nobs_live_exact_$PID"
+    $nul = [string][char]0
+    foreach ($s in @("DROP DATABASE IF EXISTS $xd", "CREATE DATABASE $xd",
+                     "CREATE TABLE $xd.t (k VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, note TEXT CHARACTER SET latin1)",
+                     "INSERT INTO $xd.t VALUES (CONCAT('a', CHAR(0), 'b'), CONCAT('x', CHAR(0), 'y')), ('a b', 'plain'), ('c', CONCAT('late', CHAR(0))), ('d', 'caf$([char]0xE9)')")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $conv = { param($c) "CONVERT(``$c`` USING utf8mb4)" }
+    $xsql = "SELECT k, note, UPPER(k) AS k" +
+        ", IF(LOCATE(0x00, CAST($(& $conv 'k') AS BINARY)) > 0, HEX($(& $conv 'k')), NULL) AS ``__nobs_exact_0``" +
+        ", IF(LOCATE(0x00, CAST($(& $conv 'note') AS BINARY)) > 0, HEX($(& $conv 'note')), NULL) AS ``__nobs_exact_1``" +
+        " FROM $xd.t ORDER BY k"
+    $xp = Api '/api/query' @{ conn = $conn; sql = $xsql; pageSize = 2; exactText = @('k', 'note') }
+    $xrows = @($xp.rows)
+    if ($xp.hasMore) { $xn = Api '/api/fetch-cursor-batch' @{ cursorId = $xp.cursorId; pageSize = 10 }; $xrows += @($xn.rows) }
+    $xs = ($xrows | ForEach-Object { ($_ | ForEach-Object { if ($null -eq $_) { 'NULL' } else { ([string]$_).Replace($nul, '<0>') } }) -join '|' }) -join ' ; '
+    Check ($xp.ok -and (@($xp.columns) -join ',') -eq 'k,note,k') 'the hex columns are not shown' "$(@($xp.columns) -join ',') $($xp.error)"
+    Check ($xs -ceq "a<0>b|x<0>y|A B ; a b|plain|A B ; c|late<0>|C ; d|caf$([char]0xE9)|D") 'keys and text holding a NUL come back exactly, on every page' $xs
+    $xe = Api '/api/query' @{ conn = $conn; sql = "SELECT k, note FROM $xd.t"; pageSize = 2; exactText = @('k') }
+    Check (-not $xe.ok -and $xe.error -match '__nobs_exact_0') 'a result without the hex columns is an error, not a guess' ($xe | ConvertTo-Json -Compress)
+    Api '/api/exec' @{ conn = $conn; sql = "DROP DATABASE IF EXISTS $xd" } | Out-Null
+
     # --- 6. paging a cursor delivers every row exactly once -------------------------------------
     # The Tauri edition dropped one row at every page boundary by reading a look-ahead row and
     # discarding it; a forward-only cursor cannot re-read it. This edition holds it back

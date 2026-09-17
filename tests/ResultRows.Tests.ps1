@@ -21,7 +21,7 @@ foreach ($name in '$script:DumpDbSource','$script:RawEnc','$script:StrictUtf8') 
     Invoke-Expression $a.Extent.Text
 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                        $n.Name -in @('Initialize-DumpDb','Test-SqlSafeToRerun','Test-SqlReadOnly','Split-OffKeyword')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+                        $n.Name -in @('Initialize-DumpDb','Test-SqlSafeToRerun','Test-SqlReadOnly','Split-OffKeyword','Get-ExactTextMap')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 Initialize-DumpDb
 
 $fail = 0
@@ -102,6 +102,31 @@ Check (Test-SqlSafeToRerun "SET @a=1; SELECT @a FROM t WHERE 0") 'a session vari
 Check (-not (Test-SqlSafeToRerun 'INSERT INTO t VALUES (1); SELECT * FROM t WHERE 0')) 'not after an INSERT'
 Check (-not (Test-SqlSafeToRerun 'SET GLOBAL max_connections=10; SELECT 1 FROM t WHERE 0')) 'not a SET GLOBAL'
 Check (-not (Test-SqlSafeToRerun 'ANALYZE TABLE t'))            'not ANALYZE'
+
+"`n-- table grids: exact text values put back --"
+$nul = [string][char]0
+$m = Get-ExactTextMap @('k', 'v', 'K', 'up', '__nobs_exact_0', '__nobs_exact_1') @('k', 'up')
+Check ($null -eq $m.err -and $m.keep -eq 4 -and ($m.names -join ',') -eq 'k,v,K,up') 'the hex columns are not shown' ($m.names -join ',')
+Check (($m.targets[0] -join ',') -eq '0,2' -and ($m.targets[1] -join ',') -eq '3') 'each text column maps to every shown column of that name, in any case' (($m.targets | ForEach-Object { $_ -join '+' }) -join ' ')
+Check ([bool](Get-ExactTextMap @('k', 'v', '__nobs_exact_0') @('k', 'v')).err) 'a result without every hex column is an error'
+Check ([bool](Get-ExactTextMap @('k', '__nobs_exact_1') @('k')).err) 'a hex column out of place is an error'
+Check ([bool](Get-ExactTextMap @('__nobs_exact_0') @('k')).err) 'nothing left to show is an error'
+
+$hex = { param([string]$s) -join ([Text.Encoding]::UTF8.GetBytes($s) | ForEach-Object { $_.ToString('X2') }) }
+$rows = New-Object 'System.Collections.Generic.List[string[]]'
+# k 'a<NUL>b' shown as 'a b'; K is an expression (UPPER) that shares the name; up untouched.
+$rows.Add([string[]]@('a b', 'x', 'A B', 'é z', (& $hex "a${nul}b"), (& $hex "é${nul}z")))
+# (a [string[]] cast would turn $null into '')
+$r2 = New-Object string[] 6; $r2[0] = 'a b'; $r2[1] = 'y'; $r2[2] = 'A B'; $rows.Add($r2)
+$rows.Add([string[]]@("c${nul}", 'z', 'C', '', $null, $null))
+$out = [NobsXmlRows]::Exact($rows, $m.keep, $m.targets)
+Check ($out.Count -eq 3 -and $out[0].Length -eq 4) 'rows keep only the shown columns'
+Check ($out[0][0] -ceq "a${nul}b") 'the value XML showed with a space is exact again' (Show $out[0][0])
+Check ($out[0][2] -ceq 'A B') 'a column that only shares the name keeps its own value' (Show $out[0][2])
+Check ($out[0][3] -ceq "é${nul}z") 'non-ASCII text too' (Show $out[0][3])
+Check ($out[1][0] -ceq 'a b' -and $null -eq $out[1][3]) 'a row without NULs is unchanged, NULL included'
+Check ($out[2][0] -ceq "c${nul}" -and $out[2][3] -ceq '') 'as is a value that is already right'
+''
 
 "`n-- NobsLf, which reads that header line --"
 $r2 = New-Object IO.StreamReader((New-Object IO.MemoryStream(,[byte[]](0x61,0x0D,0x62,0x0A,0x63))), $script:RawEnc)

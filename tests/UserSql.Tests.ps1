@@ -271,7 +271,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   const body = names.map(n => extractFunction(src, n)).join('\n');
   const run = async (upd, ins) => {
     const sent = [], toasts = [];
-    const t = { db: 'd', table: 't', cols: ['id', 'b', 'n'], binCols: [], pk: ['id'], rows: [['1', '0x01', 'x']],
+    const t = { db: 'd', table: 't', cols: ['id', 'b', 'n'], binCols: [], pk: ['id'], rows: [['1', '0x01', 'x']], exact: true,
                 pending: { upd, del: new Set(), ins } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
@@ -326,6 +326,63 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   await sub.find(x => Array.isArray(x) && / = /.test(x[0]))[1]();
   await sub.find(x => Array.isArray(x) && / != /.test(x[0]))[1]();
   CHECK(q.seen.clauses.join(' ; ') === "`id` = X'' ; `id` <> X''", 'the quick filter writes the value for its column type', q.seen.clauses.join(' ; '));
+}
+
+// XML output turns a NUL inside text into a space. A key shown that way made Apply's WHERE match
+// another row - one whose key really has a space there - so a table grid's query also asks for
+// each text column as hex where it holds a NUL, and the server puts the exact value back.
+{
+  const CHECK = (c, l, d) => eq(c, true, l + (c ? '' : ' -> ' + d));
+  const names = ['topLevelFromAt', 'exactTextQuery', 'strLit'];
+  const body = names.map(n => extractFunction(src, n)).join('\n');
+  const make = (cols) => new Function('qid', 'tableTextCols', body + '\nreturn {topLevelFromAt, exactTextQuery};')(
+    s => '`' + s + '`', async () => cols);
+  const f = make(['name', 'note']);
+  const at = s => f.topLevelFromAt(s);
+  CHECK(at('SELECT * FROM t') === 9, 'FROM is found', at('SELECT * FROM t'));
+  const tricky = "SELECT 'from', \"from\", `from`, (SELECT 1 FROM u), fromage /* from */ -- from\n#from\n FROM t";
+  CHECK(at(tricky) === tricky.lastIndexOf('FROM'), 'not inside strings, names, subqueries, comments or longer words', at(tricky));
+  const esc = "SELECT 'it''s \\' from' FROM t";
+  CHECK(at(esc) === esc.lastIndexOf('FROM'), 'past escaped and doubled quotes', at(esc));
+  CHECK(at('SELECT 1') === -1, 'none without a FROM', at('SELECT 1'));
+  const conv = c => 'CONVERT(`' + c + '` USING utf8mb4)';
+  const extra = ', IF(LOCATE(0x00, CAST(' + conv('name') + ' AS BINARY)) > 0, HEX(' + conv('name') + '), NULL) AS `__nobs_exact_0`'
+              + ', IF(LOCATE(0x00, CAST(' + conv('note') + ' AS BINARY)) > 0, HEX(' + conv('note') + '), NULL) AS `__nobs_exact_1`';
+  const a = await f.exactTextQuery('SELECT * FROM `d`.`t` WHERE x = 1', 'SELECT * FROM `d`.`t` WHERE x = 1;', { db: 'd', table: 't' });
+  CHECK(a && a.sql === 'SELECT * ' + extra + ' FROM `d`.`t` WHERE x = 1' && a.cols.join() === 'name,note', 'the hex columns go before FROM', a && a.sql);
+  const u = await f.exactTextQuery('USE d;\nSELECT id -- the id\nFROM t', 'SELECT id -- the id\nFROM t', { db: 'd', table: 't' });
+  CHECK(u && u.sql === 'USE d;\nSELECT id -- the id\n' + extra + ' FROM t', 'after a leading USE, and after a comment ending the column list', u && u.sql);
+  const none = await make([]).exactTextQuery('SELECT * FROM t', 'SELECT * FROM t', { db: 'd', table: 't' });
+  CHECK(none && none.sql === 'SELECT * FROM t' && none.cols.length === 0, 'a table without text columns is sent as it is', JSON.stringify(none));
+  CHECK(await make(null).exactTextQuery('SELECT * FROM t', 'SELECT * FROM t', { db: 'd', table: 't' }) === null, 'unknown text columns: not exact', '');
+  CHECK(await f.exactTextQuery('SELECT * FROM t', 'SELECT * FROM u', { db: 'd', table: 't' }) === null, 'SQL not ending in the statement: not exact', '');
+
+  // Apply from a grid that was not read that way: saved only when the table holds no such value.
+  const applyNames = ['applyChanges', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const applyBody = applyNames.map(n => extractFunction(src, n)).join('\n');
+  const run = async (exact, nulRows) => {
+    const sent = [], toasts = [];
+    const t = { db: 'd', table: 't', cols: ['k', 'v'], binCols: [], pk: ['k'], rows: [['a b', 'x']], exact,
+                pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
+    const env = {
+      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
+      openRun: async () => {}, refreshTabDirty: () => {}, gridBinCols: async () => [false, false],
+      tableNulTextCount: async () => nulRows, fmtCount: n => String(n),
+      toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
+      api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
+    };
+    const keys = Object.keys(env);
+    await new Function(...keys, applyBody + '\nreturn applyChanges;')(...keys.map(k => env[k]))('x');
+    return { sql: sent.join('\n'), toasts };
+  };
+  const r1 = await run(false, 2);
+  CHECK(r1.sql === '' && r1.toasts.some(m => /2 row\(s\) of d\.t hold a NUL/.test(m)), 'not exact, and the table has NULs in text: nothing is saved', JSON.stringify(r1));
+  const r2 = await run(false, null);
+  CHECK(r2.sql === '' && r2.toasts.some(m => /could not check/.test(m)), 'not exact, and the check failed: nothing is saved', JSON.stringify(r2));
+  const r3 = await run(false, 0);
+  CHECK(/UPDATE/.test(r3.sql), 'not exact, but no such values in the table: saved', JSON.stringify(r3));
+  const r4 = await run(true, 5);
+  CHECK(/UPDATE/.test(r4.sql), 'an exact grid is saved without asking', JSON.stringify(r4));
 }
 
 process.exit(fail ? 1 : 0);

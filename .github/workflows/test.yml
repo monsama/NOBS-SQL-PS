@@ -97,6 +97,11 @@ jobs:
         shell: pwsh
         run: ./tests/UpdateCheck.Tests.ps1 ./NOBSSQL.ps1
 
+      # Which table a result grid saves to, and control characters shown in text.
+      - name: Run table binding tests
+        shell: pwsh
+        run: ./tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1
+
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
         shell: pwsh

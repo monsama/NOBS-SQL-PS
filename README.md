@@ -115,13 +115,15 @@ from the text `'NULL'`. That needs a client with `--binary-as-hex`: the MariaDB
 tools the app downloads, or MySQL 8.0.19 or later. Binary, BIT and spatial values
 are shown as `0x…` hex, as in the desktop edition.
 
-One limit comes with it: the client writes a NUL byte (`0x00`) inside a **text**
-column as a space, so the grid shows such a value with a space. Binary columns are
-not affected. Nothing is copied that way: saving grid edits writes only the cells
-you changed, Compare fetches those values separately and copies them exactly, and
-exporting a table from the grid (CSV or INSERTs) refuses a table that has any and
-points to the Export tool, which copies them byte for byte. Exporting the result of
-an arbitrary query cannot check, so such a value is exported with the space.
+The client writes a NUL byte (`0x00`) inside a **text** column as a space. Binary
+columns are not affected. Where it matters the app reads such values separately:
+a table grid (a query on one table, which is what grid edits are saved from) also
+asks for each text column as hex wherever it holds a NUL, so the grid shows and
+saves the exact value, and Compare does the same. Should a grid not be read that
+way, saving refuses a table that has any such value rather than risk matching the
+wrong row. Exporting a whole table from the tree refuses such a table and points to
+the Export tool, which copies bytes exactly. The result of any other query - a join,
+say - still shows a NUL in text as a space, and is exported that way.
 
 ## Updates
 
