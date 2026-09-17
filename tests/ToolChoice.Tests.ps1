@@ -121,4 +121,13 @@ Check (-not (Test-ReleaseIsNewer 'v1.2' '1.2.0'))   '1.2 and 1.2.0 are the same 
 Check (-not (Test-ReleaseIsNewer '' '1.2.0'))       'no tag, no update'
 Check (-not (Test-ReleaseIsNewer 'nightly' '1.2.0')) 'a tag that is not a version is not an update'
 
+"`n-- the tool version is read from its --version text --"
+$ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-ToolVersionLabel' }, $true) |
+    ForEach-Object { Invoke-Expression $_.Extent.Text }
+Check ((Get-ToolVersionLabel 'C:\Users\x\NOBSSQL\bin\mysql.exe from 12.3.3-MariaDB, client 15.2 for Win64 (AMD64), source revision 83e909fc') -eq 'MariaDB 12.3.3') "MariaDB's client"
+Check ((Get-ToolVersionLabel 'C:\x\mysqldump.exe from 12.3.3-MariaDB, client 10.20 for Win64 (AMD64)') -eq 'MariaDB 12.3.3') "MariaDB's dump tool"
+Check ((Get-ToolVersionLabel 'mysqldump  Ver 8.4.9 for Win64 on x86_64 (MySQL Community Server - GPL)') -eq 'MySQL 8.4.9') "MySQL's dump tool"
+Check ((Get-ToolVersionLabel 'C:\x\mysql.exe  Ver 8.0.46 for Win64 on x86_64 (MySQL Community Server - GPL)') -eq 'MySQL 8.0.46') "MySQL's client"
+Check ($null -eq (Get-ToolVersionLabel 'something else')) 'anything else is not a version'
+
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

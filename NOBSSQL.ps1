@@ -2272,6 +2272,17 @@ function Save-Conns { param($list)
         [IO.File]::WriteAllText($script:ConnFile, $json, (New-Object System.Text.UTF8Encoding($false)))
     }
 }
+# "MariaDB 12.3.3" or "MySQL 8.4.9" out of a client tool's --version text, so Settings can show what
+# a download (or an installation) actually is - downloaded tools never update themselves.
+function Get-ToolVersionLabel { param([string]$Text)
+    if ($Text -match '(\d+\.\d+\.\d+)-MariaDB') { return "MariaDB $($Matches[1])" }
+    if ($Text -match 'Ver (\d+\.\d+\.\d+)\b.*MySQL') { return "MySQL $($Matches[1])" }
+    return $null
+}
+function Get-ToolVersion { param([string]$Path)
+    if (-not $Path -or $Path -eq '(not found)' -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try { return Get-ToolVersionLabel ((& $Path --version 2>$null) -join ' ') } catch { return $null }
+}
 # Endpoint: report whether the mysql client tools were found.
 function Api-ToolsStatus {
     Resolve-Tools
@@ -2289,7 +2300,9 @@ function Api-ToolsStatus {
         try { $ver = & $script:MysqldumpPath --version 2>$null; if($ver -match '(?i)mariadb'){ $dumpIsMariaDb='true' } else { $dumpIsMariaDb='false' } } catch {}
     }
     $myM = Get-MysqlFlavorTool 'mysql'; $myD = Get-MysqlFlavorTool 'mysqldump'
-    $forMysql = ',"mysql_for_mysql":'+(J-Str $myM.Path)+',"mysql_for_mysql_source":'+(J-Str $myM.Source)+',"mysqldump_for_mysql":'+(J-Str $myD.Path)+',"mysqldump_for_mysql_source":'+(J-Str $myD.Source)
+    $versions = ',"mysql_version":'+(J-Str (Get-ToolVersion $m))+',"mysqldump_version":'+(J-Str (Get-ToolVersion $d))+
+        ',"mysql_for_mysql_version":'+(J-Str (Get-ToolVersion $myM.Path))+',"mysqldump_for_mysql_version":'+(J-Str (Get-ToolVersion $myD.Path))
+    $forMysql = $versions+',"mysql_for_mysql":'+(J-Str $myM.Path)+',"mysql_for_mysql_source":'+(J-Str $myM.Source)+',"mysqldump_for_mysql":'+(J-Str $myD.Path)+',"mysqldump_for_mysql_source":'+(J-Str $myD.Source)
     '{"ok":true,"mysql":'+(J-Str $m)+',"mysqldump":'+(J-Str $d)+',"mysql_source":'+(J-Str $ms)+',"mysqldump_source":'+(J-Str $ds)+',"mysqldump_is_mariadb":'+$dumpIsMariaDb+$forMysql+',"download_dir":'+(J-Str $script:ToolsDir)+',"config_file":'+(J-Str $script:CfgFile)+'}'
 }
 # Endpoint: the tools export and import will use for the CONNECTED server, and whether that
@@ -3646,7 +3659,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDumpMy" style="flex:1" placeholder="MySQL's mysqldump.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysqldump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDumpMy').value=pp})">Browse...</button></div>
  <div class="row" style="margin-top:4px"><button onclick="downloadMysqlTools()">Download MySQL client tools</button><span class="muted" style="font-size:12px">mysql and mysqldump from the current MySQL 8.4 LTS release on dev.mysql.com - a ~270 MB download of which about 14 MB is kept, checked against the MD5 MySQL publishes</span></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
- <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB)</span></div>
+ <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB). Downloaded tools do not update themselves; downloading again replaces them with the current release - the version is shown above.</span></div>
  <div class="row" style="margin-top:6px"><span style="width:92px">Download URL</span><input id="cfgDownloadUrl" style="flex:1;font-family:Consolas,monospace;font-size:11px" placeholder="https://mirror.mariadb.org/mariadb-{version}/winx64-packages/{file_name}"><button onclick="resetDownloadUrl()" title="Reset to the built-in default">Reset</button></div>
  <div class="muted" style="font-size:11px;line-height:1.4;margin:2px 0 0">{version} and {file_name} are filled in automatically from the latest MariaDB LTS release. Only change this if the download above fails (mariadb.org occasionally changes its layout) - the error message will show what actually happened.</div>
  <div id="cfgLog" class="muted" style="white-space:pre-wrap;font-family:Consolas,monospace;font-size:11px;max-height:120px;overflow:auto;margin-top:6px"></div>
@@ -4089,9 +4102,9 @@ function showToolError(logId,ownerModalId,msg){
 // api() treats any failed call as the server being gone - it calls showDead(), which would throw
 // a false "server down" overlay over the app just for opening the About box.
 function openAbout(){ show('mAbout'); }
-async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src)=>{const ok=path&&path!=='(not found)';return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};const myRow=(name,path,src)=>'<div style="margin:2px 0"><b>'+name+':</b> '+(path?'<span style="font-family:Consolas,monospace">'+esc(path)+'</span> <span style="color:#3fb950">&#10003;</span><div class="muted" style="font-size:11px;margin-left:2px">'+esc(src||'')+'</div>':'<span class="muted">none - the default above is used</span>')+'</div>';
- el.innerHTML=row('mysql',r.mysql,r.mysql_source)+row('mysqldump',r.mysqldump,r.mysqldump_source)
-  +'<div class="muted" style="font-size:11px;margin-top:6px">For MySQL servers:</div>'+myRow('mysql',r.mysql_for_mysql,r.mysql_for_mysql_source)+myRow('mysqldump',r.mysqldump_for_mysql,r.mysqldump_for_mysql_source);
+async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.innerHTML='Checking...';try{const r=await api('/api/tools-status');if(!r||!r.ok){el.textContent='';return;}const row=(name,path,src,ver)=>{const ok=path&&path!=='(not found)';src=(ver?ver+' - ':'')+(src||'');return '<div style="margin:2px 0"><b>'+name+':</b> <span style="font-family:Consolas,monospace">'+esc(path)+'</span> '+(ok?'<span style="color:#3fb950">&#10003;</span>':'<span style="color:#e5534b">&#10007; not found</span>')+(ok&&src?'<div class="muted" style="font-size:11px;margin-left:2px">'+esc(src)+'</div>':'')+'</div>';};const myRow=(name,path,src,ver)=>'<div style="margin:2px 0"><b>'+name+':</b> '+(path?'<span style="font-family:Consolas,monospace">'+esc(path)+'</span> <span style="color:#3fb950">&#10003;</span><div class="muted" style="font-size:11px;margin-left:2px">'+esc((ver?ver+' - ':'')+(src||''))+'</div>':'<span class="muted">none - the default above is used</span>')+'</div>';
+ el.innerHTML=row('mysql',r.mysql,r.mysql_source,r.mysql_version)+row('mysqldump',r.mysqldump,r.mysqldump_source,r.mysqldump_version)
+  +'<div class="muted" style="font-size:11px;margin-top:6px">For MySQL servers:</div>'+myRow('mysql',r.mysql_for_mysql,r.mysql_for_mysql_source,r.mysql_for_mysql_version)+myRow('mysqldump',r.mysqldump_for_mysql,r.mysqldump_for_mysql_source,r.mysqldump_for_mysql_version);
  if(r.mysql&&r.mysql!=='(not found)'&&!$('cfgMysql').value)$('cfgMysql').value=r.mysql;
  if(r.mysqldump&&r.mysqldump!=='(not found)'&&!$('cfgDump').value)$('cfgDump').value=r.mysqldump;
  const pe=$('cfgPaths');if(pe)pe.innerHTML='Downloads: '+esc(r.download_dir)+'<br>Config: '+esc(r.config_file);}catch(e){el.textContent='';}}

@@ -41,7 +41,7 @@ All but the last need nothing set up. `Live` needs a database. CI runs all of th
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
 | `UpdateCheck` | the new-version notice: shown when newer, quiet when hidden, switched off or offline | `node` on PATH |
-| `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page, and that every script-level value a request reads reaches the request threads | nothing |
+| `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page and a tool's version, release version comparison, and that every script-level value a request reads reaches the request threads | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
 The node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they
