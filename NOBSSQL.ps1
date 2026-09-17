@@ -1335,6 +1335,18 @@ function Api-ScriptResults { param($conn,$data)
         $p.WaitForExit()
         try { $feed.Wait() } catch { }
         $errTxt = try { $et.Result } catch { '' }
+        # XML output leaves out the column names of a result without rows. A statement that is safe
+        # to repeat is run again on its own for them (Get-ResultHeaders) - but not when the script
+        # switches databases, where on its own it could read a different table; and never a CALL.
+        $switchesDb = $scriptSql -match '(?im)(^|;)\s*use\s'
+        $reruns = 0
+        foreach ($s in @($sets)) {
+            if ($null -eq $s -or $s.Rows.Count -gt 0 -or $s.Names.Count -gt 0 -or $switchesDb -or $reruns -ge 20) { continue }
+            if (-not (Test-SqlSafeToRerun ([string]$s.Statement))) { continue }
+            $reruns++
+            $h = Get-ResultHeaders $conn ([string]$s.Statement) ([string]$data.db)
+            if ($h) { $s.Names.AddRange([string[]]@($h)) }
+        }
         $sb = New-Object System.Text.StringBuilder
         [void]$sb.Append('[')
         $n = 0
@@ -5832,7 +5844,7 @@ function showResultSet(id,i){
  t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();t._total=null;
  renderResultSetTabs(id);
  const ra=$('resultActions_'+id);if(ra)ra.style.display=t.cols.length?'inline-flex':'none';
- if(!t.cols.length){$('res_'+id).innerHTML='<div class="muted" style="padding:8px">No rows. (Column names are only known when there are rows.)</div>';}
+ if(!t.cols.length){$('res_'+id).innerHTML='<div class="muted" style="padding:8px">No rows. (The column names of this result are not available: it came from a procedure, or after a USE.)</div>';}
  else renderGrid(id);
  updatePager(id);
 }

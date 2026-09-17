@@ -805,7 +805,18 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "SELECT 'NULL' AS a;`nSELECT id FROM sr_t WHERE 0;`nSELECT id FROM bulk_rows ORDER BY id;"; maxRows = 10 }
     $sets = @($sr.results)
     Check ($sr.ok -and $sets.Count -eq 3 -and [string]$sets[0].rows[0][0] -ceq 'NULL' -and @($sets[1].rows).Count -eq 0) 'every SELECT of a script, an empty one included' ($sr | ConvertTo-Json -Compress -Depth 4)
-    if ($sets.Count -eq 3) { Check (@($sets[2].rows).Count -eq 10 -and $sets[2].rowCount -eq 100000 -and $sets[2].truncated) 'a big result keeps its first rows and counts all' "$(@($sets[2].rows).Count) $($sets[2].rowCount)" }
+    if ($sets.Count -eq 3) {
+        Check ((@($sets[1].columns) -join ',') -eq 'id') 'an empty result still has its column names' ($sets[1] | ConvertTo-Json -Compress)
+        Check (@($sets[2].rows).Count -eq 10 -and $sets[2].rowCount -eq 100000 -and $sets[2].truncated) 'a big result keeps its first rows and counts all' "$(@($sets[2].rows).Count) $($sets[2].rowCount)"
+    }
+    # Run on its own, a statement after a USE could read a different table, so its names stay unknown;
+    # and a procedure is never run twice to get them.
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "USE nobs_test;`nSELECT id FROM sr_t WHERE 0;`nSELECT 1 AS a;" }
+    Check ($sr.ok -and @($sr.results).Count -eq 2 -and @($sr.results[0].columns).Count -eq 0) 'not after a USE' ($sr | ConvertTo-Json -Compress -Depth 4)
+    $su2 = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; sql = "DROP PROCEDURE IF EXISTS sr_empty;`nCREATE PROCEDURE sr_empty() SELECT id FROM sr_t WHERE 0" }
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "CALL sr_empty();`nSELECT 1 AS a;" }
+    Check ($su2.ok -and $sr.ok -and @($sr.results[0].columns).Count -eq 0) 'not for a procedure' ($sr | ConvertTo-Json -Compress -Depth 4)
+    Api '/api/script' @{ conn = $conn; db = 'nobs_test'; sql = 'DROP PROCEDURE IF EXISTS sr_empty' } | Out-Null
     $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "SELECT 1 AS a;`nSELECT * FROM sr_no_such_table;`nSELECT 2 AS b;" }
     Check (-not $sr.ok -and $sr.error -match 'at line 2' -and @($sr.results).Count -eq 1) 'an error reports its line, with the result before it' ($sr | ConvertTo-Json -Compress -Depth 4)
     $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; ro = $true; sql = 'CALL sr_two(1)' }
