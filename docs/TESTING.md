@@ -161,6 +161,16 @@ GitHub's service containers are Linux-only while this app targets Windows, so th
 The suite then runs once per server. On the MySQL run `NOBS_TEST_REMOTE_HOST` is the runner's
 own network address, so the `verify-ca` check runs too.
 
+After that the same job runs the GUI tests, which drive this script's UI in headless Edge: grid
+editing, Compare, the export and import dialogs, and a script's results. The scenarios are
+shared with the desktop edition and live in NOBS-SQL-Editor (`tests/gui`, see its
+`docs/TESTING.md`). To run them here:
+
+```powershell
+$env:NOBS_TEST_DSN = '127.0.0.1:3306:root:yourpassword'
+node ..NOBS-SQL-Editor	estsguiun.mjs --app ps --target .NOBSSQL.ps1
+```
+
 ### What it covers
 
 Every check is a regression test for a bug that actually shipped:

@@ -118,7 +118,7 @@ jobs:
   # where the app's own download puts them.
   live:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -155,6 +155,29 @@ jobs:
           $env:NOBS_TEST_SERVER_CA = $env:NOBS_CI_MYSQL_CA
           $env:NOBS_TEST_REMOTE_HOST = $env:NOBS_CI_REMOTE_HOST
           ./tests/Live.Tests.ps1 ./NOBSSQL.ps1
+
+      # The app driven through its UI in headless Edge: grid edits, Compare, export and import, a
+      # script's results. The scenarios are shared with the desktop edition and live in its
+      # repository (tests/gui), next to the setup script above.
+      - name: Install Node
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: GUI tests against MariaDB
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_CI_MARIADB_DSN
+          node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+
+      - name: GUI tests against MySQL
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $env:NOBS_TEST_DSN = $env:NOBS_CI_MYSQL_DSN
+          node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
 
       - name: Server logs
         if: ${{ failure() }}
