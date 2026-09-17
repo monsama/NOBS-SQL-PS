@@ -105,7 +105,11 @@ The CA is the last certificate printed (for MariaDB, the only one).
 Export and Import use the official MySQL/MariaDB command-line tools, which are
 **not bundled**. On first use, point the app at an existing install in
 Settings, or let it download the official MariaDB client tools from
-mariadb.org.
+mariadb.org. The archive is checked against the SHA-256 that MariaDB's own
+release API publishes for it before anything is unpacked, and a mismatch
+installs nothing — the checksum comes from the API, not from the mirror the
+bytes came from, so a redirected or altered download fails the check. If the
+API lists no checksum, nothing is installed at all.
 
 Auto-detection checks, in order: saved configuration, the system PATH, then
 common install folders (`Program Files\MariaDB*`, `Program Files\MySQL`,

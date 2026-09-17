@@ -8,6 +8,16 @@ on:
   push:
     branches: [main]
   pull_request: {}
+  # Weekly, because the tools-download job below depends on someone else's website keeping its
+  # shape - MariaDB's release API, and the HTML of MySQL's download page that that download reads
+  # its checksum out of. Neither needs a commit here to break, so without a schedule the first
+  # report comes from a user whose download button stopped working. Monday morning, and
+  # deliberately not on the hour (GitHub delays scheduled runs at popular times). Note GitHub
+  # disables scheduled workflows in a repository with no pushes for 60 days, and emails first.
+  schedule:
+    - cron: '17 6 * * 1'
+  # So the same checks can be run on demand, including the scheduled-only step below.
+  workflow_dispatch: {}
 
 jobs:
   test:
@@ -183,3 +193,34 @@ jobs:
         if: ${{ failure() }}
         shell: pwsh
         run: Get-Content C:\nobs-ci\mariadb.err, C:\nobs-ci\mysql.err -Tail 60 -ErrorAction SilentlyContinue
+
+  # The two buttons in Settings that fetch and unpack the client tools, run for real. The job above
+  # evaluates pure functions and the live suite uses tools the setup script installs directly, so
+  # this is the only check that exercises the download itself - the release API's file list and
+  # published SHA-256, MySQL's download page and the MD5 printed on it, and the unpacking of the
+  # binaries and the authentication plugins. It needs no database.
+  tools-download:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # MariaDB's archive is ~90 MB, so this runs on every push. The test writes into a temporary
+      # tree rather than %APPDATA%, and refuses to run at all unless the variable below is set.
+      - name: Download and verify the MariaDB client tools
+        shell: pwsh
+        env:
+          NOBS_TEST_TOOLS_DOWNLOAD: '1'
+        run: ./tests/ToolsDownload.Tests.ps1 ./NOBSSQL.ps1
+
+      # MySQL's is ~270 MB (the whole server archive, of which two binaries are kept) and its
+      # version, file name and MD5 come out of the page's HTML rather than an API - so it is the
+      # likelier of the two to break and the more expensive to check. Weekly and on demand, then:
+      # a restyled page breaks the download whether or not anyone pushed that week, which is what
+      # a scheduled run is for, and putting it on every push would only make those slower.
+      - name: Download and verify the MySQL client tools
+        if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+        shell: pwsh
+        env:
+          NOBS_TEST_TOOLS_DOWNLOAD: '1'
+        run: ./tests/ToolsDownload.Tests.ps1 ./NOBSSQL.ps1 -Mysql
