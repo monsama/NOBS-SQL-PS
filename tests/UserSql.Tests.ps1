@@ -263,6 +263,36 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   eq(extractFunction(src, f).includes('refuseNulTextExport('), true, f + ' checks the table for NUL in text first');
 }
 
+// Apply with the column types known (gridBinCols): an emptied binary cell is saved - the value
+// editor hands over '' for it - while text in a binary column is still refused. The GUI pass found
+// the first one refused ("These are binary/BIT columns and only accept a 0x value: b = ''").
+{
+  const names = ['applyChanges', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const body = names.map(n => extractFunction(src, n)).join('\n');
+  const run = async (upd, ins) => {
+    const sent = [], toasts = [];
+    const t = { db: 'd', table: 't', cols: ['id', 'b', 'n'], binCols: [], pk: ['id'], rows: [['1', '0x01', 'x']],
+                pending: { upd, del: new Set(), ins } };
+    const env = {
+      roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
+      openRun: async () => {}, refreshTabDirty: () => {}, gridBinCols: async () => [false, true, false],
+      toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
+      api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
+    };
+    const keys = Object.keys(env);
+    const f = new Function(...keys, body + '\nreturn applyChanges;')(...keys.map(k => env[k]));
+    await f('x');
+    return { sql: sent.join('\n'), toasts };
+  };
+  const a = await run({ '0:1': '' }, [{ id: '2', b: '' }]);
+  eq(a.toasts.some(m => m.startsWith('ERR')), false, 'an emptied binary cell and a new row with an empty binary value are accepted');
+  eq(/SET `b`=''/.test(a.sql) && /VALUES \('2',''\)/.test(a.sql), true, 'and written as an empty value');
+  const b = await run({ '0:1': 'hello' }, []);
+  eq(b.toasts.some(m => /binary\/BIT columns/.test(m)) && b.sql === '', true, 'text typed into a binary column is still refused, and nothing is sent');
+  const c = await run({ '0:2': '0x41' }, []);
+  eq(/SET `n`='0x41'/.test(c.sql), true, 'hex-looking text in a text column is written as text');
+}
+
 process.exit(fail ? 1 : 0);
 '@
 

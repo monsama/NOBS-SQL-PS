@@ -6177,12 +6177,12 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  Object.keys(t.pending.upd).forEach(k=>{const [ri,ci]=k.split(':').map(Number);
   if(!binAt(ci,ri))return;
   const v=t.pending.upd[k];
-  if(v!==null&&!isHex(v)) badBin.push(t.cols[ci]+' = '+JSON.stringify(String(v)));
+  if(v!==null&&v!==''&&!isHex(v)) badBin.push(t.cols[ci]+' = '+JSON.stringify(String(v)));
  });
  t.pending.ins.forEach(row=>{Object.keys(row).forEach(cn=>{const ci=t.cols.indexOf(cn);
   if(ci<0||!binAt(ci,null))return;
   const v=row[cn];
-  if(v!==null&&!isHex(v)) badBin.push(cn+' = '+JSON.stringify(String(v)));
+  if(v!==null&&v!==''&&!isHex(v)) badBin.push(cn+' = '+JSON.stringify(String(v)));
  });});
  if(badBin.length){
   toast('These are binary/BIT columns and only accept a 0x value:\n'+badBin.join('\n')
