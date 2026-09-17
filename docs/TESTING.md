@@ -39,7 +39,7 @@ not — see below.
 | `DdlRecreate` | recovering a procedure, function or trigger whose recreate failed | `node` on PATH |
 | `UserSql` | the SQL the Users dialog builds client-side | `node` on PATH |
 | `ViewIndices` | the grid's sort/filter ordering | `node` on PATH |
-| `ToolChoice` | which client tools export and import use for a MariaDB or a MySQL server, and the options file written for them | nothing |
+| `ToolChoice` | which client tools a MariaDB or a MySQL server gets, the options file written for them, reading MySQL's download page, and that every script-level value a request reads reaches the request threads | nothing |
 | `Live` | the running server, against a real database | `NOBS_TEST_DSN` |
 
 The node-based scripts test JavaScript embedded in `NOBSSQL.ps1`, so unlike the others they

@@ -100,6 +100,15 @@ mysqldump writes values into a MySQL table's generated columns, which MySQL
 refuses when the dump is restored. Without MySQL's tools such an export is
 refused rather than written.
 
+**No MySQL installed?** Settings can download MySQL's own `mysql` and `mysqldump`
+(the current 8.4 LTS release from dev.mysql.com). MySQL publishes Windows binaries
+only as the full server archive, so this is a ~270 MB download of which about
+14 MB is kept, in `bin\mysql\`. The archive is checked against the MD5 on MySQL's
+download page before anything is unpacked, and a mismatch installs nothing. If
+MySQL moves its page or files, `mysql_download_page` and
+`mysql_download_url_template` (with `{series}`, `{version}`, `{file_name}`) in
+the config file override the defaults.
+
 Every query goes through `mysql.exe` too, and results are read from its `--xml
 --binary-as-hex` output, because XML is the only output format that tells NULL apart
 from the text `'NULL'`. That needs a client with `--binary-as-hex`: the MariaDB

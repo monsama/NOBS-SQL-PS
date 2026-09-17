@@ -2319,6 +2319,91 @@ function Api-SaveConfig { param($data)
     if($db -and (Test-Path $db)){ $script:MysqldumpPath=$db }
     '{"ok":true}'
 }
+# ---------- MySQL's own client tools ----------
+# For machines without a MySQL installation: a MySQL server otherwise gets MariaDB's tools (see
+# Get-ToolFor). MySQL has no release API like MariaDB's, but its download page names the current
+# Windows ZIP and prints its MD5 beside it. Both addresses can be overridden in config.json
+# (mysql_download_page, mysql_download_url_template). The same as the Tauri edition's
+# download_mysql_tools.
+function Get-MysqlDownloadDefaults {
+    @{
+        Page     = 'https://dev.mysql.com/downloads/mysql/8.4.html'
+        Template = 'https://cdn.mysql.com/Downloads/MySQL-{series}/{file_name}'
+        # Where a release goes once a newer one replaces it on the CDN.
+        Archive  = 'https://downloads.mysql.com/archives/get/p/23/file/{file_name}'
+    }
+}
+# The ZIP archive named on MySQL's download page, its version, and the MD5 printed after it.
+function Get-MysqlDownloadInfo { param([string]$Html)
+    $m = [regex]::Match($Html, '\((mysql-(\d+\.\d+\.\d+)-winx64\.zip)\)')
+    if (-not $m.Success) { return $null }
+    $after = $Html.Substring($m.Index + $m.Length)
+    if ($after.Length -gt 2000) { $after = $after.Substring(0, 2000) }
+    $h = [regex]::Match($after, 'class="md5">\s*([0-9a-fA-F]{32})\s*<')
+    return @{ File = $m.Groups[1].Value; Version = $m.Groups[2].Value; Md5 = $(if ($h.Success) { $h.Groups[1].Value.ToLower() } else { $null }) }
+}
+# Only the two binaries the app runs, from <root>/bin/. Both are self-contained - OpenSSL and MySQL
+# 8's default authentication are built in, which was checked by running them from an empty folder.
+function Get-MysqlZipMember { param([string]$Name)
+    $parts = ($Name -replace '\\', '/').Split('/')
+    if ($parts.Count -ne 3 -or $parts[1] -ne 'bin') { return $null }
+    if ($parts[2] -in 'mysql.exe', 'mysqldump.exe') { return $parts[2] }
+    return $null
+}
+function Api-DownloadMysqlTools {
+    $tmpZip = $null
+    try {
+        $ProgressPreference = 'SilentlyContinue'
+        # dev.mysql.com answers a browser-like User-Agent with 403 (it expects the JavaScript a
+        # browser would run first) and serves the page to one that says it is curl. Measured.
+        $ua = 'curl/8.0 NOBSSQL'
+        $def = Get-MysqlDownloadDefaults
+        $cfg = Load-Cfg
+        $page = if ($cfg -and $cfg.mysql_download_page) { [string]$cfg.mysql_download_page } else { $def.Page }
+        $tpl = if ($cfg -and $cfg.mysql_download_url_template) { [string]$cfg.mysql_download_url_template } else { $def.Template }
+        try { $html = (Invoke-WebRequest -Uri $page -UseBasicParsing -UserAgent $ua -ErrorAction Stop).Content }
+        catch { return '{"ok":false,"error":'+(J-Str "Could not read MySQL's download page $page : $($_.Exception.Message)")+'}' }
+        $info = Get-MysqlDownloadInfo $html
+        if (-not $info) { return '{"ok":false,"error":'+(J-Str "MySQL's download page $page did not name a Windows ZIP archive.")+'}' }
+        # A download that cannot be checked is not installed.
+        if (-not $info.Md5) { return '{"ok":false,"error":'+(J-Str "MySQL's download page did not show a checksum for $($info.File), so the download was not attempted.")+'}' }
+        $series = ($info.Version.Split('.')[0..1]) -join '.'
+        $fill = { param($t) $t.Replace('{series}', $series).Replace('{version}', $info.Version).Replace('{file_name}', $info.File) }
+        $tmpZip = Join-Path $env:TEMP ("nobs-mysql-" + [Guid]::NewGuid().ToString('N') + ".zip")
+        $errs = @(); $ok = $false
+        foreach ($src in @(@{ Label = 'download URL'; Url = (& $fill $tpl) }, @{ Label = 'MySQL archive'; Url = (& $fill $def.Archive) })) {
+            Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue
+            & curl.exe -fsSL --retry 3 -A $ua -o $tmpZip $src.Url
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $tmpZip)) { $errs += "$($src.Label) $($src.Url): curl exit $LASTEXITCODE"; continue }
+            $got = (Get-FileHash -LiteralPath $tmpZip -Algorithm MD5).Hash.ToLower()
+            if ($got -ne $info.Md5) { $errs += "$($src.Label) $($src.Url): checksum mismatch (got $got, the page says $($info.Md5))"; continue }
+            $ok = $true; break
+        }
+        if (-not $ok) { return '{"ok":false,"error":'+(J-Str ("Could not download $($info.File)." + [Environment]::NewLine + ($errs -join [Environment]::NewLine)))+'}' }
+        $dest = Join-Path $script:ToolsDir 'mysql'
+        if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead($tmpZip)
+        $got = @()
+        try {
+            foreach ($e in $zip.Entries) {
+                $base = Get-MysqlZipMember $e.FullName
+                if ($base) { [IO.Compression.ZipFileExtensions]::ExtractToFile($e, (Join-Path $dest $base), $true); $got += $base }
+            }
+        } finally { $zip.Dispose() }
+        if ($got.Count -lt 2) { return '{"ok":false,"error":'+(J-Str "$($info.File) was downloaded and checked, but mysql.exe and mysqldump.exe were not both inside.")+'}' }
+        $mb = Join-Path $dest 'mysql.exe'; $db = Join-Path $dest 'mysqldump.exe'
+        $cfgSave = Load-Cfg; if (-not $cfgSave) { $cfgSave = [pscustomobject]@{} }
+        $cfgSave | Add-Member -NotePropertyName mysql_bin_mysql -NotePropertyValue $mb -Force
+        $cfgSave | Add-Member -NotePropertyName mysqldump_bin_mysql -NotePropertyValue $db -Force
+        Save-Cfg $cfgSave
+        '{"ok":true,"message":'+(J-Str "Downloaded MySQL $($info.Version) client tools to $dest (checksum verified)")+',"config":{"mysql_bin_mysql":'+(J-Str $mb)+',"mysqldump_bin_mysql":'+(J-Str $db)+'}}'
+    } catch {
+        '{"ok":false,"error":'+(J-Str ("Download failed: " + $_.Exception.Message))+'}'
+    } finally {
+        if ($tmpZip) { Remove-Item $tmpZip -Force -ErrorAction SilentlyContinue }
+    }
+}
 function Api-DownloadTools {
     try {
         $ProgressPreference='SilentlyContinue'
@@ -2394,7 +2479,12 @@ function Api-DownloadTools {
         if($got.Count -eq 0){ return '{"ok":false,"error":"Archive downloaded but no client binaries inside."}' }
         $mb = @('mysql.exe','mariadb.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
         $db = @('mysqldump.exe','mariadb-dump.exe') | ForEach-Object { Join-Path $script:ToolsDir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
-        Save-Cfg ([pscustomobject]@{ mysql_bin=[string]$mb; mysqldump_bin=[string]$db })
+        # Merged into what is already saved: writing only these two keys dropped the download URL
+        # template and the MySQL-server paths.
+        $cfgSave = Load-Cfg; if (-not $cfgSave) { $cfgSave = [pscustomobject]@{} }
+        $cfgSave | Add-Member -NotePropertyName mysql_bin -NotePropertyValue ([string]$mb) -Force
+        $cfgSave | Add-Member -NotePropertyName mysqldump_bin -NotePropertyValue ([string]$db) -Force
+        Save-Cfg $cfgSave
         if($mb){ $script:MysqlPath=[string]$mb }; if($db){ $script:MysqldumpPath=[string]$db }
         '{"ok":true,"message":'+(J-Str ("Downloaded MariaDB $patch client tools to $script:ToolsDir ($gotPlugins auth plugins)"))+',"config":{"mysql_bin":'+(J-Str ([string]$mb))+',"mysqldump_bin":'+(J-Str ([string]$db))+'}}'
     } catch {
@@ -3509,6 +3599,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">This edition runs everything through mysql.exe, so a MySQL server gets MySQL's own tools throughout - queries as well as Export and Import: these two paths, or else the newest MySQL Server installation (Program Files\MySQL\MySQL Server *\bin). MariaDB's mysqldump cannot make a restorable dump of a MySQL table with generated columns, and only MySQL's client checks a CA without the host name. Leave empty to detect automatically.</div>
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysqlMy" style="flex:1" placeholder="MySQL's mysql.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysql.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysqlMy').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDumpMy" style="flex:1" placeholder="MySQL's mysqldump.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysqldump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDumpMy').value=pp})">Browse...</button></div>
+ <div class="row" style="margin-top:4px"><button onclick="downloadMysqlTools()">Download MySQL client tools</button><span class="muted" style="font-size:12px">mysql and mysqldump from the current MySQL 8.4 LTS release on dev.mysql.com - a ~270 MB download of which about 14 MB is kept, checked against the MD5 MySQL publishes</span></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
  <div class="row"><button class="go" onclick="downloadTools()">Download MariaDB client tools</button><span class="muted" style="font-size:12px">Latest LTS winx64 client from mariadb.org (~90 MB)</span></div>
  <div class="row" style="margin-top:6px"><span style="width:92px">Download URL</span><input id="cfgDownloadUrl" style="flex:1;font-family:Consolas,monospace;font-size:11px" placeholder="https://mirror.mariadb.org/mariadb-{version}/winx64-packages/{file_name}"><button onclick="resetDownloadUrl()" title="Reset to the built-in default">Reset</button></div>
@@ -3958,6 +4049,14 @@ async function refreshToolsStatus(){const el=$('cfgStatus');if(!el)return;el.inn
 function resetDownloadUrl(){$('cfgDownloadUrl').value=window._mariadbDownloadUrlDefault||'';}
 async function saveSettings(){try{const r=await api('/api/save-config',{config:{mysql_bin:$('cfgMysql').value.trim(),mysqldump_bin:$('cfgDump').value.trim(),mysql_bin_mysql:$('cfgMysqlMy').value.trim(),mysqldump_bin_mysql:$('cfgDumpMy').value.trim(),mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});if(r&&r.ok){log('Saved client-tool paths.');refreshToolsStatus();hide('mSettings');}else toast('Save failed: '+(r?r.error:''),true);}catch(e){toast('Save failed: '+e,true);}}
 async function downloadTools(){try{await api('/api/save-config',{config:{mariadb_download_url_template:$('cfgDownloadUrl').value.trim()}});}catch(e){}$('cfgLog').textContent='Downloading MariaDB client tools (~90 MB). This can take a minute...';try{const r=await api('/api/download-tools');if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysql').value=r.config.mysql_bin||$('cfgMysql').value;$('cfgDump').value=r.config.mysqldump_bin||$('cfgDump').value;}log(r.message);refreshToolsStatus();}else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}}catch(e){$('cfgLog').textContent='Failed: '+e;}}
+// MySQL's archive is the whole server (~270 MB), and only two binaries are kept from it. The paths
+// it fills in are the "MySQL servers" ones, used only for MySQL servers.
+async function downloadMysqlTools(){
+ $('cfgLog').textContent='Downloading MySQL client tools (~270 MB). This can take a few minutes...';
+ try{const r=await api('/api/download-mysql-tools');
+  if(r&&r.ok){$('cfgLog').textContent=r.message;if(r.config){$('cfgMysqlMy').value=r.config.mysql_bin_mysql||$('cfgMysqlMy').value;$('cfgDumpMy').value=r.config.mysqldump_bin_mysql||$('cfgDumpMy').value;}log(r.message);refreshToolsStatus();}
+  else{$('cfgLog').textContent='Failed: '+(r?r.error:'unknown');}
+ }catch(e){$('cfgLog').textContent='Failed: '+e;}}
 let _inpResolve=null;
 function inputBox(opts){return new Promise(res=>{_inpResolve=res;$('inpTitle').textContent=opts.title||'Input';const box=$('inpFields');box.innerHTML='';
  (opts.fields||[]).forEach(f=>{const w=document.createElement('div');w.style.margin='6px 0';if(f.type==='checkbox'){w.style.display='flex';w.style.alignItems='center';w.style.gap='8px';const cbx=document.createElement('input');cbx.id='inp_'+f.key;cbx.type='checkbox';cbx.checked=!!f.value;const clb=document.createElement('label');clb.textContent=f.label||f.key;clb.style.fontSize='13px';clb.htmlFor=cbx.id;clb.style.cursor='pointer';cbx.onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();inpCancel();}};w.appendChild(cbx);w.appendChild(clb);box.appendChild(w);return;}const lb=document.createElement('label');lb.textContent=f.label||f.key;lb.style.display='block';lb.style.fontSize='12px';lb.style.marginBottom='2px';lb.style.color='var(--muted)';
@@ -7815,7 +7914,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -7897,6 +7996,7 @@ $RequestHandler = {
                 '/api/get-config'     { Send-Json $client (Api-GetConfig) }
                 '/api/save-config'    { Send-Json $client (Api-SaveConfig $data) }
                 '/api/download-tools' { Send-Json $client (Api-DownloadTools) }
+                '/api/download-mysql-tools' { Send-Json $client (Api-DownloadMysqlTools) }
                 '/api/conn-list'   { Send-Json $client (Api-ConnList) }
                 '/api/conn-get'    { Send-Json $client (Api-ConnGet $data) }
                 '/api/conn-save'   { Send-Json $client (Api-ConnSave $data) }

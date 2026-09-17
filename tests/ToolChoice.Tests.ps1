@@ -13,7 +13,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-    $n.Name -in @('Get-MysqlServerBinDirs','Select-Tool','Get-PluginDir','New-Cnf','Get-CnfSafe','Get-SslLines',
+    $n.Name -in @('Get-MysqlServerBinDirs','Select-Tool','Get-MysqlDownloadInfo','Get-MysqlZipMember','Get-PluginDir','New-Cnf','Get-CnfSafe','Get-SslLines',
                   'Test-ClientIsMariaDB','Test-ToolIsMariaDB','Test-DumpIsMariaDB')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0
@@ -37,6 +37,36 @@ try {
     Check ((Select-Tool $false $null 'def.exe') -eq 'def.exe')    'MySQL server without them: the default pair'
     Check ((Select-Tool $true 'my.exe' 'def.exe') -eq 'def.exe')  'MariaDB server: the default pair'
     Check ((Select-Tool $null 'my.exe' 'def.exe') -eq 'def.exe')  'a server that could not be asked: the default pair'
+
+    "`n-- MySQL's download page gives the ZIP and its checksum --"
+    # Verbatim from https://dev.mysql.com/downloads/mysql/8.4.html (September 2026): the MSI row,
+    # then the ZIP row. The MD5 has to be the one printed for the ZIP, not the MSI's before it.
+    $page = @'
+<td class="sub-text">(mysql-8.4.11-winx64.msi)</td>
+            <td class="sub-text" style="text-align:right;" colspan="4">
+                MD5: <code class="md5">b5c515a0f410cd6903cd41057ed5d662</code> |
+        </tr>
+                            <td class="col1"><b>Windows (x86, 64-bit), ZIP Archive</b></td>
+                        <td class="col3">8.4.11</td>
+            <td class="col4">268.2M</td>
+            <td class="sub-text">(mysql-8.4.11-winx64.zip)</td>
+            <td class="sub-text" style="text-align:right;" colspan="4">
+                MD5: <code class="md5">2E833921898A9A030EA6BFE81BD811BC</code> |
+            <td class="sub-text">(mysql-8.4.11-winx64-debug-test.zip)</td>
+                MD5: <code class="md5">00000000000000000000000000000000</code> |
+'@
+    $info = Get-MysqlDownloadInfo $page
+    Check ($info.File -eq 'mysql-8.4.11-winx64.zip' -and $info.Version -eq '8.4.11') 'the ZIP and its version' "$($info.File) $($info.Version)"
+    Check ($info.Md5 -ceq '2e833921898a9a030ea6bfe81bd811bc') "the ZIP's own checksum, lowercased" $info.Md5
+    Check ($null -eq (Get-MysqlDownloadInfo '<html>nothing</html>')) 'no archive named, nothing claimed'
+    Check ($null -eq (Get-MysqlDownloadInfo '(mysql-9.1.0-winx64.zip) and no checksum').Md5) 'no checksum on the page, none invented'
+
+    "`n-- only the two client binaries are taken from the archive --"
+    Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64/bin/mysql.exe') -eq 'mysql.exe') 'bin/mysql.exe'
+    Check ((Get-MysqlZipMember 'mysql-8.4.11-winx64\bin\mysqldump.exe') -eq 'mysqldump.exe') 'bin\mysqldump.exe, backslashes'
+    foreach ($n in 'mysql-8.4.11-winx64/bin/mysqld.exe', 'mysql-8.4.11-winx64/lib/plugin/mysql.exe', 'mysql-8.4.11-winx64/mysql.exe', 'mysql-8.4.11-winx64/bin/x/mysql.exe', 'mysql.exe') {
+        Check ($null -eq (Get-MysqlZipMember $n)) "not $n"
+    }
 
     "`n-- the options file follows the tool it is written for --"
     $script:ToolsDir = Join-Path $root 'tools'
@@ -63,5 +93,21 @@ try {
 } finally {
     Remove-Item $root -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+"`n-- every script-level value a request reads is shared with the request threads --"
+# Requests run in a runspace pool, which sees only the variables listed in the seed loop at the
+# bottom of the script; any other $script: value is $null there. The MariaDB download read two of
+# those - its URL template and the plugin list - so it failed with "You cannot call a method on a
+# null-valued expression" unless a template had been saved.
+$topLevel = $ast.EndBlock.Statements | Where-Object { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] } |
+    ForEach-Object { $_.Left.Extent.Text } | Where-Object { $_ -like '$script:*' } | ForEach-Object { $_.Substring(8) } | Sort-Object -Unique
+$seedLine = ($ast.Extent.Text -split "`n" | Where-Object { $_ -match 'foreach \(\$vn in' } | Select-Object -First 1)
+$seeded = [regex]::Matches([string]$seedLine, "'(\w+)'") | ForEach-Object { $_.Groups[1].Value }
+$readInFunctions = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $false) |
+    ForEach-Object { $_.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -like 'script:*' }, $true) } |
+    ForEach-Object { $_.VariablePath.UserPath.Substring(7) } | Sort-Object -Unique
+Check (@($seeded).Count -gt 10) 'the seed list was found' "found $(@($seeded).Count)"
+$missing = @($topLevel | Where-Object { $readInFunctions -contains $_ -and $seeded -notcontains $_ })
+Check ($missing.Count -eq 0) 'none is missing from it' ($missing -join ', ')
 
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }
