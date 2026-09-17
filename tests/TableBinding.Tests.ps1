@@ -4,59 +4,18 @@
 # tests/ui/table-binding.test.mjs) runs against its ui/index.html - both editions share the UI, so they share
 # the test. Generated from that file; keep the two in step.
 #
-# -Source points at that file and makes the copy below checked rather than trusted: it must match,
-# or this fails. Without it, the two only stayed in step while someone remembered, and a stale copy
-# fails nothing - it quietly stops testing the UI this edition ships, which is the opposite of what
-# a passing test here is taken to mean. CI passes -Source; -Update regenerates the copy from it,
-# which is the fix when this fails.
+# That the copy below still matches that file is checked by tests/SharedUiTests.Tests.ps1, which
+# does the same for every shared test here and can regenerate them - so this file does not have to
+# be kept in step by hand, and a stale copy fails CI rather than passing quietly against whatever
+# it last knew about.
 #
 #   pwsh -NoProfile -File tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1
-#   pwsh -NoProfile -File tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1 -Source ../NOBS-SQL-Editor/tests/ui/table-binding.test.mjs
-#   ... -Source <path> -Update    rewrite the copy below from that file
 
-param([Parameter(Mandatory)][string]$ScriptPath, [string]$Source, [switch]$Update)
+param([Parameter(Mandatory)][string]$ScriptPath)
 
 if (-not (Test-Path $ScriptPath)) { "  FAIL  script not found: $ScriptPath"; exit 1 }
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) { "  FAIL  node not found on PATH - this UI is JavaScript and needs it to run"; exit 1 }
-if ($Update -and -not $Source) { "  FAIL  -Update needs -Source to copy from"; exit 1 }
-
-# The copy below, and the file it came from, compared as text: line endings normalised (this file
-# is checked out with CRLF on Windows) and trailing whitespace ignored, since that is what the
-# generator strips.
-function Get-EmbeddedTest {
-    $me = [IO.File]::ReadAllText($PSCommandPath) -replace "`r`n", "`n"
-    $m = [regex]::Match($me, '(?s)\$test = @''\n(.*?)\n''@\n')
-    if (-not $m.Success) { throw 'the embedded test could not be located in this file' }
-    return @{ Text = $m.Groups[1].Value; Start = $m.Groups[1].Index; Length = $m.Groups[1].Length; Whole = $me }
-}
-if ($Source) {
-    if (-not (Test-Path $Source)) { "  FAIL  -Source not found: $Source"; exit 1 }
-    $want = (([IO.File]::ReadAllText((Resolve-Path $Source).Path) -replace "`r`n", "`n")).TrimEnd()
-    $have = Get-EmbeddedTest
-    if ($Update) {
-        if ($have.Text -ceq $want) { "  ok    the embedded test is already identical to $Source" }
-        else {
-            $new = $have.Whole.Substring(0, $have.Start) + $want + $have.Whole.Substring($have.Start + $have.Length)
-            [IO.File]::WriteAllText($PSCommandPath, $new, (New-Object System.Text.UTF8Encoding($false)))
-            "  ok    regenerated the embedded test from $Source - review and commit it"
-        }
-        exit 0
-    }
-    if ($have.Text -cne $want) {
-        "  FAIL  the embedded test has drifted from $Source"
-        $a = $have.Text -split "`n"; $b = $want -split "`n"
-        for ($i = 0; $i -lt [Math]::Max($a.Count, $b.Count); $i++) {
-            if ($i -ge $a.Count) { "        line $($i+1): missing here -> $($b[$i])"; break }
-            if ($i -ge $b.Count) { "        line $($i+1): only here    -> $($a[$i])"; break }
-            if ($a[$i] -cne $b[$i]) { "        first difference at line $($i+1):"; "          here:   $($a[$i])"; "          there:  $($b[$i])"; break }
-        }
-        "        Regenerate with: pwsh -NoProfile -File $($MyInvocation.MyCommand.Name) $ScriptPath -Source $Source -Update"
-        exit 1
-    }
-    "  ok    the embedded test is identical to $Source"
-}
-
 $test = @'
 // Which table a result grid edits, and how text with control characters is shown.
 //
