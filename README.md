@@ -89,9 +89,13 @@ XAMPP).
 
 **MySQL servers get MySQL's own tools** when there are any: the two optional
 "MySQL servers" paths in Settings, or else the newest MySQL Server installation
-(`Program Files\MySQL\MySQL Server *\bin`). Export and Import ask the server
-what it is and pick the pair to match; MariaDB servers, and MySQL servers on a
-machine without MySQL's tools, use the default pair. It matters because MariaDB's
+(`Program Files\MySQL\MySQL Server *\bin`). That applies to everything - queries,
+the grid and Compare as well as Export and Import - since this edition runs all of
+it through `mysql.exe`. What a server is gets asked when you connect (with MySQL's
+client too, if the default one cannot reach it) and remembered per host and port.
+MariaDB servers, and MySQL servers on a machine without MySQL's tools, use the
+default pair. With MySQL's client, `verify-ca` works against a MySQL server's
+self-generated certificate from any address. It matters because MariaDB's
 mysqldump writes values into a MySQL table's generated columns, which MySQL
 refuses when the dump is restored. Without MySQL's tools such an export is
 refused rather than written.

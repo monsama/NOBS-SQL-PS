@@ -60,6 +60,8 @@ $script:RunningJobs = [System.Collections.Concurrent.ConcurrentDictionary[string
 # is the pscustomobject built by Open-QueryCursor (Process/Reader/Rows/Headers/RequestId/
 # Cnf/LastUsed/Lock). See Open-QueryCursor, Api-FetchCursorBatch, Api-CloseCursor below.
 $script:OpenCursors = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+# What each server is (host:port -> $true for MariaDB), shared by every runspace - see Get-ServerIsMariaDB.
+$script:ServerFlavor = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 # A simple thread-safe set of requestIds the user has asked to cancel. Compare operations run
 # MANY sequential queries (one per table/chunk) rather than one big one, so instead of trying to
 # kill whichever single sub-query happens to be in flight, each loop just checks this set between
@@ -607,22 +609,24 @@ function J-RowsFast {
 # Output options every result-reading mysql.exe call uses. See NobsXmlRows for why XML: it is the
 # only format in which NULL and the text 'NULL' differ. --binary-as-hex keeps binary and BIT values
 # exact (XML turns a NUL byte into a space) and renders them as 0x.., as the Tauri build does.
-function Get-ResultArgs {
-    if (-not (Test-ClientHasBinaryAsHex)) {
-        throw "This mysql.exe ($script:MysqlPath) does not support --binary-as-hex, which this app needs to read binary values without losing bytes. Open Settings and download the client tools, or select a newer MySQL (8.0.19 or later) or MariaDB client."
+function Get-ResultArgs { param([string]$Client)
+    if (-not $Client) { $Client = [string]$script:MysqlPath }
+    if (-not (Test-ClientHasBinaryAsHex $Client)) {
+        throw "This mysql.exe ($Client) does not support --binary-as-hex, which this app needs to read binary values without losing bytes. Open Settings and download the client tools, or select a newer MySQL (8.0.19 or later) or MariaDB client."
     }
     return @('--xml','--binary-as-hex','--default-character-set=utf8mb4')
 }
 # Cached against the path it probed, like Test-ClientIsMariaDB. MariaDB's client reports an unknown
 # option and still prints its version with exit code 0, so the text is what tells.
-function Test-ClientHasBinaryAsHex {
-    $path = [string]$script:MysqlPath
-    if ($script:ClientBinHex -and $script:ClientBinHex.Path -eq $path) { return $script:ClientBinHex.Ok }
+function Test-ClientHasBinaryAsHex { param([string]$Path)
+    if (-not $Path) { $Path = [string]$script:MysqlPath }
+    if (-not ($script:BinHexByPath -is [hashtable])) { $script:BinHexByPath = @{} }
+    if ($script:BinHexByPath.ContainsKey($Path)) { return $script:BinHexByPath[$Path] }
     $ok = $true
-    if ($path -and (Test-Path $path)) {
-        try { $ok = -not ((& $path --binary-as-hex --version 2>&1 | Out-String) -match '(?i)unknown (option|variable)') } catch { }
+    if ($Path -and (Test-Path $Path)) {
+        try { $ok = -not ((& $Path --binary-as-hex --version 2>&1 | Out-String) -match '(?i)unknown (option|variable)') } catch { }
     }
-    $script:ClientBinHex = @{ Path = $path; Ok = $ok }
+    $script:BinHexByPath[$Path] = $ok
     return $ok
 }
 # Whether running $sql a second time is harmless: Test-SqlReadOnly, minus the statements that
@@ -645,7 +649,8 @@ function Test-SqlSafeToRerun { param([string]$sql)
 function Get-ResultHeaders { param($conn,$sql,$db)
     if (-not (Test-SqlSafeToRerun $sql)) { return $null }
     Initialize-DumpDb
-    $cnf = New-Cnf $conn
+    $my = Get-Mysql $conn
+    $cnf = New-Cnf $conn -Tool $my
     $sa = New-SqlArg $sql
     $p = $null
     try {
@@ -653,7 +658,7 @@ function Get-ResultHeaders { param($conn,$sql,$db)
         if ($db) { $a += "--database=$db" }
         $a += @("-e",$sa.arg)
         $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $script:MysqlPath; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.FileName = $my; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
         $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
         $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         $psi.Arguments = Format-Args $a
@@ -666,7 +671,7 @@ function Get-ResultHeaders { param($conn,$sql,$db)
         $p.WaitForExit()
         if ($null -eq $line -or $line -eq '') { return $null }
         # MySQL's client ends lines with CRLF on Windows (see NobsXmlRows).
-        if (-not (Test-ClientIsMariaDB) -and $line.EndsWith("`r")) { $line = $line.Substring(0, $line.Length - 1) }
+        if (-not (Test-ClientIsMariaDB $my) -and $line.EndsWith("`r")) { $line = $line.Substring(0, $line.Length - 1) }
         return ,@($line.Split([char]9) | ForEach-Object { ConvertFrom-RawText $_ })
     } finally {
         if ($p) { try { $p.Dispose() } catch { } }
@@ -683,15 +688,16 @@ $script:NoHeadersNote = "Query OK. The result was empty, and its column names ar
 function Run-Query2 {
     param($conn,$sql,$db,$RequestId,[switch]$WithColumns)
     Initialize-DumpDb
-    try { $ra = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
-    $cnf=New-Cnf $conn
+    $my = Get-Mysql $conn
+    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    $cnf=New-Cnf $conn -Tool $my
     try {
         $a=@("--defaults-extra-file=$cnf") + $ra
         if($db){ $a+="--database=$db" }
         $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
         # Read losslessly, then parse (see NobsXmlRows). This used to parse --batch output, which
         # cannot tell NULL from the text 'NULL' - so Compare copied such a value as a real NULL.
-        $r=Run-Proc $script:MysqlPath $a $RequestId -RawOut
+        $r=Run-Proc $my $a $RequestId -RawOut
         if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
         $x = New-Object NobsXmlRows (New-Object System.IO.StringReader ([string]$r.out))
@@ -789,14 +795,15 @@ function Open-QueryCursor {
     param($conn,$sql,$db,$RequestId,[int]$PageSize=1000)
     if ($PageSize -lt 1) { $PageSize = 1000 }
     Initialize-DumpDb
-    try { $ra = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
-    $cnf = New-Cnf $conn
+    $my = Get-Mysql $conn
+    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    $cnf = New-Cnf $conn -Tool $my
     $a=@("--defaults-extra-file=$cnf","--quick") + $ra
     if ($db) { $a += "--database=$db" }
     $sqlArg = New-SqlArg $sql
     $a += @("-e",$sqlArg.arg)
     $psi=New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName=$script:MysqlPath; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
+    $psi.FileName=$my; $psi.UseShellExecute=$false; $psi.CreateNoWindow=$true
     $psi.RedirectStandardOutput=$true; $psi.RedirectStandardError=$true
     # Result rows are parsed out of this stream, so it must not lose bytes. A UTF-8 reader
     # replaces every invalid byte with U+FFFD, which silently destroyed binary column values
@@ -852,13 +859,14 @@ function Open-QueryCursor {
 # --binary-as-hex makes a binary key read exactly as Run-Query2 reads it (0x..): as raw bytes it
 # went through a UTF-8 decode that replaced anything invalid, and no longer matched its own row.
 function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
-    try { $null = Get-ResultArgs } catch { return @{ ok=$false; err=$_.Exception.Message } }
-    $cnf=New-Cnf $conn
+    $my = Get-Mysql $conn
+    try { $null = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    $cnf=New-Cnf $conn -Tool $my
     try {
         $a=@("--defaults-extra-file=$cnf","--batch","--raw","--binary-as-hex","--default-character-set=utf8mb4")
         if($db){ $a+="--database=$db" }
         $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
-        $r=Run-Proc $script:MysqlPath $a $RequestId
+        $r=Run-Proc $my $a $RequestId
         if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
         if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
         if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
@@ -878,12 +886,14 @@ function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
 # Test the connection and return the server version (called when you click Connect).
 function Api-Connect { param($conn)
     if (-not $script:MysqlPath -or -not (Test-Path $script:MysqlPath)) { return '{"ok":false,"error":"mysql.exe not found. Open Settings in the app to select it, or to download the MariaDB client tools."}' }
-    $cnf=New-Cnf $conn
-    try {
-        $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
-        if($r.exit -eq 0){ $v=($r.out).Trim(); $script:ServerIsMariaDB=($v -match 'MariaDB'); return '{"ok":true,"version":'+(J-Str $v)+',"mariadb":'+(($script:ServerIsMariaDB).ToString().ToLower())+'}' }
-        return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-TlsErr (Friendly-AuthErr (FirstErr $r.err)) $conn)))+'}'
-    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    # Always asked afresh here, so a server swapped behind the same address is noticed.
+    $v = Get-ServerVersion $conn
+    if ($null -ne $v.version) {
+        $maria = [bool]($v.version -match 'MariaDB')
+        $script:ServerFlavor[(Get-ServerFlavorKey $conn)] = $maria
+        return '{"ok":true,"version":'+(J-Str $v.version)+',"mariadb":'+$maria.ToString().ToLower()+',"client":'+(J-Str (Get-Mysql $conn))+'}'
+    }
+    return '{"ok":false,"error":'+(J-Str ("Connection failed: "+(Friendly-TlsErr (Friendly-AuthErr (FirstErr $v.err)) $conn)))+'}'
 }
 # List databases with their sizes for the left sidebar.
 function Api-Schemas { param($conn)
@@ -1006,9 +1016,10 @@ function New-SqlArg {
 
 # Execute SQL that returns no rows (INSERT / UPDATE / DDL ...).
 function Run-Exec { param($conn,$sql)
-    $cnf=New-Cnf $conn
+    $my=Get-Mysql $conn
+    $cnf=New-Cnf $conn -Tool $my
     $sa=New-SqlArg $sql
-    try { $r=Run-Proc $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","-e",$sa.arg)
+    try { $r=Run-Proc $my @("--defaults-extra-file=$cnf","--comments","-e",$sa.arg)
         if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue } }
 }
@@ -1193,7 +1204,8 @@ function Api-KillProcess { param($conn,$data)
 }
 # Endpoint: run a multi-statement SQL script.
 function Api-Script { param($conn,$data)
-    $cnf=New-Cnf $conn
+    $my=Get-Mysql $conn
+    $cnf=New-Cnf $conn -Tool $my
     $tmp=Join-Path $env:TEMP ("mysqlscript_"+[Guid]::NewGuid().ToString('N')+".sql")
     $requestId=[string]$data.requestId
     try {
@@ -1206,9 +1218,9 @@ function Api-Script { param($conn,$data)
         # table half-updated - the one outcome a pending-changes model exists to prevent.
         if($data.transaction){ $scriptSql = "START TRANSACTION;`n" + $scriptSql + "`nCOMMIT;" }
         [IO.File]::WriteAllText($tmp, $scriptSql, (New-Object System.Text.UTF8Encoding($false)))
-        $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId
+        $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $null $tmp $null $requestId
         if ($r.exit -ne 0 -and (FirstErr $r.err) -match "ASCII '\\0'.*--binary-mode") {
-            $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId
+            $r=Run-Stdin $my @("--defaults-extra-file=$cnf","--comments","--binary-mode") $null $tmp $null $requestId
             if($r.exit -eq 0){ return '{"ok":true,"message":"Auto-retried with --binary-mode (statement contained raw NUL bytes)."}' }
         }
         if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
@@ -1381,21 +1393,68 @@ function Get-MysqlServerBinDirs { param([string[]]$Bases)
     return @($found | Sort-Object -Property @{ Expression = 'Ver'; Descending = $true }, Dir | ForEach-Object { $_.Dir })
 }
 # The tool to use for a MySQL server, with where it came from, or $null for "the default pair".
+# Asked on every query to a MySQL server, so the answer is kept until the config file or a MySQL
+# folder under Program Files changes.
 function Get-MysqlFlavorTool { param([string]$Base)
+    $bases = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+    $stamp = "$Base"
+    foreach ($f in @([string]$script:CfgFile) + @($bases | ForEach-Object { Join-Path $_ 'MySQL' })) {
+        try { $stamp += '|' + (Get-Item -LiteralPath $f -ErrorAction Stop).LastWriteTimeUtc.Ticks } catch { $stamp += '|-' }
+    }
+    if (-not ($script:FlavorToolCache -is [hashtable])) { $script:FlavorToolCache = @{} }
+    if ($script:FlavorToolCache.ContainsKey($stamp)) { return $script:FlavorToolCache[$stamp] }
+    $res = $null
     $cfg = Load-Cfg
     $key = "$($Base)_bin_mysql"
-    if ($cfg -and $cfg.$key -and (Test-Path -LiteralPath ([string]$cfg.$key))) { return @{ Path = [string]$cfg.$key; Source = 'Saved configuration' } }
-    foreach ($d in (Get-MysqlServerBinDirs @($env:ProgramFiles, ${env:ProgramFiles(x86)}))) {
-        $f = Join-Path $d "$Base.exe"
-        if (Test-Path -LiteralPath $f) { return @{ Path = $f; Source = "Found in $(Split-Path -Parent $d)" } }
+    if ($cfg -and $cfg.$key -and (Test-Path -LiteralPath ([string]$cfg.$key))) { $res = @{ Path = [string]$cfg.$key; Source = 'Saved configuration' } }
+    if (-not $res) {
+        foreach ($d in (Get-MysqlServerBinDirs $bases)) {
+            $f = Join-Path $d "$Base.exe"
+            if (Test-Path -LiteralPath $f) { $res = @{ Path = $f; Source = "Found in $(Split-Path -Parent $d)" }; break }
+        }
     }
-    return $null
+    $script:FlavorToolCache[$stamp] = $res
+    return $res
 }
-# $true for MariaDB, $false for MySQL, $null if the server could not be asked.
+# $true for MariaDB, $false for MySQL, $null if the server could not be asked. Remembered per
+# host and port in a dictionary every runspace shares, so it costs one query per server, not one
+# per request; connecting asks again.
+function Get-ServerFlavorKey { param($conn) '{0}:{1}' -f ([string]$conn.host).Trim().ToLower(), ([string]$conn.port).Trim() }
 function Get-ServerIsMariaDB { param($conn)
-    $v = Run-Query2 $conn 'SELECT VERSION()' $null $null
-    if (-not $v.ok -or @($v.rows).Count -eq 0) { return $null }
-    return ([string]$v.rows[0][0]) -match 'MariaDB'
+    if (-not $conn -or $null -eq $script:ServerFlavor) { return $null }
+    $key = Get-ServerFlavorKey $conn
+    $known = $null
+    if ($script:ServerFlavor.TryGetValue($key, [ref]$known)) { return $known }
+    $v = Get-ServerVersion $conn
+    if ($null -eq $v.version) { return $null }
+    $maria = [bool]($v.version -match 'MariaDB')
+    $script:ServerFlavor[$key] = $maria
+    return $maria
+}
+# SELECT VERSION() with the default client, and then with MySQL's when that one cannot connect -
+# only MySQL's client can verify a MySQL server's CA without its host name, so for such a
+# connection it is the only way to find out what the server is. Returns version (or $null) and err.
+function Get-ServerVersion { param($conn)
+    $cands = @([string]$script:MysqlPath)
+    $myTool = Get-MysqlFlavorTool 'mysql'
+    if ($myTool -and $myTool.Path -ne $cands[0]) { $cands += $myTool.Path }
+    $firstErr = $null
+    foreach ($exe in $cands) {
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { continue }
+        $cnf = New-Cnf $conn -Tool $exe
+        try {
+            $r = Run-Proc $exe @("--defaults-extra-file=$cnf","-N","-e","SELECT VERSION()")
+            if ($r.exit -eq 0) { return @{ version = ([string]$r.out).Trim(); err = $null } }
+            if ($null -eq $firstErr) { $firstErr = $r.err }
+        } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+    }
+    return @{ version = $null; err = $firstErr }
+}
+# The mysql.exe for a connection: MySQL's own for a MySQL server when there is one, the default
+# client otherwise. Every place that runs mysql.exe for a connection asks this.
+function Get-Mysql { param($conn)
+    if (-not $conn) { return [string]$script:MysqlPath }
+    return Get-ToolFor $conn 'mysql'
 }
 # Only a server known to be MySQL switches; MariaDB, or a server that could not be asked, keeps
 # the default pair - which is also the fallback when there are no MySQL tools.
@@ -2067,11 +2126,12 @@ function Api-ImportCsv { param($conn,$data)
     }
     if($batch.Count){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';') }
     [void]$sb.AppendLine('COMMIT;')
-    $cnf=New-Cnf $conn
+    $my=Get-Mysql $conn
+    $cnf=New-Cnf $conn -Tool $my
     $tmp=Join-Path $env:TEMP ("mysqlcsv_"+[Guid]::NewGuid().ToString('N')+".sql")
     try {
         [IO.File]::WriteAllText($tmp,$sb.ToString(),(New-Object System.Text.UTF8Encoding($false)))
-        $r=Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf") $null $tmp
+        $r=Run-Stdin $my @("--defaults-extra-file=$cnf") $null $tmp
         if($r.exit -eq 0){ return '{"ok":true,"message":'+(J-Str ("Imported $n row(s) into $db.$table (columns: "+($useCols -join ', ')+")"))+'}' }
         return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}'
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
@@ -2402,14 +2462,15 @@ function Get-CreateTableSqlBatch { param($conn,$db,$tables,$RequestId)
     $result = @{}
     if(-not $tables -or $tables.Count -eq 0){ return $result }
     $chunkSize = 50
-    $cnf = New-Cnf $conn
+    $dump = Get-ToolFor $conn 'mysqldump'
+    $cnf = New-Cnf $conn -Tool $dump
     try {
         for($i=0; $i -lt $tables.Count; $i += $chunkSize){
             if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
             $endIdx = [Math]::Min($i+$chunkSize,$tables.Count) - 1
             $chunk = $tables[$i..$endIdx]
             $a = @("--defaults-extra-file=$cnf","--no-data","--compact","--skip-comments",$db) + $chunk
-            $r = Run-Proc $script:MysqldumpPath $a $RequestId
+            $r = Run-Proc $dump $a $RequestId
             if($r.exit -ne 0 -or -not $r.out){ continue }
             $parts = $r.out -split '(?=CREATE TABLE `)'
             foreach($part in $parts){
@@ -2855,9 +2916,10 @@ function Api-CompareRowsApplyDiff { param($data)
     foreach($s in $skipped){ [void]$log.Add("SKIPPED (no columns/key) id=$s") }
     if($stmts.Count -eq 0){ return '{"ok":true,"log":'+(J-Arr $log)+'}' }
     $script = "START TRANSACTION;`n" + ($stmts -join "`n") + "`nCOMMIT;`n"
-    $cnf = New-Cnf $tgt
+    $my = Get-Mysql $tgt
+    $cnf = New-Cnf $tgt -Tool $my
     try {
-        $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $script $null
+        $r2 = Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $script $null
         if($r2.exit -eq 0){
             foreach($d in $pkDescs){ [void]$log.Add("OK  updated id=$d") }
             return '{"ok":true,"log":'+(J-Arr $log)+'}'
@@ -2914,7 +2976,8 @@ function Api-CompareRowsInsertAll { param($data)
     $srcBin = Get-BinaryColumnSet $src $srcDb $table
     $tgtBin = Get-BinaryColumnSet $tgt $tgtDb $table
     if($null -eq $srcBin -or $null -eq $tgtBin){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $table on both sides.")+'}' }
-    $cnf = New-Cnf $tgt
+    $my = Get-Mysql $tgt
+    $cnf = New-Cnf $tgt -Tool $my
     try {
         for($fi=0; $fi -lt $missingRows.Count; $fi += $chunkSize){
             if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
@@ -2929,7 +2992,7 @@ function Api-CompareRowsInsertAll { param($data)
             $obj = (SqlId $tgtDb) + '.' + (SqlId $table)
             $valuesSql = ($fr.rows | ForEach-Object { Get-ValuesTuple $cols $_ $tgtBin }) -join ','
             $sql = "INSERT INTO $obj ($colList) VALUES $valuesSql"
-            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null $null $rid
+            $r2 = Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $sql $null $null $rid
             if($r2.exit -eq 0){ $inserted += $fr.rows.Count; [void]$log.Add("OK  inserted "+$fr.rows.Count+" row(s) ("+($inserted)+" of "+$missingTotal+" so far)") }
             else { [void]$log.Add("FAILED (insert) rows "+$fi+"-"+$fEnd+" : "+(FirstErr $r2.err)) }
         }
@@ -2953,7 +3016,8 @@ function Api-CompareRowsApply { param($data)
     if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $db.$table.")+'}' }
     $log = New-Object System.Collections.ArrayList
     $batchSize = 500
-    $cnf = New-Cnf $tgt
+    $my = Get-Mysql $tgt
+    $cnf = New-Cnf $tgt -Tool $my
     try {
         for($i=0; $i -lt $rows.Count; $i += $batchSize){
             $endIdx = [Math]::Min($i+$batchSize,$rows.Count) - 1
@@ -2963,7 +3027,7 @@ function Api-CompareRowsApply { param($data)
             # IMPORTANT: pipe the SQL via stdin (Run-Stdin), not as a "-e" command-line argument
             # (Run-Proc) - a batch of rows easily exceeds Windows' command-line length limit
             # ("The filename or extension is too long"), especially for wide tables.
-            $r2 = Run-Stdin $script:MysqlPath @("--defaults-extra-file=$cnf","--comments") $sql $null
+            $r2 = Run-Stdin $my @("--defaults-extra-file=$cnf","--comments") $sql $null
             $batchNum = [int]($i/$batchSize)+1
             if($r2.exit -eq 0){ [void]$log.Add("OK  inserted "+$batch.Count+" row(s) (batch $batchNum)") }
             else { [void]$log.Add("FAILED batch $batchNum : "+(FirstErr $r2.err)) }
@@ -3442,7 +3506,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysql" style="flex:1" placeholder="full path to mysql.exe (or mariadb.exe)"><button onclick="browse({title:'Select mysql.exe / mariadb.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysql').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDump" style="flex:1" placeholder="full path to mysqldump.exe (or mariadb-dump.exe)"><button onclick="browse({title:'Select mysqldump.exe / mariadb-dump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDump').value=pp})">Browse...</button></div>
  <div style="font-size:12px;font-weight:600;margin:10px 0 2px">MySQL servers <span class="muted" style="font-weight:400">- optional</span></div>
- <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">Export and Import use MySQL's own tools for a MySQL server: these two paths, or else the newest MySQL Server installation (Program Files\MySQL\MySQL Server *\bin). MariaDB's mysqldump cannot make a restorable dump of a MySQL table with generated columns, and only MySQL's client checks a CA without the host name. Leave empty to detect automatically.</div>
+ <div class="muted" style="font-size:11px;line-height:1.5;margin-bottom:6px">This edition runs everything through mysql.exe, so a MySQL server gets MySQL's own tools throughout - queries as well as Export and Import: these two paths, or else the newest MySQL Server installation (Program Files\MySQL\MySQL Server *\bin). MariaDB's mysqldump cannot make a restorable dump of a MySQL table with generated columns, and only MySQL's client checks a CA without the host name. Leave empty to detect automatically.</div>
  <div class="row"><span style="width:92px">mysql</span><input id="cfgMysqlMy" style="flex:1" placeholder="MySQL's mysql.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysql.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgMysqlMy').value=pp})">Browse...</button></div>
  <div class="row"><span style="width:92px">mysqldump</span><input id="cfgDumpMy" style="flex:1" placeholder="MySQL's mysqldump.exe - empty: detect a MySQL Server installation"><button onclick="browse({title:'Select MySQL\'s mysqldump.exe',filter:'*.exe',mode:'file',onPick:pp=>$('cfgDumpMy').value=pp})">Browse...</button></div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">DOWNLOAD</div>
@@ -7751,7 +7815,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ClientBinHex','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }

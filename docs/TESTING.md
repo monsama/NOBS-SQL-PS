@@ -124,6 +124,11 @@ in this run they say they skipped.
 
 ### The CA certificate checks
 
+With `NOBS_TEST_REMOTE_HOST` set as well - an address of the MySQL test server other than
+loopback, such as this machine's LAN address - the suite connects there with `verify-ca` through
+the app, as a temporary user it creates and drops. That is the case only MySQL's client can do,
+because the certificate a MySQL server generates for itself never names a real host.
+
 Set `NOBS_TEST_SERVER_CA` to the test server's own CA to run the one check that matters most:
 `verify-ca` connecting with it. Without that, the remaining CA checks only show that a *wrong* CA
 is refused — and a CA being silently ignored would be refused in exactly the same way against a
@@ -167,8 +172,8 @@ Every check is a regression test for a bug that actually shipped:
   characters `0x`), a binary key, CR/LF, a NUL inside text (which XML output turns into a space),
   BIT, spatial, and a latin1 target. The diff also sees NULL against `''` and `'null'` against
   `'NULL'`.
-- **Export and import use the tools that match the server**: MySQL's own for a MySQL server when
-  the machine has them, and a table with generated columns comes back whole from its own dump.
+- **The tools match the server**: MySQL's own for a MySQL server when the machine has them - for
+  queries (`verify-ca` over a LAN address) as well as export and import, and a table with generated columns comes back whole from its own dump.
   Without MySQL's tools the export must be refused instead.
 - **Paging a cursor delivers every row exactly once**, with no row dropped at a page boundary.
 - **Result values arrive as themselves**: NULL vs `'NULL'`, CR/LF inside text, empty vs NULL

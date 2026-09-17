@@ -719,6 +719,40 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         # See the Tauri repo's docs/TESTING.md for pulling the server's CA off the wire with openssl.
         if ($null -eq $caOk.rightCa) { "  skip  NOBS_TEST_SERVER_CA not set - the right-CA check did not run" }
         else { Check $caOk.rightCa 'ssl=verify-ca connects with the server''s own CA' }
+        # --- a MySQL server is queried with MySQL's own client ----------------------------------------
+        # Only MySQL's client can check a CA without the host name ('verify-ca'), and a MySQL server's
+        # generated certificate never names a real host - so over anything but loopback, MariaDB's
+        # client cannot connect to it that way at all. This edition runs every query through mysql.exe,
+        # so a MySQL server gets MySQL's client throughout. Needs the server's CA and an address other
+        # than loopback (NOBS_TEST_REMOTE_HOST, e.g. this machine's LAN address).
+        $remote = $env:NOBS_TEST_REMOTE_HOST
+        $tools = Api '/api/tools-status' @{}
+        $cx = Api '/api/connect' @{ conn = $conn }
+        if (-not $env:NOBS_TEST_SERVER_CA -or -not $remote) {
+            "  skip  NOBS_TEST_SERVER_CA / NOBS_TEST_REMOTE_HOST not set - verify-ca through MySQL's client did not run"
+        } elseif ($cx.mariadb -or -not $tools.mysql_for_mysql) {
+            "  skip  not a MySQL server, or no MySQL client tools here - verify-ca through MySQL's client did not run"
+        } else {
+            Check ($cx.client -eq $tools.mysql_for_mysql) "a MySQL server is queried with MySQL's client" "client=$($cx.client)"
+            $caUser = "nobs_live_ca_$PID"; $caPw = 'Ca-' + [Guid]::NewGuid().ToString('N')
+            $made = Api '/api/exec' @{ conn = $conn; sql = "CREATE USER '$caUser'@'%' IDENTIFIED BY '$caPw'" }
+            try {
+                Api '/api/exec' @{ conn = $conn; sql = "GRANT SELECT ON nobs_test.* TO '$caUser'@'%'" } | Out-Null
+                $rc = @{ host = $remote; port = $conn.port; user = $caUser; password = $caPw; ssl = 'verify-ca'; sslCa = $env:NOBS_TEST_SERVER_CA }
+                $rcx = Api '/api/connect' @{ conn = $rc }
+                Check ($made.ok -and $rcx.ok) "verify-ca connects to a MySQL server over $remote" ($rcx | ConvertTo-Json -Compress)
+                $rq = Api '/api/query' @{ conn = $rc; db = 'nobs_test'; sql = 'SELECT COUNT(*) FROM ro_canary' }
+                Check ($rq.ok -and [string]$rq.rows[0][0] -eq '3') 'and queries over it' ($rq | ConvertTo-Json -Compress)
+                $bad = @{ host = $remote; port = $conn.port; user = $caUser; password = $caPw; ssl = 'verify-ca'; sslCa = $bogusCa }
+                if ($bogusCa) {
+                    $bx = Api '/api/connect' @{ conn = $bad }
+                    Check (-not $bx.ok) 'while a CA that did not sign the certificate is still refused' ($bx | ConvertTo-Json -Compress)
+                }
+            } finally {
+                Api '/api/exec' @{ conn = $conn; sql = "DROP USER IF EXISTS '$caUser'@'%'" } | Out-Null
+            }
+        }
+
     } finally { Remove-Item $bogusCa -Force -ErrorAction SilentlyContinue }
     }
 
