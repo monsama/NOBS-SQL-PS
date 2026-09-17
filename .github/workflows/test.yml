@@ -107,10 +107,21 @@ jobs:
         shell: pwsh
         run: ./tests/UpdateCheck.Tests.ps1 ./NOBSSQL.ps1
 
-      # Which table a result grid saves to, and control characters shown in text.
+      # Which table a result grid saves to, and control characters shown in text. The test file is
+      # shared with the Tauri edition and lives there; the copy in this repository is generated
+      # from it, so the editor repository is checked out and -Source compares the two. Without
+      # that, a stale copy fails nothing and silently stops testing the UI this edition ships.
+      - name: Check out NOBS-SQL-Editor (the shared UI test)
+        uses: actions/checkout@v7
+        with:
+          repository: monsama/NOBS-SQL-Editor
+          path: editor
+          sparse-checkout: tests/ui
+          sparse-checkout-cone-mode: false
+
       - name: Run table binding tests
         shell: pwsh
-        run: ./tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1
+        run: ./tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1 -Source ./editor/tests/ui/table-binding.test.mjs
 
       # Saving grid edits: every change must match exactly one row.
       - name: Run grid save tests
