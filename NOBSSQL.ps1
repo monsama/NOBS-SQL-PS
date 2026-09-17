@@ -35,6 +35,8 @@
 #>
 param([switch]$NoBrowser)
 
+# Shown in the startup banner and the About box. Same numbering as the desktop edition's releases.
+$script:AppVersion = '1.2.0'
 $script:PackedPayload = ''
 # Default MariaDB client-tools download URL, editable in Settings and stored under
 # "mariadb_download_url_template" in the same config file as the tool paths. {version} and
@@ -3611,7 +3613,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <hr style="border:none;border-top:1px solid var(--bd2);margin:10px 0">
  <div class="row" style="gap:8px"><button class="sm needsconn" title="Clear the database overview cache and reload" onclick="clearOverviewCache()">Refresh Cache</button><button class="sm" title="Toggle light / dark theme" onclick="toggleTheme()">Switch Theme</button><button class="sm" title="Keyboard shortcuts" onclick="show('mShortcuts')">Shortcut Info</button><button class="sm" title="Version, license and project information" onclick="openAbout()">About</button></div>
  <div class="row" style="justify-content:flex-end;margin-top:12px"><button class="go" onclick="saveSettings()">Save</button><button onclick="hide('mSettings')">Close</button></div></div></div>
-<div class="modal floating" id="mAbout"><div class="box" style="width:560px;max-width:92vw;top:70px;left:150px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mAbout')" title="Drag to move"><h3 id="aboutTitle" style="margin:0">NOBS SQL Editor</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mAbout')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
+<div class="modal floating" id="mAbout"><div class="box" style="width:560px;max-width:92vw;top:70px;left:150px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none" onmousedown="floatDragStart(event,'mAbout')" title="Drag to move"><h3 id="aboutTitle" style="margin:0">NOBS SQL Editor __APP_VERSION__</h3><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mAbout')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></div>
  <div class="muted" style="font-size:12px;line-height:1.6">
   A lightweight client for MySQL and MariaDB, running as a single PowerShell script.<br>
   Copyright &copy; 2026 Viktor Ljuca
@@ -4036,7 +4038,8 @@ function showToolError(logId,ownerModalId,msg){
  btn.onclick=()=>{if(ownerModalId)hide(ownerModalId);openSettings();};
  row.appendChild(btn); el.appendChild(row);
 }
-// No version lookup here, unlike the Tauri build: this backend has no app-info endpoint, and
+// No version lookup here, unlike the Tauri build: the version is written into this page when the
+// server starts (a placeholder in the title). This backend has no app-info endpoint, and
 // api() treats any failed call as the server being gone - it calls showDead(), which would throw
 // a false "server down" overlay over the app just for opening the About box.
 function openAbout(){ show('mAbout'); }
@@ -7794,7 +7797,7 @@ window.addEventListener('beforeunload',e=>{saveSession();if(anyPending()){e.prev
 (function(){function initSideResize(){const sd=$('side'),rz=$('sideResize'),mn=$('main');if(!sd||!rz||!mn){setTimeout(initSideResize,300);return;}const saved=parseInt(localStorage.getItem('sideW')||'',10);if(saved&&saved>=280)sd.style.width=saved+'px';let drag=false;rz.addEventListener('pointerdown',e=>{drag=true;rz.classList.add('drag');try{rz.setPointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='none';e.preventDefault();});rz.addEventListener('pointermove',e=>{if(!drag)return;const left=mn.getBoundingClientRect().left;let w=e.clientX-left;const max=Math.max(280,window.innerWidth-320);w=Math.max(280,Math.min(w,max));sd.style.width=w+'px';});const end=e=>{if(!drag)return;drag=false;rz.classList.remove('drag');try{rz.releasePointerCapture(e.pointerId);}catch(_){}document.body.style.userSelect='';localStorage.setItem('sideW',String(parseInt(sd.style.width,10)||280));};rz.addEventListener('pointerup',end);rz.addEventListener('pointercancel',end);rz.addEventListener('dblclick',()=>{sd.style.width='280px';localStorage.setItem('sideW','280');});}initSideResize();})();
 </script></body></html>
 '@
-$Html = $Html.Replace('__TOKEN__', $Token)
+$Html = $Html.Replace('__TOKEN__', $Token).Replace('__APP_VERSION__', $script:AppVersion)
 
 Resolve-Tools
 # Probe the client's SSL flag dialect once here, so the answer is seeded into every runspace
@@ -7815,7 +7818,7 @@ if (-not $listener) {
 }
 $url = "http://127.0.0.1:$port/"
 Write-Host ""
-Write-Host "  NOBS SQL Editor is running." -ForegroundColor Green
+Write-Host "  NOBS SQL Editor $script:AppVersion is running." -ForegroundColor Green
 Write-Host "  Open:  $url"
 if ($script:MysqlPath){ Write-Host "  mysql:     $script:MysqlPath" } else { Write-Host "  mysql.exe NOT found - open Settings in the app to select it, or to download the MariaDB client tools." -ForegroundColor Yellow }
 if ($script:MysqldumpPath){ Write-Host "  mysqldump: $script:MysqldumpPath" }
