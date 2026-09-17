@@ -1,0 +1,12 @@
+# Weekly pull requests for outdated GitHub Actions - the script itself has no package dependencies.
+# Minor and patch updates come together; a major update comes on its own. Every pull request runs
+# the full test workflow before it is merged.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor:
+        update-types: [minor, patch]
