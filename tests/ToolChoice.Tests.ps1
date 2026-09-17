@@ -139,6 +139,20 @@ Check ((Get-ToolVersionLabel 'mysqldump  Ver 8.4.9 for Win64 on x86_64 (MySQL Co
 Check ((Get-ToolVersionLabel 'C:\x\mysql.exe  Ver 8.0.46 for Win64 on x86_64 (MySQL Community Server - GPL)') -eq 'MySQL 8.0.46') "MySQL's client"
 Check ($null -eq (Get-ToolVersionLabel 'something else')) 'anything else is not a version'
 
+"`n-- every function using the C# helpers loads them first --"
+# The helper types are compiled on first use (Initialize-DumpDb). The script-results endpoint used
+# them without that, so as the first request after start it failed with "Unable to find type".
+$loadsLater = @{
+    'Initialize-DumpDb'    = 'defines them'
+    'Run-Stdin'            = 'uses them only for -Rename, which only Api-Import passes'
+    'Api-FetchCursorBatch' = 'reads a cursor Open-QueryCursor made'
+}
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+    $b = $f.Body.Extent.Text
+    if ($b -notmatch 'Nobs(XmlRows|DumpDb|Lf|ResultSet)' -or $loadsLater.ContainsKey($f.Name)) { continue }
+    Check ($b -match 'Initialize-DumpDb') "$($f.Name) loads the helpers before using them"
+}
+
 "`n-- schema sync writes a column as the server defines it --"
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('Get-ColumnDefinitions','ColDefinition','ColDefLine','ColDefaultClause','SqlId','SqlLit','Needs-Quote') }, $true) |
     ForEach-Object { Invoke-Expression $_.Extent.Text }

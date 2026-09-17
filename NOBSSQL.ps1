@@ -1305,6 +1305,59 @@ function Api-Script { param($conn,$data)
         if($r.exit -eq 0){ return '{"ok":true}' } else { return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}' }
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
+# Endpoint: run a script on one connection and return every result set it produces - a
+# procedure's SELECTs, or several SELECTs in a row - which Api-Script discards. At most maxRows
+# rows (default 1000) are kept per result; rowCount counts them all. mysql.exe stops at the first
+# error, which is returned with the results produced before it.
+function Api-ScriptResults { param($conn,$data)
+    Initialize-DumpDb
+    $my = Get-Mysql $conn
+    try { $ra = Get-ResultArgs $my } catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
+    $maxRows = [int]$data.maxRows; if ($maxRows -lt 1) { $maxRows = 1000 }
+    $scriptSql = [string]$data.sql
+    # The database as an option rather than a USE line, so error line numbers match the script.
+    $dbArg = @(); if ($data.db) { $dbArg = @("--database=" + [string]$data.db) }
+    $cnf = New-Cnf $conn -Tool $my
+    $requestId = [string]$data.requestId
+    $p = $null; $entry = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $my; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $psi.Arguments = Format-Args (@("--defaults-extra-file=$cnf", "--comments") + $ra + $dbArg)
+        $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
+        if ($requestId) { $entry = [pscustomobject]@{ Process=$p; Cancelled=$false }; $script:RunningQueries[$requestId] = $entry }
+        $et = $p.StandardError.ReadToEndAsync()
+        $feed = [NobsXmlRows]::FeedAndClose($p.StandardInput.BaseStream, [Text.Encoding]::UTF8.GetBytes($scriptSql))
+        $sets = $null; $readErr = $null
+        try { $sets = (New-Object NobsXmlRows $p.StandardOutput).AllSets($maxRows) } catch { $readErr = Get-InnerMessage $_ }
+        $p.WaitForExit()
+        try { $feed.Wait() } catch { }
+        $errTxt = try { $et.Result } catch { '' }
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append('[')
+        $n = 0
+        foreach ($s in @($sets)) {
+            if ($null -eq $s) { continue }
+            if ($n -gt 0) { [void]$sb.Append(',') }
+            $n++
+            $stmt = [string]$s.Statement; if ($stmt.Length -gt 120) { $stmt = $stmt.Substring(0, 120) }
+            [void]$sb.Append('{"statement":' + $n + ',"sql":' + (J-Str $stmt) + ',"columns":' + (J-Arr @($s.Names)) + ',"rows":' + (J-RowsFast $s.Rows) +
+                             ',"rowCount":' + $s.Count + ',"truncated":' + $(if ($s.Count -gt $s.Rows.Count) { 'true' } else { 'false' }) + '}')
+        }
+        [void]$sb.Append(']')
+        $results = $sb.ToString()
+        if ($entry -and $entry.Cancelled) { return '{"ok":false,"cancelled":true,"error":"Query cancelled.","results":'+$results+'}' }
+        if ($p.ExitCode -ne 0) { return '{"ok":false,"error":'+(J-Str (FirstErr $errTxt))+',"results":'+$results+'}' }
+        if ($readErr) { return '{"ok":false,"error":'+(J-Str ("Could not read the result from mysql.exe: " + $readErr))+',"results":'+$results+'}' }
+        return '{"ok":true,"results":'+$results+'}'
+    } finally {
+        if ($requestId) { $null = $script:RunningQueries.TryRemove($requestId, [ref]$null) }
+        if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { }; try { $p.Dispose() } catch { } }
+        Remove-Item $cnf -Force -ErrorAction SilentlyContinue
+    }
+}
 # Endpoint: apply grid edits (insert/update/delete rows) the user made in the results table.
 # NOTE: not currently called by the frontend (row edits are built and sent as plain SQL via
 # applyChanges()/`lit()` -> /api/script instead), but the endpoint is still registered, so it
@@ -1925,6 +1978,50 @@ public sealed class NobsXmlRows {
         return list;
     }
     public List<string[]> All() { return Page(int.MaxValue); }
+    // Every result set in the output - a script's SELECTs, a procedure's results - each with at
+    // most maxRows rows kept and all of them counted. The column names of a result without rows
+    // are not in the output, so such a result has none.
+    public List<NobsResultSet> AllSets(int maxRows) {
+        var list = new List<NobsResultSet>();
+        NobsResultSet cur = null;
+        while (true) {
+            int c = Read();
+            if (c < 0) break;
+            if (c != '<') continue;
+            string tag = TagName();
+            if (tag == "?xml") {
+                TagRest(null);
+                if (!eolKnown) { eolKnown = true; crlf = Peek() == '\r'; }
+            } else if (tag == "resultset") {
+                var attrs = new StringBuilder();
+                bool closed = TagRest(attrs);
+                bool found;
+                cur = new NobsResultSet { Statement = AttrValue(attrs.ToString(), "statement", out found) };
+                list.Add(cur);
+                Names.Clear();
+                if (closed) cur = null;
+            } else if (tag == "/resultset") {
+                TagRest(null);
+                cur = null;
+            } else if (tag == "row") {
+                TagRest(null);
+                if (cur == null) { Row(false); continue; }
+                bool keep = cur.Rows.Count < maxRows;
+                string[] row = Row(keep);
+                if (keep) { cur.Rows.Add(row); if (cur.Names.Count == 0) cur.Names.AddRange(Names); }
+                cur.Count++;
+            } else TagRest(null);
+        }
+        return list;
+    }
+    // Writes data to a process's input and closes it, without waiting: the process writes its
+    // results meanwhile, and they are read as they come.
+    public static System.Threading.Tasks.Task FeedAndClose(Stream s, byte[] data) {
+        return System.Threading.Tasks.Task.Run(() => {
+            try { s.Write(data, 0, data.Length); s.Flush(); } catch (IOException) { } catch (ObjectDisposedException) { }
+            finally { try { s.Close(); } catch (IOException) { } }
+        });
+    }
     // A grid query that also asked for each text column as hex wherever it holds a NUL (see
     // Get-ExactTextMap): drops those hex columns and puts each exact value back in place of the
     // one in which XML turned the NUL into a space. targets[i] lists the shown columns named after
@@ -1948,6 +2045,12 @@ public sealed class NobsXmlRows {
         }
         return result;
     }
+}
+public sealed class NobsResultSet {
+    public string Statement;
+    public readonly List<string> Names = new List<string>();
+    public readonly List<string[]> Rows = new List<string[]>();
+    public long Count;
 }
 public static class NobsDumpDb {
     static bool Kw(byte[] l, int n, ref int i, string w) {
@@ -5250,7 +5353,7 @@ function openTab(title,sql,db,run,table,ddl){const id='t'+(++tabSeq);title=uniqu
   '<span class="tbsep"></span></span>'+
   '<span style="flex:1 1 auto"></span>'+
   '<span id="edit_'+id+'" style="display:inline-flex;align-items:center;gap:6px"></span>'+pager+'</div>'+
-  '<div class="result" id="res_'+id+'"></div><div class="status" id="st_'+id+'">Ready.</div>';
+  '<div id="rsets_'+id+'" style="display:none;gap:6px;align-items:center;flex-wrap:wrap;padding:4px 8px"></div><div class="result" id="res_'+id+'"></div><div class="status" id="st_'+id+'">Ready.</div>';
  $('panes').appendChild(pane);const ta=$('ed_'+id);ta.value=sql||'';
  const ra1=$('resultActions_'+id);if(ra1)ra1.style.display='none';
  (function(){const es=$('es_'+id),ew=$('ew_'+id);es.addEventListener('mousedown',e=>{e.preventDefault();const sy=e.clientY,sh=ew.offsetHeight,maxH=ew.parentElement.clientHeight-120;
@@ -5551,6 +5654,54 @@ function markEdited(id){
  if(edited!==!!t.sqlEdited){ t.sqlEdited=edited; if(activeTab===id) updateSchemaBadge(id); }
 }
 function dbOf(t){ if(t&&(t.table||t.ddl)&&!t.sqlEdited)return t.db||curSchema||null; /* table-view + DDL tabs keep their own schema, until their SQL is edited - see markEdited() */ return curSchema||(t&&t.db)||null; /* plain query tabs follow the selected sidebar schema */ }
+// Whether a script's results are all worth showing: it calls a procedure, or has more than one
+// statement that returns rows. Both used to show nothing but the last SELECT - a procedure's results
+// and every earlier SELECT were run and thrown away.
+function scriptShowsResults(stmts){
+ const heads=stmts.map(s=>sqlHead(s));
+ if(heads.some(h=>/^call\b/i.test(h)))return true;
+ return heads.filter(h=>/^(select|show|describe|desc|explain|with|table|values)\b/i.test(h)).length>1;
+}
+// Runs such a script on one connection and shows each result in a tab of its own. These grids
+// are read-only: a result of a script is not tied to one table's rows.
+async function runScriptResults(id,sql,reqId){
+ const t=T(id);const st=$('st_'+id);
+ const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
+ const writes=stmts.some(s=>!/^(select|show|describe|desc|explain|with|table|values|use)\b/i.test(sqlHead(s)));
+ if(writes&&roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
+ const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH},t.abortCtrl.signal);
+ if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
+ if(!T(id))return;
+ t.table=null;t.pk=null;t.pending=null;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;t.exact=false;
+ {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
+ const selb=$('selbtn_'+id);if(selb)selb.innerHTML='';
+ t.resultSets=r.results||[];
+ if(t.resultSets.length){showResultSet(id,0);}
+ else{t.cols=[];t.rows=[];$('res_'+id).innerHTML='';renderResultSetTabs(id);updatePager(id);const ra0=$('resultActions_'+id);if(ra0)ra0.style.display='none';}
+ const n=t.resultSets.length;
+ if(r.ok){st.className='status';st.textContent='OK. '+stmts.length+' statement(s) executed, '+n+' result(s).';log('SCRIPT OK ('+stmts.length+' statements, '+n+' results)');}
+ else{st.className='status err';st.textContent=(r.error||'Failed.')+(n?' - showing the '+n+' result(s) produced before it.':'');log(logErr(r.error||'Failed.'));}
+ if(writes&&t.db)loadObjects(t.db);
+}
+function showResultSet(id,i){
+ const t=T(id);if(!t||!t.resultSets||!t.resultSets[i])return;
+ const rs=t.resultSets[i];t.resultIdx=i;
+ t.cols=rs.columns;t.rows=rs.rows;t.binCols=rs.binaryCols||[];t.bitCols=rs.bitCols||null;
+ t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();t._total=null;
+ renderResultSetTabs(id);
+ const ra=$('resultActions_'+id);if(ra)ra.style.display=t.cols.length?'inline-flex':'none';
+ if(!t.cols.length){$('res_'+id).innerHTML='<div class="muted" style="padding:8px">No rows. (Column names are only known when there are rows.)</div>';}
+ else renderGrid(id);
+ updatePager(id);
+}
+function renderResultSetTabs(id){
+ const t=T(id);const el=$('rsets_'+id);if(!el)return;
+ const sets=(t&&t.resultSets)||[];const cur=sets[t&&t.resultIdx||0];
+ if(!sets.length||(sets.length===1&&!cur.truncated)){el.style.display='none';el.innerHTML='';return;}
+ el.style.display='flex';
+ el.innerHTML=(sets.length>1?sets.map((s,i)=>'<button class="sm" style="'+(i===t.resultIdx?'border-color:var(--accent);font-weight:600':'')+'" title="'+esc('Statement '+s.statement+': '+s.sql)+'" onclick="showResultSet(\''+id+'\','+i+')">Result '+(i+1)+' ('+fmtCount(s.rowCount)+')</button>').join(''):'')
+  +(cur&&cur.truncated?'<span class="muted">Showing the first '+fmtCount(cur.rows.length)+' of '+fmtCount(cur.rowCount)+' rows.</span>':'');
+}
 // runSql(): send the editor SQL to the server and show the rows (or the error).
 async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sql!==t.curRun){t.prevRun=t.curRun;t.curRun=sql;}const st=$('st_'+id);st.className='status';st.textContent='Running\u2026';
  closeCursorFor(t);
@@ -5576,10 +5727,15 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
  const leadingAreAllUse=stmts.length>1&&stmts.slice(0,-1).every(s=>/^use\s+\S/i.test(sqlHead(s)));
  const needsScriptStep=stmts.length>1&&isSelectLast&&!leadingAreAllUse;
  const isSelect=isSelectLast;
+ // A CALL, or more than one SELECT: every result is shown, each in its own tab.
+ const multiResult=scriptShowsResults(stmts);
+ if(t.resultSets){t.resultSets=null;renderResultSetTabs(id);}
  const reqId=(crypto.randomUUID?crypto.randomUUID():('r'+Date.now()+Math.random()));
  t.abortCtrl=new AbortController();t.runningReqId=reqId;setRunning(id,true);
  try{
-  if(isSelect){
+  if(multiResult){
+    await runScriptResults(id,sql,reqId);
+  } else if(isSelect){
     if(needsScriptStep){
       // Each leading statement was already correctly, individually extracted by splitStmts()
       // above - including correctly handling any DELIMITER directive within it (a procedure's
@@ -8414,7 +8570,7 @@ $RequestHandler = {
             if ([bool]$data.ro) {
                 switch -Regex ($req.path) {
                     '/api/(rowop|import|importcsv|kill-process)$' { $roBlocked = $true }
-                    '/api/(exec|script|query)$' { if (-not (Test-SqlReadOnly ([string]$data.sql))) { $roBlocked = $true } }
+                    '/api/(exec|script|script-results|query)$' { if (-not (Test-SqlReadOnly ([string]$data.sql))) { $roBlocked = $true } }
                 }
             }
             if ($roBlocked) { Send-Json $client '{"ok":false,"error":"This connection is READ-ONLY (safe mode). The server blocked a write operation."}'; return }
@@ -8435,6 +8591,7 @@ $RequestHandler = {
                 '/api/process-list' { Send-Json $client (Api-ProcessList $conn) }
                 '/api/kill-process' { Send-Json $client (Api-KillProcess $conn $data) }
                 '/api/script'  { Send-Json $client (Api-Script $conn $data) }
+                '/api/script-results' { Send-Json $client (Api-ScriptResults $conn $data) }
                 '/api/rowop'   { Send-Json $client (Api-RowOp $conn $data) }
                 '/api/export'  { Send-Json $client (Api-Export $conn $data) }
                 '/api/import'  { Send-Json $client (Api-Import $conn $data) }

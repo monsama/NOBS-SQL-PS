@@ -748,6 +748,29 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Api '/api/conn-delete' @{ name = $fn } | Out-Null
     $cn = $null
 
+    # --- 5f. a script returns every result set ----------------------------------------------------
+    # A procedure's results, and every SELECT but the last in a script, were run and thrown away.
+    $srp = "DELIMITER `$`$`nCREATE PROCEDURE sr_two(IN n INT)`nBEGIN`n  SELECT id, v FROM sr_t WHERE id <= n ORDER BY id;`n  UPDATE sr_t SET v = 'touched' WHERE id = 3;`n  SELECT COUNT(*) AS c, MAX(b) AS mb FROM sr_t;`nEND`$`$`nDELIMITER ;"
+    $su = Api '/api/script' @{ conn = $conn; db = 'nobs_test'; sql = "DROP PROCEDURE IF EXISTS sr_two; DROP TABLE IF EXISTS sr_t; CREATE TABLE sr_t (id INT PRIMARY KEY, v VARCHAR(10), b VARBINARY(4)); INSERT INTO sr_t VALUES (1,'one',0x00FF),(2,NULL,NULL),(3,'NULL',X'');`n$srp" }
+    if (-not $su.ok) { "  note  setup: $($su.error)" }
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = 'CALL sr_two(2);'; maxRows = 1000 }
+    $sets = @($sr.results)
+    Check ($sr.ok -and $sets.Count -eq 2) "a procedure's two results both come back" ($sr | ConvertTo-Json -Compress -Depth 6)
+    if ($sets.Count -eq 2) {
+        $s0 = ($sets[0].rows | ForEach-Object { ($_ | ForEach-Object { if ($null -eq $_) { '<NULL>' } else { $_ } }) -join '|' }) -join ';'
+        Check ((@($sets[0].columns) -join ',') -eq 'id,v' -and $s0 -ceq '1|one;2|<NULL>') 'with their columns, NULL kept' $s0
+        Check (($sets[1].rows[0] -join '|') -ceq '3|0x00FF') 'and binary as hex' ($sets[1].rows[0] -join '|')
+    }
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "SELECT 'NULL' AS a;`nSELECT id FROM sr_t WHERE 0;`nSELECT id FROM bulk_rows ORDER BY id;"; maxRows = 10 }
+    $sets = @($sr.results)
+    Check ($sr.ok -and $sets.Count -eq 3 -and [string]$sets[0].rows[0][0] -ceq 'NULL' -and @($sets[1].rows).Count -eq 0) 'every SELECT of a script, an empty one included' ($sr | ConvertTo-Json -Compress -Depth 4)
+    if ($sets.Count -eq 3) { Check (@($sets[2].rows).Count -eq 10 -and $sets[2].rowCount -eq 100000 -and $sets[2].truncated) 'a big result keeps its first rows and counts all' "$(@($sets[2].rows).Count) $($sets[2].rowCount)" }
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; sql = "SELECT 1 AS a;`nSELECT * FROM sr_no_such_table;`nSELECT 2 AS b;" }
+    Check (-not $sr.ok -and $sr.error -match 'at line 2' -and @($sr.results).Count -eq 1) 'an error reports its line, with the result before it' ($sr | ConvertTo-Json -Compress -Depth 4)
+    $sr = Api '/api/script-results' @{ conn = $conn; db = 'nobs_test'; ro = $true; sql = 'CALL sr_two(1)' }
+    Check (-not $sr.ok -and $sr.error -match 'READ-ONLY') 'read-only mode refuses a CALL' ($sr | ConvertTo-Json -Compress)
+    Api '/api/script' @{ conn = $conn; db = 'nobs_test'; sql = 'DROP PROCEDURE sr_two; DROP TABLE sr_t' } | Out-Null
+
     # --- 5d. a table grid reads text holding a NUL exactly ---------------------------------------
     # XML output shows the NUL as a space, and Apply's WHERE then matched the row whose key really
     # is 'a b'. The grid's query asks for such values as hex as well (exactTextQuery in the UI) and

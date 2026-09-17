@@ -30,7 +30,8 @@ Requires Windows PowerShell 5.1 or later.
 - Browse schemas, tables, views, procedures, functions, triggers and events,
   with quick filtering and search across all schemas.
 - Tabbed SQL editor with syntax highlighting, autocomplete, query formatting,
-  and run-whole-script or run-selection.
+  and run-whole-script or run-selection. A procedure call, or a script with
+  several SELECTs, shows each result in a tab of its own.
 - Result grids with per-column filtering and sorting, column resize and
   show/hide, and a row-detail form view for wide tables.
 - Inline and full-row editing staged as pending changes and applied in a single
