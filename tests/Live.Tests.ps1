@@ -193,11 +193,19 @@ try {
     # and the assertion below passes vacuously. (Confirmed: with fixed delays this whole case
     # reported "ok" against the unfixed code.)
     #
-    # Make it deterministic instead: exclude every table, so the routines/events dump is the only
-    # work the export has to do and any cancel shortly after start lands inside it. Then sweep
-    # short delays, stopping as soon as the step has actually been reached.
-    $tabsR = Sql "SELECT table_name FROM information_schema.tables WHERE table_schema='nobs_test'" 'nobs_test'
-    $excludeAll = @($tabsR.rows | ForEach-Object { 'nobs_test.' + [string]$_[0] })
+    # Make it deterministic instead: export a database that has no tables and 300 procedures, so
+    # the routines/events dump is the only work the export has to do and it lasts long enough to be
+    # hit. Then sweep delays, stopping as soon as the step has actually been reached.
+    #
+    # The request is sent straight from this process. It used to go through Start-Job, whose new
+    # PowerShell process takes a varying and often long time to start - on a CI runner the cancel
+    # regularly arrived before the export had begun, and 45 attempts all missed.
+    $rtDb = "nobs_live_routines_$PID"
+    $procs = (1..300 | ForEach-Object { "CREATE PROCEDURE $rtDb.p$_() SELECT $_;" }) -join "`n"
+    $mk = Api '/api/script' @{ conn = $conn; sql = "DROP DATABASE IF EXISTS $rtDb; CREATE DATABASE $rtDb;`n$procs" }
+    if (-not $mk.ok) { "  note  could not create $rtDb : $($mk.error)" }
+    $http = [System.Net.Http.HttpClient]::new()
+    $http.Timeout = [TimeSpan]::FromMinutes(10)
 
     $sawCancel = $false
     $reachedRoutines = $false
@@ -206,7 +214,7 @@ try {
     # lands in it. The dump is quick, so the window is narrow and a single sweep does flake; each
     # attempt is cheap (every table is excluded, so there is almost nothing else to do). The sweep
     # is cycled with a small jitter so repeated attempts do not all land in the same place.
-    $delaySweep = @(20, 30, 40, 55, 70, 85, 100, 120, 145, 175, 210, 260, 320, 400, 500)
+    $delaySweep = @(100, 200, 300, 400, 500, 650, 800, 1000, 1250, 1500, 2000)
     $attempt = 0
     while (-not ($reachedRoutines -and $sawCancel) -and $attempt -lt 45) {
         $delay = $delaySweep[$attempt % $delaySweep.Count] + (Get-Random -Minimum 0 -Maximum 12)
@@ -214,18 +222,17 @@ try {
         $folder = Join-Path ([IO.Path]::GetTempPath()) "nobs-live-exp-$PID-$delay"
         Remove-Item $folder -Recurse -Force -ErrorAction SilentlyContinue
         $jobId = "live-$PID-$delay"
-        $bg = Start-Job -ScriptBlock {
-            param($base, $token, $conn, $folder, $jobId, $excludes)
-            $b = @{
-                token = $token; conn = $conn; dbs = @('nobs_test'); folder = $folder
-                mode = 'table'; jobId = $jobId; excludes = $excludes
-                options = @{ charset = 'utf8mb4'; routines = $true; events = $true; quick = $true; extinsert = $true }
-            }
-            Invoke-RestMethod -Uri "$base/api/export" -Method Post -ContentType 'application/json' -Body ($b | ConvertTo-Json -Depth 8 -Compress) -TimeoutSec 600
-        } -ArgumentList $base, $token, $conn, $folder, $jobId, $excludeAll
+        $b = @{
+            token = $token; conn = $conn; dbs = @($rtDb); folder = $folder
+            mode = 'table'; jobId = $jobId; excludes = @()
+            options = @{ charset = 'utf8mb4'; routines = $true; events = $true; quick = $true; extinsert = $true }
+        }
+        $body = [System.Net.Http.StringContent]::new(($b | ConvertTo-Json -Depth 8 -Compress), [Text.Encoding]::UTF8, 'application/json')
+        $pending = $http.PostAsync("$base/api/export", $body)
         Start-Sleep -Milliseconds $delay
         Api '/api/cancel-job' @{ jobId = $jobId } | Out-Null
-        $res = Receive-Job -Job $bg -Wait -AutoRemoveJob
+        $res = $null
+        try { $res = $pending.GetAwaiter().GetResult().Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json } catch { }
         if ($res.cancelled) {
             $sawCancel = $true
             foreach ($line in @($res.log)) {
@@ -245,6 +252,8 @@ try {
     # is vacuous. Confirmed by reverting the fix - the test only catches the bug when it gets here.
     Check $reachedRoutines 'a cancel actually reached the routines/events step' "$attempt attempts, none landed inside the routines/events dump - widen `$delaySweep above"
     Check ($reasonless.Count -eq 0) 'a cancelled export never logs a FAILED line with no reason' ($reasonless -join ' | ')
+    $http.Dispose()
+    Api '/api/exec' @{ conn = $conn; sql = "DROP DATABASE IF EXISTS $rtDb" } | Out-Null
     $orphans = @(Get-Process -Name 'mysqldump', 'mariadb-dump' -ErrorAction SilentlyContinue)
     Check ($orphans.Count -eq 0) 'cancelling leaves no orphaned mysqldump process' "found $($orphans.Count)"
 
