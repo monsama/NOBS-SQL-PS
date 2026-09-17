@@ -614,6 +614,44 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Api '/api/conn-delete' @{ name = $vn } | Out-Null
     $cn = $null
 
+    # --- 5c. text keys holding a tab or a line break -----------------------------------------------
+    # The key list used to be read from tab-separated output, so such a key fell apart, never
+    # matched itself on the other side, and showed up as missing on one side and extra on the other.
+    $ks = "nobs_live_key_src_$PID"; $kt = "nobs_live_key_tgt_$PID"; $kn = "nobs_live_key_$PID"
+    $cn = $kn
+    Api '/api/conn-save' @{ name = $kn; conn = $conn; accent = '#3b82f6'; env = 'test'; readonly = $false; savepw = $true } | Out-Null
+    $kdef = '(k VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PRIMARY KEY, v VARCHAR(10))'
+    $keys = "(CONCAT('a', CHAR(9), 'b'), 'tab'), (CONCAT('c', CHAR(10), 'd'), 'lf'), (CONCAT('e', CHAR(13), CHAR(10)), 'crlf'), ('NULL', 'text'), ('p\\q', 'backslash')"
+    foreach ($s in @("DROP DATABASE IF EXISTS $ks", "DROP DATABASE IF EXISTS $kt", "CREATE DATABASE $ks", "CREATE DATABASE $kt",
+                     "CREATE TABLE $ks.t $kdef", "CREATE TABLE $kt.t $kdef",
+                     "INSERT INTO $ks.t VALUES $keys, ('only-src', 'x')",
+                     "INSERT INTO $kt.t VALUES $keys, ('only-tgt', 'y')",
+                     "CREATE TABLE $ks.one (k VARCHAR(20) PRIMARY KEY, v VARCHAR(10))", "CREATE TABLE $kt.one (k VARCHAR(20) PRIMARY KEY, v VARCHAR(10))",
+                     "INSERT INTO $ks.one VALUES ('single', 'new')", "INSERT INTO $kt.one VALUES ('single', 'old')")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $kc = Api '/api/compare-rows' @{ sourceConnName = $kn; sourceDb = $ks; targetConnName = $kn; targetDb = $kt; table = 't' }
+    $missingKeys = @($kc.rows | ForEach-Object { [string]$_[0] }) -join ','
+    $extraKeys = @($kc.extraPks | ForEach-Object { [string]$_[0] }) -join ','
+    Check ($kc.ok -and $kc.missingTotal -eq 1 -and $kc.extraTotal -eq 1) 'compare matches keys holding a tab, a line break or a backslash' "missing=$($kc.missingTotal) extra=$($kc.extraTotal) $($kc.error)"
+    # One row on each side is its own case: PowerShell unrolls a one-item list, and the single missing
+    # row came back without its data, the single extra key as its first character.
+    Check ($missingKeys -eq 'only-src' -and (@($kc.columns) -join ',') -eq 'k,v') 'a single missing row comes with its data' "rows=$($kc.rows | ConvertTo-Json -Compress) cols=$(@($kc.columns) -join ',')"
+    Check ($extraKeys -eq 'only-tgt') 'a single target-only key is named whole' "extraPks=$($kc.extraPks | ConvertTo-Json -Compress)"
+    Api '/api/exec' @{ conn = $conn; sql = "UPDATE $kt.t SET v = 'changed'" } | Out-Null
+    $kd = Api '/api/compare-rows-diff' @{ sourceConnName = $kn; sourceDb = $ks; targetConnName = $kn; targetDb = $kt; table = 't' }
+    Check ($kd.ok -and @($kd.diffs).Count -eq 5) 'and finds each of them as a changed row' "diffs=$(@($kd.diffs).Count) $($kd.error)"
+    if ($kd.ok) {
+        $ka = Api '/api/compare-rows-apply-diff' @{ targetConnName = $kn; targetDb = $kt; table = 't'; pkCols = @($kd.pkCols); updates = @($kd.diffs) }
+        $same = Scalar "SELECT COUNT(*) FROM $ks.t s JOIN $kt.t d ON CAST(s.k AS BINARY) = CAST(d.k AS BINARY) AND s.v <=> d.v"
+        Check ($ka.ok -and $same -eq '5') 'and updates exactly those rows' "matching rows=$same $($ka | ConvertTo-Json -Compress)"
+    }
+    $k1 = Api '/api/compare-rows-diff' @{ sourceConnName = $kn; sourceDb = $ks; targetConnName = $kn; targetDb = $kt; table = 'one' }
+    Check ($k1.ok -and @($k1.diffs).Count -eq 1 -and [string]$k1.diffs[0].pk[0] -eq 'single') 'a table with a single common row is compared too' ($k1 | ConvertTo-Json -Compress -Depth 6)
+    foreach ($s in @("DROP DATABASE IF EXISTS $ks", "DROP DATABASE IF EXISTS $kt")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+    Api '/api/conn-delete' @{ name = $kn } | Out-Null
+    $cn = $null
+
     # --- 6. paging a cursor delivers every row exactly once -------------------------------------
     # The Tauri edition dropped one row at every page boundary by reading a look-ahead row and
     # discarding it; a forward-only cursor cannot re-read it. This edition holds it back

@@ -845,40 +845,51 @@ function Open-QueryCursor {
     return @{ ok=$true; columns=$cursor.Headers; rows=$page.rows; hasMore=$true; cursorId=$cursorId }
 }
 
-# Leaner variant of Run-Query2, purpose-built for bulk-fetching a PRIMARY KEY column list (e.g.
-# ~950,000 ids to work out what's missing/different in Compare). Run-Query2 is general-purpose -
-# it checks every single cell for NULL, decodes backslash-escapes, and hex-encodes control
-# characters, because a normal query result can contain any of that. A primary key column can
-# never be NULL and is essentially never anything but a plain integer or simple string, so none
-# of that per-cell work is needed here - and across hundreds of thousands of rows, skipping it
-# is the difference between this being usably fast and not.
-# TRADE-OFF (documented, not hidden): this uses --raw, so it does NOT decode backslash-escapes.
-# A PK value containing an actual embedded tab/newline/backslash (exceedingly rare in practice)
-# could be mis-parsed here. This function is ONLY used to compute missing/matching id sets for
-# comparison - the real row data movement (insert/update) always goes through the fully general,
-# correctness-first Run-Query2/SqlValFor path, so the worst case here is a wrong verdict for one
-# unusual row, never corrupted data.
-# --binary-as-hex makes a binary key read exactly as Run-Query2 reads it (0x..): as raw bytes it
-# went through a UTF-8 decode that replaced anything invalid, and no longer matched its own row.
+# Fetches a PRIMARY KEY column list in bulk (e.g. ~950,000 ids, to work out what is missing or
+# different in Compare), streamed straight from mysql.exe into NobsXmlRows rather than read into
+# one string first.
+#
+# This used to read --batch --raw output and split it on tabs and line breaks, which misread any key
+# holding a tab or a line break: its row fell apart, it never matched itself on the other side,
+# and Compare reported it as missing on both. The XML reader reads every key exactly, and is fast
+# enough for this - 100,000 full rows take about a second.
 function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
+    Initialize-DumpDb
     $my = Get-Mysql $conn
-    try { $null = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
-    $cnf=New-Cnf $conn -Tool $my
+    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    $cnf = New-Cnf $conn -Tool $my
+    $sa = New-SqlArg $sql
+    $p = $null
+    $entry = $null
     try {
-        $a=@("--defaults-extra-file=$cnf","--batch","--raw","--binary-as-hex","--default-character-set=utf8mb4")
-        if($db){ $a+="--database=$db" }
-        $sa=New-SqlArg $sql; $a+=@("-e",$sa.arg)
-        $r=Run-Proc $my $a $RequestId
-        if($sa.file){ Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
-        if($r.exit -ne 0){ return @{ ok=$false; err=(FirstErr $r.err) } }
-        if([string]::IsNullOrEmpty($r.out)){ return @{ ok=$true; columns=@(); rows=@() } }
-        $lines=$r.out.Split([string[]]@("`r`n","`n"),[StringSplitOptions]::RemoveEmptyEntries)
-        if($lines.Count -eq 0){ return @{ ok=$true; columns=@(); rows=@() } }
-        $headers=@($lines[0].Split([char]9))
-        $rows=New-Object System.Collections.ArrayList($lines.Count)
-        for($i=1;$i -lt $lines.Count;$i++){ [void]$rows.Add($lines[$i].Split([char]9)) }
-        return @{ ok=$true; columns=$headers; rows=$rows }
-    } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue }
+        $a = @("--defaults-extra-file=$cnf","--quick") + $ra
+        if($db){ $a += "--database=$db" }
+        $a += @("-e",$sa.arg)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $my; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = $script:RawEnc; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $psi.Arguments = Format-Args $a
+        $p = New-Object System.Diagnostics.Process; $p.StartInfo = $psi; [void]$p.Start()
+        # Registered like Run-Proc does, so Compare's Cancel can kill it mid-read.
+        $entry = [pscustomobject]@{ Process=$p; Cancelled=$false }
+        if ($RequestId) { $script:RunningQueries[$RequestId] = $entry }
+        $et = $p.StandardError.ReadToEndAsync()
+        $x = New-Object NobsXmlRows $p.StandardOutput
+        $rows = $null; $readErr = $null
+        try { $rows = $x.All() } catch { $readErr = Get-InnerMessage $_ }
+        $p.WaitForExit()
+        $errTxt = try { $et.Result } catch { '' }
+        if ($entry.Cancelled) { return @{ ok=$false; err='Query cancelled by user.' } }
+        if ($p.ExitCode -ne 0) { return @{ ok=$false; err=(FirstErr $errTxt) } }
+        if ($readErr) { return @{ ok=$false; err=("Could not read the result from mysql.exe: " + $readErr) } }
+        return @{ ok=$true; columns=@($x.Names); rows=$rows }
+    } finally {
+        if ($RequestId) { $null = $script:RunningQueries.TryRemove($RequestId, [ref]$null) }
+        if ($p) { try { if (-not $p.HasExited) { $p.Kill() } } catch { }; try { $p.Dispose() } catch { } }
+        Remove-Item $cnf -Force -ErrorAction SilentlyContinue
+        if ($sa.file) { Remove-Item $sa.file -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 
@@ -2893,10 +2904,13 @@ function Api-CompareRows { param($data)
     $extraRows = New-Object System.Collections.ArrayList
     foreach($row in $tgtR.rows){ if(-not $srcSet.Contains(($row -join "`u{1}"))){ [void]$extraRows.Add($row) } }
     $extraTotal = $extraRows.Count
-    $extraPks = if($extraTotal -gt 2000){ $extraRows.GetRange(0,2000) } else { $extraRows }
+    # Assigned, not returned from an if-expression: PowerShell unrolls a collection that comes out of
+    # one, so with a single row these held that row's key values instead of a list of rows. Compare
+    # then looked up the characters of the key and showed a single missing row as having no data.
+    $extraPks = $extraRows; if($extraTotal -gt 2000){ $extraPks = $extraRows.GetRange(0,2000) }
     $cap = 2000
     $truncated = $missingTotal -gt $cap
-    $useRows = if($truncated){ $missingRows.GetRange(0,$cap) } else { $missingRows }
+    $useRows = $missingRows; if($truncated){ $useRows = $missingRows.GetRange(0,$cap) }
     $roJson = $(if($tgt.readonly){'true'}else{'false'})
     if($useRows.Count -eq 0){
         return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"columns":[],"rows":[],"missingTotal":0,"truncated":false,"targetReadonly":'+$roJson+',"extraTotal":'+$extraTotal+',"extraPks":'+(J-RowsFast $extraPks)+',"allMissingPks":[]}'
@@ -2949,7 +2963,8 @@ function Api-CompareRowsDiff { param($data)
     $commonTotal = $common.Count
     $cap = 500
     $truncated = $commonTotal -gt $cap
-    $useCommon = if($truncated){ $common.GetRange(0,$cap) } else { $common }
+    # Assigned, not returned from an if-expression - see Api-CompareRows.
+    $useCommon = $common; if($truncated){ $useCommon = $common.GetRange(0,$cap) }
     $roJson = $(if($tgt.readonly){'true'}else{'false'})
     if($useCommon.Count -eq 0){
         return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"fkCols":'+(J-Arr $fk)+',"diffs":[],"commonTotal":'+$commonTotal+',"comparedCount":0,"truncated":false,"targetReadonly":'+$roJson+'}'
