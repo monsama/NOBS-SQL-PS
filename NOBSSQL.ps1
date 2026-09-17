@@ -294,6 +294,9 @@ function New-Cnf {
     foreach ($l in (Get-SslLines $conn.ssl $maria $conn.sslCa)) { [void]$sb.AppendLine($l) }
     $pluginDir = Get-PluginDir $Tool
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
+    # Only mysql.exe reads [mysql]; mysqldump shares this file and would reject the option. It
+    # writes TIMESTAMP values in UTC on its own (--tz-utc). Set for Compare's connections.
+    if ($conn.utc) { [void]$sb.AppendLine('[mysql]'); [void]$sb.AppendLine("init-command=`"SET time_zone='+00:00'`"") }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
     [IO.File]::WriteAllText($tmp, '', (New-Object System.Text.UTF8Encoding($false)))
@@ -435,8 +438,20 @@ function SqlValFor { param($x, [bool]$Binary)
 # The columns of a table whose values come back as 0x.. hex (binary strings, BIT, and spatial
 # types - checked against both clients). $null if the table cannot be read.
 function Get-BinaryColumnSet { param($conn,$db,$table)
-    $types = 'binary','varbinary','tinyblob','blob','mediumblob','longblob','bit',
-             'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection','geomcollection'
+    Get-ColumnSetOf $conn $db $table @('binary','varbinary','tinyblob','blob','mediumblob','longblob','bit',
+             'geometry','point','linestring','polygon','multipoint','multilinestring','multipolygon','geometrycollection','geomcollection')
+}
+# A FLOAT is read as rounded text (1.1 is stored as 1.10000002384), and that text compared to the
+# column matches nothing - so rows keyed by one could not be fetched or updated by their key. Such
+# key columns are compared as text instead (Get-KeyCol).
+function Get-FloatColumnSet { param($conn,$db,$table) Get-ColumnSetOf $conn $db $table @('float') }
+function Get-KeyCol { param($col, $floatSet)
+    if ($floatSet -and $floatSet.Contains([string]$col)) { return 'CAST(' + (SqlId $col) + ' AS CHAR)' }
+    return (SqlId $col)
+}
+# The names of the columns of db.table whose DATA_TYPE is one of $types, ignoring case; $null when
+# the table's columns cannot be read.
+function Get-ColumnSetOf { param($conn,$db,$table,$types)
     $r = Run-Query2 $conn ("SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table)) $null
     if(-not $r.ok -or $r.rows.Count -eq 0){ return $null }
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -448,17 +463,27 @@ function Get-BinaryColumnSet { param($conn,$db,$table)
 # column therefore also comes back, in the same statement, as hex - but only where it holds a
 # NUL, which leaves the extra columns NULL (and cheap) everywhere else - and those values replace
 # the ones XML mangled.
-function Get-ExactRows { param($conn,$db,$table,$where,$RequestId)
+#
+# The columns are named rather than SELECT *: SELECT * leaves out INVISIBLE columns (MySQL 8.0.23+,
+# MariaDB 10.3+), so a copy made from it stored NULL in them, and a generated column cannot be given
+# a value, so a copy that included one was refused. All but the generated columns are read, plus
+# any generated one in -Keep (a key column, without which rows could not be told apart), or exactly
+# -Columns, so that both sides of a comparison come back in the same order.
+function Get-ExactRows { param($conn,$db,$table,$where,$RequestId,$Keep,$Columns)
     $types = 'char','varchar','tinytext','text','mediumtext','longtext'
-    $cr = Run-Query2 $conn ("SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " ORDER BY ORDINAL_POSITION") $null
+    $cr = Run-Query2 $conn ("SELECT COLUMN_NAME, DATA_TYPE, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " AND TABLE_NAME=" + (SqlLit $table) + " ORDER BY ORDINAL_POSITION") $null
     if(-not $cr.ok){ return $cr }
-    $textCols = @($cr.rows | Where-Object { $types -contains ([string]$_[1]).ToLower() } | ForEach-Object { [string]$_[0] })
+    if(@($cr.rows).Count -eq 0){ return @{ ok=$false; err="Could not read the columns of $db.$table." } }
+    $typeOf = @{}; foreach($row in $cr.rows){ $typeOf[[string]$row[0]] = ([string]$row[1]).ToLower() }
+    if ($Columns) { $selCols = @($Columns | ForEach-Object { [string]$_ }) }
+    else { $selCols = @($cr.rows | Where-Object { -not (Test-GeneratedExtra ([string]$_[2])) -or ($Keep -and (@($Keep) -contains [string]$_[0])) } | ForEach-Object { [string]$_[0] }) }
+    $textCols = @($selCols | Where-Object { $types -contains $typeOf[$_] })
     $extra = ''
     for($i=0; $i -lt $textCols.Count; $i++){
         $c = SqlId $textCols[$i]
         $extra += ", IF(LOCATE(0x00, CAST(CONVERT($c USING utf8mb4) AS BINARY)) > 0, HEX(CONVERT($c USING utf8mb4)), NULL) AS ``nobs_nul_$i``"
     }
-    $r = Run-Query2 $conn ("SELECT *$extra FROM " + (SqlId $db) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $RequestId
+    $r = Run-Query2 $conn ("SELECT " + (($selCols | ForEach-Object { SqlId $_ }) -join ',') + "$extra FROM " + (SqlId $db) + '.' + (SqlId $table) + ' WHERE ' + $where) $null $RequestId
     if(-not $r.ok -or $textCols.Count -eq 0){ return $r }
     $n = @($r.columns).Count - $textCols.Count
     if($n -le 0){ return @{ ok=$true; columns=@(); rows=(New-Object System.Collections.ArrayList) } }
@@ -480,14 +505,19 @@ function Get-ExactRows { param($conn,$db,$table,$where,$RequestId)
     }
     return @{ ok=$true; columns=$cols; rows=$rows }
 }
+# EXTRA for a generated column: VIRTUAL/STORED GENERATED on both servers, PERSISTENT GENERATED on
+# older MariaDB. MySQL's DEFAULT_GENERATED only marks an expression default.
+function Test-GeneratedExtra { param([string]$Extra) return ($Extra -match '(?i)(VIRTUAL|STORED|PERSISTENT) GENERATED') }
 # A WHERE clause matching a chunk of primary-key tuples, each value written for its column's type.
-function Get-PkWhere { param($pkCols, $chunk, $binSet)
+function Get-PkWhere { param($pkCols, $chunk, $binSet, $floatSet)
     $bin = @($pkCols | ForEach-Object { $binSet.Contains([string]$_) })
+    $flt = @($pkCols | ForEach-Object { [bool]($floatSet -and $floatSet.Contains([string]$_)) })
+    $val = { param($v, $i) if ($flt[$i]) { SqlLit $v } else { SqlValFor $v $bin[$i] } }
     if($pkCols.Count -eq 1){
-        return (SqlId $pkCols[0]) + ' IN (' + (($chunk | ForEach-Object { SqlValFor $_[0] $bin[0] }) -join ',') + ')'
+        return (Get-KeyCol $pkCols[0] $floatSet) + ' IN (' + (($chunk | ForEach-Object { & $val $_[0] 0 }) -join ',') + ')'
     }
-    $tuples = ($chunk | ForEach-Object { $row = $_; '(' + ((0..($pkCols.Count-1) | ForEach-Object { SqlValFor $row[$_] $bin[$_] }) -join ',') + ')' }) -join ','
-    return '(' + (($pkCols | ForEach-Object { SqlId $_ }) -join ',') + ') IN (' + $tuples + ')'
+    $tuples = ($chunk | ForEach-Object { $row = $_; '(' + ((0..($pkCols.Count-1) | ForEach-Object { & $val $row[$_] $_ }) -join ',') + ')' }) -join ','
+    return '(' + (($pkCols | ForEach-Object { Get-KeyCol $_ $floatSet }) -join ',') + ') IN (' + $tuples + ')'
 }
 # One VALUES tuple, each value written for its column's type.
 function Get-ValuesTuple { param($cols, $row, $binSet)
@@ -2151,7 +2181,7 @@ function Api-ImportCsv { param($conn,$data)
     $db=[string]$data.db; $table=[string]$data.table
     if(-not $db -or -not $table){ return '{"ok":false,"error":"No target table."}' }
     $dbl=SqlLit $db; $tl=SqlLit $table
-	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME,DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
+	$cr=Run-Query2 $conn ("SELECT COLUMN_NAME,DATA_TYPE,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=$dbl AND TABLE_NAME=$tl ORDER BY ORDINAL_POSITION") $null
     if(-not $cr.ok){ return '{"ok":false,"error":'+(J-Str $cr.err)+'}' }
     $tableCols=@($cr.rows | ForEach-Object { $_[0] })
     if($tableCols.Count -eq 0){ return '{"ok":false,"error":"Table not found or has no columns."}' }
@@ -2161,12 +2191,55 @@ function Api-ImportCsv { param($conn,$data)
     # ID). Only the columns information_schema actually reports as binary/BIT get that treatment.
     $binTypes=@('binary','varbinary','blob','tinyblob','mediumblob','longblob','bit')
     $binCols=@($cr.rows | Where-Object { $binTypes -contains ([string]$_[1]).ToLower() } | ForEach-Object { $_[0] })
-    try { if($data.hasHeader){ $rows=@(Import-Csv -Path $file) } else { $rows=@(Import-Csv -Path $file -Header $tableCols) } }
+    # Read with numbered columns, one more than the header has, so a row's field count shows: a
+    # missing field comes back $null (an empty one is ''), and anything in the extra column is a
+    # field too many. Import-Csv with the file's own header made missing fields NULL and dropped
+    # extra ones - a stray separator or an unquoted line break imported as a shifted or cut row.
+    try {
+        $first = @(Import-Csv -Path $file -Header 'c0' | Select-Object -First 1)
+        $width = if ($data.hasHeader) { $null } else { $tableCols.Count }
+        if ($data.hasHeader) {
+            if ($first.Count -eq 0) { return '{"ok":false,"error":"The CSV is empty."}' }
+            # Just the header line, parsed on its own to count its fields.
+            $probe = @(Get-Content -LiteralPath $file -TotalCount 1 -Encoding UTF8 | ConvertFrom-Csv -Header (0..4095 | ForEach-Object { "c$_" }))
+            $width = @($probe[0].PSObject.Properties | Where-Object { $null -ne $_.Value }).Count
+        }
+        $names = @(0..$width | ForEach-Object { "c$_" })
+        $all = @(Import-Csv -Path $file -Header $names)
+    }
     catch { return '{"ok":false,"error":'+(J-Str ("CSV parse error: "+$_.Exception.Message))+'}' }
+    if ($data.hasHeader) {
+        $csvCols = @(0..($width-1) | ForEach-Object { [string]$all[0]."c$_" })
+        $rows = @($all | Select-Object -Skip 1)
+    } else { $csvCols = $tableCols; $rows = $all }
     if($rows.Count -eq 0){ return '{"ok":false,"error":"CSV has no data rows."}' }
-    $csvCols=@($rows[0].PSObject.Properties.Name)
-    $useCols=@($csvCols | Where-Object { $tableCols -contains $_ })
-    if($useCols.Count -eq 0){ return '{"ok":false,"error":"No CSV columns match the table columns (check the header row)."}' }
+    for ($ri = 0; $ri -lt $rows.Count; $ri++) {
+        $row = $rows[$ri]; $n = $width
+        if ($null -ne $row."c$width") { $n = 'more than ' + $width }
+        else { for ($k = $width - 1; $k -ge 0 -and $null -eq $row."c$k"; $k--) { $n = $k } }
+        if ($n -ne $width) {
+            $what = if ($data.hasHeader) { 'header' } else { 'table' }
+            return '{"ok":false,"error":'+(J-Str ("Data row $($ri + 1) has $n field(s), but the $what has $width. Nothing was imported."))+'}'
+        }
+    }
+    # A header is matched to the table's columns ignoring case, as MySQL does. A column the table
+    # does not have used to be skipped without a word - a typo in the header row left that
+    # column's data out of every row imported.
+    $useCols = @(); $unknown = @()
+    foreach ($h in $csvCols) {
+        $tc = @($tableCols | Where-Object { $_ -eq $h.Trim() }) | Select-Object -First 1
+        if ($null -eq $tc) { $unknown += $(if ($h) { $h } else { '(empty)' }); continue }
+        if ($useCols -contains $tc) { return '{"ok":false,"error":'+(J-Str "The CSV has the column $tc twice. Nothing was imported.")+'}' }
+        $useCols += $tc
+    }
+    if ($unknown.Count) { return '{"ok":false,"error":'+(J-Str ("The table has no column named " + ($unknown -join ', ') + ". Nothing was imported - rename the CSV column(s) or remove them."))+'}' }
+    # A generated column cannot be given a value - the server computes it - so the CSV's copy of it
+    # (this app's own CSV export includes them) is left out.
+    $generated = @($cr.rows | Where-Object { Test-GeneratedExtra ([string]$_[2]) } | ForEach-Object { [string]$_[0] })
+    $csvIdx = @(0..($useCols.Count-1) | Where-Object { $generated -notcontains $useCols[$_] })
+    $skippedGen = @($useCols | Where-Object { $generated -contains $_ })
+    $useCols = @($csvIdx | ForEach-Object { $useCols[$_] })
+    if ($useCols.Count -eq 0) { return '{"ok":false,"error":"The CSV has no column that can be written."}' }
     $tbl=(SqlId $db)+'.'+(SqlId $table)
     $colList=($useCols | ForEach-Object { SqlId $_ }) -join ','
     # "Truncate table" + a mid-file failure (a bad value, an FK violation, disk full) used to
@@ -2183,7 +2256,8 @@ function Api-ImportCsv { param($conn,$data)
     # reset an AUTO_INCREMENT counter the way TRUNCATE does.
     $sb=New-Object System.Text.StringBuilder
     [void]$sb.AppendLine('START TRANSACTION;')
-    [void]$sb.AppendLine('SET FOREIGN_KEY_CHECKS=0;'); [void]$sb.AppendLine('SET UNIQUE_CHECKS=0;')
+    # Foreign key and unique checks stay on. They were switched off here, which let a CSV row
+    # point at a parent that does not exist - stored without an error.
     if($data.truncate){ [void]$sb.AppendLine('DELETE FROM '+$tbl+';') }
     $batch=New-Object System.Collections.ArrayList; $n=0
     foreach($row in $rows){
@@ -2193,7 +2267,7 @@ function Api-ImportCsv { param($conn,$data)
         # long-standing meaning of NULL, so importing a spreadsheet is unchanged.
         # A bare "0x" in a binary column is an EMPTY binary value - that is how the Tauri edition exports
         # one - and the hex rule below needs at least one digit, so it used to be stored as the text "0x".
-        foreach($c in $useCols){ $v=$row.$c; if($null -eq $v -or ($nullMarker -and $v -ceq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -eq '0x'){ $vals+="X''" } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
+        for($ci=0; $ci -lt $useCols.Count; $ci++){ $c=$useCols[$ci]; $v=$row."c$($csvIdx[$ci])"; if($null -eq $v -or ($nullMarker -and $v -ceq $nullMarker) -or (-not $nullMarker -and $v -eq '')){ $vals+='NULL' } elseif(($binCols -contains $c) -and $v -eq '0x'){ $vals+="X''" } elseif(($binCols -contains $c) -and $v -match '^0x[0-9A-Fa-f]+$'){ $vals+=$v } else { $vals+=(SqlLit $v) } }
         [void]$batch.Add('('+($vals -join ',')+')'); $n++
         if($batch.Count -ge 500){ [void]$sb.AppendLine('INSERT INTO '+$tbl+' ('+$colList+') VALUES '+($batch -join ',')+';'); $batch.Clear() }
     }
@@ -2205,7 +2279,8 @@ function Api-ImportCsv { param($conn,$data)
     try {
         [IO.File]::WriteAllText($tmp,$sb.ToString(),(New-Object System.Text.UTF8Encoding($false)))
         $r=Run-Stdin $my @("--defaults-extra-file=$cnf") $null $tmp
-        if($r.exit -eq 0){ return '{"ok":true,"message":'+(J-Str ("Imported $n row(s) into $db.$table (columns: "+($useCols -join ', ')+")"))+'}' }
+        $note = if ($skippedGen.Count) { '; generated, so computed by the server: ' + ($skippedGen -join ', ') } else { '' }
+        if($r.exit -eq 0){ return '{"ok":true,"message":'+(J-Str ("Imported $n row(s) into $db.$table (columns: "+($useCols -join ', ')+$note+")"))+'}' }
         return '{"ok":false,"error":'+(J-Str (FirstErr $r.err))+'}'
     } finally { Remove-Item $cnf -Force -ErrorAction SilentlyContinue; Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
 }
@@ -2637,19 +2712,25 @@ function Resolve-SavedConn { param($name)
     if(-not $c){ return $null }
     $pass=''
     if($c.pass){ try { $sec=ConvertTo-SecureString $c.pass; $b=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec); $pass=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($b); [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b) } catch {} }
-    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly }
+    # Saved connections are what Compare uses, and Compare reads TIMESTAMP values as text on one
+    # server and writes that text on the other. Each server reads it in its own session time zone,
+    # so between servers in different zones every copied TIMESTAMP moved by the difference (Zurich
+    # to UTC: 12:00 UTC arrived as 14:00 UTC), and equal values showed as different. utc runs
+    # both sessions in UTC (see New-Cnf), so the text means the same instant everywhere.
+    [pscustomobject]@{ host=$c.host; port=$c.port; user=$c.user; ssl=$c.ssl; sslCa=[string]$c.sslCa; password=$pass; readonly=[bool]$c.readonly; utc=$true }
 }
 # Returns an ordered map of table -> ordered list of columns {name,type,null,default,extra} for
 # every table in the given schema, via one information_schema query (cheap, single round trip).
 function Get-SchemaColumns { param($conn,$db)
-    $sql = "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " ORDER BY TABLE_NAME,ORDINAL_POSITION"
+    $sql = "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE,IS_NULLABLE,COLUMN_DEFAULT,EXTRA,CHARACTER_SET_NAME,COLLATION_NAME,COLUMN_COMMENT,GENERATION_EXPRESSION FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=" + (SqlLit $db) + " ORDER BY TABLE_NAME,ORDINAL_POSITION"
     $r = Run-Query2 $conn $sql $null
     if(-not $r.ok){ return $null }
     $map = [ordered]@{}
     foreach($row in $r.rows){
         $t = [string]$row[0]
         if(-not $map.Contains($t)){ $map[$t] = New-Object System.Collections.ArrayList }
-        [void]$map[$t].Add([pscustomobject]@{ name=[string]$row[1]; type=[string]$row[2]; null=[string]$row[3]; default=$row[4]; extra=[string]$row[5] })
+        [void]$map[$t].Add([pscustomobject]@{ name=[string]$row[1]; type=[string]$row[2]; null=[string]$row[3]; default=$row[4]; extra=[string]$row[5]
+                                              charset=$row[6]; collation=$row[7]; comment=[string]$row[8]; generation=[string]$row[9] })
     }
     $map
 }
@@ -2699,6 +2780,38 @@ function ColDefLine { param($col)
     $extraPart = if($col.extra){' ' + $col.extra}else{''}
     (SqlId $col.name) + ' ' + $col.type + ' ' + $nullPart + (ColDefaultClause $col.default) + $extraPart
 }
+# Each column's definition as the server writes it in SHOW CREATE TABLE, keyed by name (any case).
+# Schema sync used to rebuild a column from its type, NULL, default and EXTRA alone, so MODIFY
+# COLUMN turned a latin1_bin column into the table's default character set and collation (case-
+# insensitive utf8mb4), dropped its comment, and could not write a generated column at all.
+function Get-ColumnDefinitions { param([string]$Create)
+    $defs = @{}
+    foreach ($line in ($Create -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l.StartsWith('`')) { continue }
+        $sb = New-Object System.Text.StringBuilder; $i = 1; $closed = $false
+        while ($i -lt $l.Length) {
+            if ($l[$i] -eq '`') { if ($i + 1 -lt $l.Length -and $l[$i + 1] -eq '`') { [void]$sb.Append('`'); $i += 2; continue }; $closed = $true; break }
+            [void]$sb.Append($l[$i]); $i++
+        }
+        if ($closed) { $defs[$sb.ToString()] = $l.TrimEnd(',') }
+    }
+    return $defs
+}
+# The definition to write for $col: the server's own line, with the character set and collation
+# spelled out when the line leaves them to the table default - which on the target may differ.
+function ColDefinition { param($col, $defs)
+    if (-not $defs -or -not $defs.ContainsKey([string]$col.name)) { return (ColDefLine $col) }
+    $def = [string]$defs[[string]$col.name]
+    if ($col.charset -and $col.collation -and $def -notmatch '(?i) CHARACTER SET | COLLATE ') {
+        # SqlId leaves plain names bare; the server always quotes them.
+        $head = '`' + ([string]$col.name).Replace('`', '``') + '` ' + $col.type
+        if ($def.StartsWith($head, [StringComparison]::OrdinalIgnoreCase)) {
+            return $head + " CHARACTER SET $($col.charset) COLLATE $($col.collation)" + $def.Substring($head.Length)
+        }
+    }
+    return $def
+}
 # Compares every table in $srcCols/$tgtCols and returns an array of table-diff objects:
 # {name, status, sql:[{stmt,checked,kind}]} - status is one of missing_target/missing_source/diff/same.
 function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
@@ -2727,14 +2840,19 @@ function Compare-TableSets { param($srcConn,$srcDb,$srcCols,$tgtCols,$RequestId)
         $tByName = @{}; foreach($c in $tCols){ $tByName[$c.name]=$c }
         $sByName = @{}; foreach($c in $sCols){ $sByName[$c.name]=$c }
         $diffs = New-Object System.Collections.ArrayList
+        $defs = $null
         foreach($c in $sCols){
-            if(-not $tByName.Contains($c.name)){
-                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' ADD COLUMN '+(ColDefLine $c)+';'); checked=$true; kind='add_column' })
-            } else {
+            $kind = $null
+            if(-not $tByName.Contains($c.name)){ $kind = 'add_column' }
+            else {
                 $tc = $tByName[$c.name]
-                if($c.type -ne $tc.type -or $c.null -ne $tc.null -or [string]$c.default -ne [string]$tc.default){
-                    [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+' MODIFY COLUMN '+(ColDefLine $c)+';'); checked=$true; kind='modify_column' })
-                }
+                if($c.type -ne $tc.type -or $c.null -ne $tc.null -or [string]$c.default -ne [string]$tc.default -or
+                   [string]$c.collation -ne [string]$tc.collation -or $c.comment -cne $tc.comment -or $c.generation -ne $tc.generation){ $kind = 'modify_column' }
+            }
+            if ($kind) {
+                if ($null -eq $defs) { $defs = Get-ColumnDefinitions (Get-CreateTableSql $srcConn $srcDb $t) }
+                $verb = if ($kind -eq 'add_column') { ' ADD COLUMN ' } else { ' MODIFY COLUMN ' }
+                [void]$diffs.Add([pscustomobject]@{ stmt=('ALTER TABLE '+(SqlId $t)+$verb+(ColDefinition $c $defs)+';'); checked=$true; kind=$kind })
             }
         }
         foreach($c in $tCols){
@@ -2832,6 +2950,7 @@ function Api-Fk { param($conn,$db,$table)
 function Get-RowsByPk { param($conn,$db,$table,$pkCols,$pkValues,$RequestId)
     if(-not $pkValues -or $pkValues.Count -eq 0){ return @{ ok=$true; columns=@(); rows=(New-Object System.Collections.ArrayList) } }
     $binSet = Get-BinaryColumnSet $conn $db $table
+    $floatSet = Get-FloatColumnSet $conn $db $table
     if($null -eq $binSet){ return @{ ok=$false; err="Could not read the column types of $db.$table." } }
     $fetchChunk = 200
     $fullCols = $null
@@ -2840,8 +2959,8 @@ function Get-RowsByPk { param($conn,$db,$table,$pkCols,$pkValues,$RequestId)
         if($RequestId -and $script:CancelledCompares.ContainsKey($RequestId)){ break }
         $fEnd = [Math]::Min($fi+$fetchChunk,$pkValues.Count) - 1
         $chunk = $pkValues[$fi..$fEnd]
-        $where = Get-PkWhere $pkCols $chunk $binSet
-        $fr = Get-ExactRows $conn $db $table $where $RequestId
+        $where = Get-PkWhere $pkCols $chunk $binSet $floatSet
+        $fr = Get-ExactRows $conn $db $table $where $RequestId -Keep $pkCols
         if(-not $fr.ok){ return @{ ok=$false; err=$fr.err } }
         if(-not $fullCols -or @($fullCols).Count -eq 0){ $fullCols = $fr.columns }
         foreach($row in $fr.rows){ [void]$fullRows.Add($row) }
@@ -3043,6 +3162,7 @@ function Api-CompareRowsDiff { param($data)
         return '{"ok":true,"pkCols":'+(J-Arr $pk)+',"fkCols":'+(J-Arr $fk)+',"diffs":[],"commonTotal":'+$commonTotal+',"comparedCount":0,"truncated":false,"targetReadonly":'+$roJson+'}'
     }
     $binSet = Get-BinaryColumnSet $src $srcDb $table
+    $floatSet = Get-FloatColumnSet $src $srcDb $table
     if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $srcDb.$table.")+'}' }
     $fetchChunk = 200
     $fullCols = $null
@@ -3054,13 +3174,13 @@ function Api-CompareRowsDiff { param($data)
         if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
         $fEnd = [Math]::Min($fi+$fetchChunk,$useCommon.Count) - 1
         $chunk = $useCommon[$fi..$fEnd]
-        $where = Get-PkWhere $pk $chunk $binSet
-        $sr = Get-ExactRows $src $srcDb $table $where $rid
+        $where = Get-PkWhere $pk $chunk $binSet $floatSet
+        $sr = Get-ExactRows $src $srcDb $table $where $rid -Keep $pk
         if(-not $sr.ok){ return '{"ok":false,"error":'+(J-Str $sr.err)+'}' }
         if(-not $fullCols -or @($fullCols).Count -eq 0){ $fullCols = $sr.columns }
         $pkIdx = @($pk | ForEach-Object { [Array]::IndexOf($fullCols,$_) })
         foreach($row in $sr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $srcFull[$k] = $row }
-        $tr = Get-ExactRows $tgt $tgtDb $table $where $rid
+        $tr = Get-ExactRows $tgt $tgtDb $table $where $rid -Columns $sr.columns
         if(-not $tr.ok){ return '{"ok":false,"error":'+(J-Str $tr.err)+'}' }
         foreach($row in $tr.rows){ $k = (($pkIdx | ForEach-Object { $row[$_] }) -join "`u{1}"); $tgtFull[$k] = $row }
     }
@@ -3098,6 +3218,7 @@ function Api-CompareRowsApplyDiff { param($data)
     $obj = (SqlId $db) + '.' + (SqlId $table)
     $binSet = Get-BinaryColumnSet $tgt $db $table
     if($null -eq $binSet){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $db.$table.")+'}' }
+    $floatSet = Get-FloatColumnSet $tgt $db $table
     # Unlike Api-CompareRowsApply/Api-CompareRowsInsertAll (INSERT-only, each batch already atomic
     # as one statement, and a chunk failing partway through a large bulk insert shouldn't block
     # the rest), this updates EXISTING target rows one at a time - the exact "apply this reviewed
@@ -3113,9 +3234,16 @@ function Api-CompareRowsApplyDiff { param($data)
     foreach($u in $updates){
         $sets = @(); foreach($cd in $u.colDiffs){ $sets += (SqlId ([string]$cd.col)) + '=' + (SqlValFor $cd.src ($binSet.Contains([string]$cd.col))) }
         $whs = @(); $pkv = @($u.pk)
-        for($i=0; $i -lt $pkCols.Count; $i++){ $whs += (SqlId $pkCols[$i]) + '=' + (SqlValFor $pkv[$i] ($binSet.Contains([string]$pkCols[$i]))) }
+        for($i=0; $i -lt $pkCols.Count; $i++){
+            if ($floatSet -and $floatSet.Contains([string]$pkCols[$i])) { $whs += (Get-KeyCol $pkCols[$i] $floatSet) + '=' + (SqlLit $pkv[$i]) }
+            else { $whs += (SqlId $pkCols[$i]) + '=' + (SqlValFor $pkv[$i] ($binSet.Contains([string]$pkCols[$i]))) }
+        }
         $pkDesc = ($pkv -join ',')
         if($sets.Count -eq 0 -or $whs.Count -eq 0){ [void]$skipped.Add($pkDesc); continue }
+        # The update used to count as done whatever it matched: a row deleted on the target since
+        # the comparison, or a key that could not be matched, was reported as updated. This stops
+        # the batch (error 1172, both servers) unless the key matches exactly one row.
+        [void]$stmts.Add('SELECT 1 FROM (SELECT 1 AS x UNION ALL SELECT 2) nobs_guard WHERE (SELECT COUNT(*) FROM ' + $obj + ' WHERE ' + ($whs -join ' AND ') + ') <> 1 INTO @nobs_one_row;')
         [void]$stmts.Add("UPDATE $obj SET " + ($sets -join ',') + ' WHERE ' + ($whs -join ' AND ') + ' LIMIT 1;')
         [void]$pkDescs.Add($pkDesc)
     }
@@ -3131,7 +3259,9 @@ function Api-CompareRowsApplyDiff { param($data)
             foreach($d in $pkDescs){ [void]$log.Add("OK  updated id=$d") }
             return '{"ok":true,"log":'+(J-Arr $log)+'}'
         } else {
-            [void]$log.Add("FAILED : "+(FirstErr $r2.err))
+            $fe = FirstErr $r2.err
+            if ($fe -match 'Result consisted of more than one row') { $fe = 'a row to update no longer matches exactly one target row (changed or deleted since the comparison, or its key cannot be matched) - ' + $fe }
+            [void]$log.Add("FAILED : "+$fe)
             [void]$log.Add((Get-BatchFailureNote (FirstErr $r2.err)))
             return '{"ok":false,"log":'+(J-Arr $log)+'}'
         }
@@ -3182,6 +3312,7 @@ function Api-CompareRowsInsertAll { param($data)
     $inserted = 0
     $srcBin = Get-BinaryColumnSet $src $srcDb $table
     $tgtBin = Get-BinaryColumnSet $tgt $tgtDb $table
+    $srcFloat = Get-FloatColumnSet $src $srcDb $table
     if($null -eq $srcBin -or $null -eq $tgtBin){ return '{"ok":false,"error":'+(J-Str "Could not read the column types of $table on both sides.")+'}' }
     $my = Get-Mysql $tgt
     $cnf = New-Cnf $tgt -Tool $my
@@ -3190,9 +3321,12 @@ function Api-CompareRowsInsertAll { param($data)
             if($rid -and $script:CancelledCompares.ContainsKey($rid)){ $cancelled = $true; break }
             $fEnd = [Math]::Min($fi+$chunkSize,$missingRows.Count) - 1
             $chunk = $missingRows[$fi..$fEnd]
-            $where = Get-PkWhere $pk $chunk $srcBin
-            $fr = Get-ExactRows $src $srcDb $table $where $rid
+            $where = Get-PkWhere $pk $chunk $srcBin $srcFloat
+            $fr = Get-ExactRows $src $srcDb $table $where $rid -Keep $pk
             if(-not $fr.ok){ [void]$log.Add("FAILED (fetch) rows "+$fi+"-"+$fEnd+" : "+$fr.err); continue }
+            # A row that cannot be read back by its key is not copied; say so rather than
+            # reporting the chunk as done.
+            if($fr.rows.Count -ne @($chunk).Count){ [void]$log.Add("FAILED (fetch) rows "+$fi+"-"+$fEnd+" : "+(@($chunk).Count - $fr.rows.Count)+" of "+@($chunk).Count+" row(s) could not be read back by their key and were not copied") }
             if($fr.rows.Count -eq 0){ continue }
             $cols = @($fr.columns)
             $colList = ($cols | ForEach-Object { SqlId $_ }) -join ','
@@ -4075,6 +4209,56 @@ async function gridBinCols(id){
  if(t.binCols&&t.binCols.length===t.cols.length)return t.binCols.map(Boolean);
  if(!t.table)return null;
  return tableBinCols(t.db,t.table,t.cols);
+}
+// A table's columns in order, each with whether it is generated; null when they cannot be read.
+// Copies name their columns from this rather than using SELECT *: SELECT * leaves out INVISIBLE
+// columns (MySQL 8.0.23+, MariaDB 10.3+), so a copy made from it stored NULL in them, and a
+// generated column cannot be given a value, so a copy that included one was refused.
+async function tableColumnsInfo(db,table){
+ try{
+  const r=await api('/api/query',{sql:"SELECT COLUMN_NAME, EXTRA FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)+" ORDER BY ORDINAL_POSITION"});
+  if(!r.ok||!r.rows.length)return null;
+  return r.rows.map(x=>({name:String(x[0]),generated:GENERATED_EXTRA.test(String(x[1]||''))}));
+ }catch(e){return null;}
+}
+// EXTRA for a generated column; MySQL's DEFAULT_GENERATED only marks an expression default.
+const GENERATED_EXTRA=/(VIRTUAL|STORED|PERSISTENT) GENERATED/i;
+// An INSERT that skips a row whose key already exists, as INSERT IGNORE did - without IGNORE's
+// other effect: it turns errors into warnings, so a value too long for its column was cut short
+// and an impossible date stored as 0000-00-00, silently, when the file was run.
+function insertSkipExisting(tbl,cols,tuple){const f=qid(cols[0]);return 'INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES '+tuple+' ON DUPLICATE KEY UPDATE '+f+'='+f+';';}
+// How Apply finds a grid row: by its key, as the grid holds it. Two key types do not survive that:
+//  - FLOAT is shown rounded (1.1 is stored as 1.10000002384), so k = '1.1' matched nothing, and the
+//    edit or delete did nothing while the app reported it applied. Matched by its text instead.
+//  - TIMESTAMP is shown in the session time zone, where the hour clocks go back in autumn happens
+//    twice: two keys an hour apart both showed as 02:30, and editing one changed the other. Matched
+//    by its text within a few hours of it, so both show up and the guard below refuses.
+// null when a key column is not in the result.
+function keyWhere(t,ri,bc,types){
+ const parts=[];
+ for(const p of t.pk){
+  const ci=t.cols.indexOf(p);if(ci<0)return null;
+  const v=t.rows[ri][ci],q=qid(p),ty=types&&types[String(p).toLowerCase()];
+  if(v===null||v===undefined){parts.push(q+' IS NULL');continue;}
+  const l=strLit(String(v));
+  if(ty==='float'){parts.push('CAST('+q+' AS CHAR)='+l);continue;}
+  if(ty==='timestamp'){parts.push('('+q+' BETWEEN '+l+' - INTERVAL 3 HOUR AND '+l+' + INTERVAL 3 HOUR AND CAST('+q+' AS CHAR)='+l+')');continue;}
+  parts.push(q+'='+litAs(v,bc?bc[ci]:null));
+ }
+ return parts.join(' AND ');
+}
+// Stops the batch - which runs as one transaction - unless where matches exactly one row: none when
+// the row was changed or deleted since it was read, or its key cannot be matched; more when the key
+// is ambiguous. Both servers refuse to put two rows into a variable (error 1172).
+function oneRowGuard(tbl,where){return 'SELECT 1 FROM (SELECT 1 AS x UNION ALL SELECT 2) nobs_guard WHERE (SELECT COUNT(*) FROM '+tbl+' WHERE '+where+') <> 1 INTO @nobs_one_row;';}
+const ONE_ROW_REFUSED='Nothing was saved. A row you changed or deleted no longer matches exactly one row in the table: it may have been changed or deleted since it was loaded, or its key cannot be matched exactly (a FLOAT key shown rounded, or a TIMESTAMP key in the hour the clocks go back). Reload the table and try again.';
+async function tableColTypes(db,table){
+ try{
+  const r=await api('/api/query',{sql:"SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+strLit(db)+" AND TABLE_NAME="+strLit(table)});
+  if(!r.ok)return null;
+  const m={};r.rows.forEach(x=>{m[String(x[0]).toLowerCase()]=String(x[1]).toLowerCase();});
+  return m;
+ }catch(e){return null;}
 }
 // lit() decides from the value's shape, which is wrong both ways for row data: a text cell holding
 // 0x41 was written as the byte A, and an empty binary value - shown as the bare 0x - as the two
@@ -4986,10 +5170,10 @@ async function newTrigger(db,table){
   :('-- Fill in the trigger body, then click "Apply (recreate)".\nDROP TRIGGER IF EXISTS '+qid(db)+'.'+qid(name)+';\nDELIMITER $$\nCREATE TRIGGER '+qid(db)+'.'+qid(name)+'\n'+res.timing+' '+res.event+' ON '+qid(db)+'.'+qid(table)+'\nFOR EACH ROW\nBEGIN\n\n  -- your logic here\n\nEND$$\nDELIMITER ;\n');
  openTab('trigger: '+name,body,db,false,null,{type:'trigger',db,name});
 }
-async function dropSchema(db){if(!(await ask('DROP DATABASE '+db+' ? Deletes ALL its data.')))return;if(await exec('DROP DATABASE '+qid(db),'Dropped schema')){loadSchemas();$('objects').innerHTML='';}}
+async function dropSchema(db){if(!(await ask('DROP DATABASE '+db+' ? Deletes ALL its data.')))return;if(await exec('DROP DATABASE '+qid(db),'Dropped schema')){[...tabs].forEach(t=>{if(t.db===db&&t.table)closeTab(t.id);});loadSchemas();$('objects').innerHTML='';}}
 async function dropObject(db,type,name){const kw={table:'TABLE',view:'VIEW',procedure:'PROCEDURE',function:'FUNCTION',trigger:'TRIGGER',event:'EVENT'}[type];if(!(await ask('DROP '+kw+' '+db+'.'+name+'?\n\nThis permanently removes the '+type+' and cannot be undone.')))return;if(await exec('DROP '+kw+' IF EXISTS '+qid(db)+'.'+qid(name),'Dropped '+type+' '+db+'.'+name)){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
 async function truncateTable(db,name){if(!(await ask('TRUNCATE TABLE '+db+'.'+name+'?\n\nThis permanently deletes ALL rows and cannot be undone.')))return;if(await exec('TRUNCATE TABLE '+qid(db)+'.'+qid(name),'Truncated '+db+'.'+name)){invalidateTableCache(db,name);[...tabs].forEach(t=>{if(t.table===name&&t.db===db)openRun(t.id);});}}
-async function renameTable(db,name){const res=await inputBox({title:'Rename table',okText:'Rename',fields:[{key:'name',label:'New table name',value:name}]});if(!res||!res.name.trim()||res.name.trim()===name)return;if(await exec('RENAME TABLE '+qid(db)+'.'+qid(name)+' TO '+qid(db)+'.'+qid(res.name.trim()),'Renamed'))loadObjects(db);}
+async function renameTable(db,name){const res=await inputBox({title:'Rename table',okText:'Rename',fields:[{key:'name',label:'New table name',value:name}]});if(!res||!res.name.trim()||res.name.trim()===name)return;if(await exec('RENAME TABLE '+qid(db)+'.'+qid(name)+' TO '+qid(db)+'.'+qid(res.name.trim()),'Renamed')){[...tabs].forEach(t=>{if(t.db===db&&t.table===name)closeTab(t.id);});loadObjects(db);}}
 async function duplicateTable(db,name){
  const res=await inputBox({title:'Duplicate table',okText:'Create',fields:[
   {key:'name',label:'New table name',value:name+'_copy'},
@@ -4999,7 +5183,14 @@ async function duplicateTable(db,name){
  const newName=res.name.trim();
  if(roBlock())return;
  let sql='CREATE TABLE '+qid(db)+'.'+qid(newName)+' LIKE '+qid(db)+'.'+qid(name)+';';
- if(res.data){sql+='\nINSERT INTO '+qid(db)+'.'+qid(newName)+' SELECT * FROM '+qid(db)+'.'+qid(name)+';';}
+ if(res.data){
+  // Named columns: SELECT * left invisible columns NULL in the copy, and a generated column in it
+  // made the copy fail - after the empty table had already been created.
+  const info=await tableColumnsInfo(db,name);
+  if(!info){toast('Could not read the columns of '+db+'.'+name+'. Nothing was created.',true);return;}
+  const cl=info.filter(c=>!c.generated).map(c=>qid(c.name)).join(',');
+  sql+='\nINSERT INTO '+qid(db)+'.'+qid(newName)+' ('+cl+') SELECT '+cl+' FROM '+qid(db)+'.'+qid(name)+';';
+ }
  const r=await api('/api/script',{sql,db});
  if(r.ok){log('Duplicated '+name+' as '+newName+(res.data?' (with data)':' (structure only)')+'.');loadObjects(db);}
  else{toast(r.error||'Duplicate failed',true);}
@@ -6375,10 +6566,12 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
   return;
  }
  // updates grouped by row
+ const kt=await tableColTypes(t.db,t.table);let noKey=false;
  const byRow={};Object.keys(t.pending.upd).forEach(k=>{const[ri,ci]=k.split(':').map(Number);(byRow[ri]=byRow[ri]||{})[ci]=t.pending.upd[k];});
  Object.keys(byRow).forEach(ri=>{ri=+ri;const sets=Object.keys(byRow[ri]).map(ci=>qid(t.cols[ci])+'='+litAs(byRow[ri][ci],bc?bc[ci]:null));
-   const wh=t.pk.map(p=>qid(p)+'='+litAs(t.rows[ri][t.cols.indexOf(p)],bc?bc[t.cols.indexOf(p)]:null));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
- t.pending.del.forEach(ri=>{const wh=t.pk.map(p=>qid(p)+'='+litAs(t.rows[ri][t.cols.indexOf(p)],bc?bc[t.cols.indexOf(p)]:null));S.push('DELETE FROM '+tbl+' WHERE '+wh.join(' AND ')+' LIMIT 1;');});
+   const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}S.push(oneRowGuard(tbl,wh));S.push('UPDATE '+tbl+' SET '+sets.join(',')+' WHERE '+wh+' LIMIT 1;');});
+ t.pending.del.forEach(ri=>{const wh=keyWhere(t,ri,bc,kt);if(wh==null){noKey=true;return;}S.push(oneRowGuard(tbl,wh));S.push('DELETE FROM '+tbl+' WHERE '+wh+' LIMIT 1;');});
+ if(noKey){toast('Nothing was saved: the result does not include every key column ('+t.pk.join(', ')+'), so the rows cannot be found exactly. Include the key in the query.',true);return;}
  t.pending.ins.forEach(row=>{const cols=Object.keys(row);if(!cols.length)return;S.push('INSERT INTO '+tbl+' ('+cols.map(qid).join(',')+') VALUES ('+cols.map(c=>litAs(row[c],bc?bc[t.cols.indexOf(c)]:null)).join(',')+');');});
  // A BIT or binary column round-trips as 0x..., and lit() passes that through unquoted. Anything
  // else is quoted, and MySQL then stores the BYTES of the text: typing 8 into a BIT(8) cell
@@ -6413,13 +6606,14 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  // above), and if that's the ONLY thing pending, S ends up empty with nothing to tell the user
  // apply didn't silently do something - say so instead of just doing nothing visibly.
  if(!S.length){toast('Nothing to apply - new row(s) with no values are ignored. Fill in a column, or Revert to remove them.',true);return;}
+ const changes=S.filter(s=>!s.startsWith('SELECT 1 FROM (SELECT 1 AS x')).length;
  log('APPLY:\n'+S.join('\n'));
  // Runs as one transaction, so a failure part-way leaves the table exactly as it was.
  // Foreign keys are NOT disabled here: they were, which let an edit point a row at a
  // parent that does not exist and silently break referential integrity the schema was
  // written to guarantee.
  const r=await api('/api/script',{sql:S.join('\n'),transaction:true});
- if(r.ok){log('Applied '+S.length+' change(s).');toast('Applied '+S.length+' change(s).','ok');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);toast('Apply failed: '+r.error,true);}}
+ if(r.ok){log('Applied '+changes+' change(s).');toast('Applied '+changes+' change(s).','ok');invalidateTableCache(t.db,t.table);openRun(id).then(()=>refreshTabDirty(id));}else{log('APPLY error: '+r.error);toast(/Result consisted of more than one row/.test(String(r.error))?ONE_ROW_REFUSED:'Apply failed: '+r.error,true);}}
 
 function ddlFailureNote(err, sql){
  const e = String(err || "");
@@ -6521,9 +6715,13 @@ function selAll(id,ch){const t=T(id);if(!t.selected)t.selected=new Set();const v
 function copySel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bTSV(t.cols,rows)).then(()=>log('Copied '+rows.length+' selected row(s) (TSV).'));}
 function copySelCsv(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}navigator.clipboard.writeText(bCSV(t.cols,rows)).then(()=>{csvNullHint(rows);}).then(()=>log('Copied '+rows.length+' selected row(s) (CSV).'));}
 function csvGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'csv');return;}dl(bCSV(t.cols,t.rows),'result.csv');}
-async function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const bc=await gridBinCols(id);const s=t.rows.map(r=>'INSERT IGNORE INTO `table` ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
+async function insGrid(id){const t=T(id);if(!t.cols)return;if(t.table){exportFull(t.db,t.table,'inserts');return;}const bc=await gridBinCols(id);const s=t.rows.map(r=>insertSkipExisting('`table`',t.cols,'('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,'result_inserts.sql');log('Exported '+t.rows.length+' row(s) as INSERTs.');}
 async function csvSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;dl(bCSV(t.cols,rows),(t.table||'result')+'_selected.csv');log('Exported '+rows.length+' selected row(s) to CSV.');}
-async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);const s=rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+t.cols.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
+async function insSel(id){const t=T(id);if(!t.cols)return;const rows=selRows(id);if(!rows.length){toast('No rows selected. Tick the checkboxes on the rows you want.',true);return;}if(t.table&&!t.exact&&await refuseNulTextExport(t.db,t.table))return;const tbl=t.table?(qid(t.db)+'.'+qid(t.table)):'`table`';const bc=await gridBinCols(id);
+ // A generated column cannot be given a value, so it is left out.
+ const info=t.table?await tableColumnsInfo(t.db,t.table):null;const gen=new Set((info||[]).filter(c=>c.generated).map(c=>c.name.toLowerCase()));
+ const keep=t.cols.map((c,i)=>i).filter(i=>!gen.has(String(t.cols[i]).toLowerCase()));
+ const s=rows.map(r=>insertSkipExisting(tbl,keep.map(i=>t.cols[i]),'('+keep.map(i=>litAs(r[i],bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,(t.table||'result')+'_selected_inserts.sql');log('Exported '+rows.length+' selected row(s) as INSERTs.');}
 async function dl(text,name){
  const ext=(name.split('.').pop()||'').toLowerCase();const filters=ext?[{name:ext.toUpperCase()+' file',extensions:[ext]}]:undefined;
  // Tauri: native Save As + backend write
@@ -7965,9 +8163,13 @@ async function exportFull(db,name,fmt){fmt=fmt||'csv';const ext=(fmt==='inserts'
      if(!(await ask('Continue exporting '+db+'.'+name+' via the query engine anyway? This may take a while for a table this size.'))){return;}
    }
  }catch(e){}
- const q=await api('/api/query',{sql:'SELECT * FROM '+qid(db)+'.'+qid(name),db:db});if(!q.ok){toast(q.error,true);return;}
+ // Named columns: every one for CSV, invisible ones included (SELECT * leaves them out); INSERTs
+ // leave out generated columns, which cannot be given a value (the CSV import skips them).
+ const info=await tableColumnsInfo(db,name);if(!info){toast('Could not read the columns of '+db+'.'+name+'.',true);return;}
+ const expCols=info.filter(c=>fmt!=='inserts'||!c.generated).map(c=>c.name);
+ const q=await api('/api/query',{sql:'SELECT '+expCols.map(qid).join(',')+' FROM '+qid(db)+'.'+qid(name),db:db});if(!q.ok){toast(q.error,true);return;}
  if(await refuseNulTextExport(db,name))return;
- if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const bc=await tableBinCols(db,name,q.columns);const s=q.rows.map(r=>'INSERT IGNORE INTO '+tbl+' ('+q.columns.map(qid).join(',')+') VALUES ('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+');').join('\n');dl(s,defName);}
+ if(fmt==='inserts'){const tbl=qid(db)+'.'+qid(name);const bc=await tableBinCols(db,name,q.columns);const s=q.rows.map(r=>insertSkipExisting(tbl,q.columns,'('+r.map((v,i)=>litAs(v,bc?bc[i]:null)).join(',')+')')).join('\n');dl(s,defName);}
  else{dl(bCSV(q.columns,q.rows),defName);}}
 function importCsv(db,table){csvTarget={db,table};$('csvTitle').textContent='Import CSV into '+db+'.'+table;$('csvFile').value='';$('csvLog').textContent='';show('mCsv');}
 async function runCsvImport(){const f=$('csvFile').value.trim();if(!f){toast('Choose a CSV file.',true);return;}

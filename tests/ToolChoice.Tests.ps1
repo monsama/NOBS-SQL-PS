@@ -85,7 +85,16 @@ try {
         $b1 = Get-Content -Raw $f1; $b2 = Get-Content -Raw $f2
         Check ($b1 -match 'ssl-mode=REQUIRED' -and $b1 -notmatch 'plugin-dir') "for MySQL's tool: MySQL's SSL option, no plugin folder" $b1
         Check ($b2 -match '(?m)^ssl\s*$' -and $b2 -match 'plugin-dir') 'for the default client: MariaDB''s option and our plugins' $b2
+        Check ($b1 -notmatch '\[mysql\]|init-command') 'an ordinary connection keeps the server''s time zone' $b1
     } finally { Remove-Item $f1, $f2 -Force -ErrorAction SilentlyContinue }
+    # Compare's connections run in UTC, set only for mysql.exe: mysqldump reads the same file and
+    # rejects options it does not know.
+    $utc = @{ host = 'h'; port = '3306'; user = 'u'; password = 'p'; ssl = 'required'; utc = $true }
+    $f3 = New-Cnf $utc -Tool $theirs
+    try {
+        $b3 = Get-Content -Raw $f3
+        Check ($b3 -match "(?s)\[client\].*ssl-mode=REQUIRED.*\r?\n\[mysql\]\r?\ninit-command=`"SET time_zone='\+00:00'`"") 'a Compare connection sets UTC in the [mysql] group, after the client options' $b3
+    } finally { Remove-Item $f3 -Force -ErrorAction SilentlyContinue }
     $script:MysqldumpPath = $ours
     $script:DumpIsMariaDB = @{ Path = $ours; Maria = $true }
     Check (-not (Test-DumpIsMariaDB $theirs)) 'the dump flavor is asked of the tool that will run'
@@ -129,5 +138,21 @@ Check ((Get-ToolVersionLabel 'C:\x\mysqldump.exe from 12.3.3-MariaDB, client 10.
 Check ((Get-ToolVersionLabel 'mysqldump  Ver 8.4.9 for Win64 on x86_64 (MySQL Community Server - GPL)') -eq 'MySQL 8.4.9') "MySQL's dump tool"
 Check ((Get-ToolVersionLabel 'C:\x\mysql.exe  Ver 8.0.46 for Win64 on x86_64 (MySQL Community Server - GPL)') -eq 'MySQL 8.0.46') "MySQL's client"
 Check ($null -eq (Get-ToolVersionLabel 'something else')) 'anything else is not a version'
+
+"`n-- schema sync writes a column as the server defines it --"
+$ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('Get-ColumnDefinitions','ColDefinition','ColDefLine','ColDefaultClause','SqlId','SqlLit','Needs-Quote') }, $true) |
+    ForEach-Object { Invoke-Expression $_.Extent.Text }
+foreach ($name in '$script:ReservedSet') {
+    $a = $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $name},$true) | Select-Object -First 1
+    if ($a) { Invoke-Expression $a.Extent.Text }
+}
+$create = "CREATE TABLE ``t`` (`n  ``id`` int(11) NOT NULL,`n  ``we````ird`` varchar(10) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL COMMENT 'x, y',`n  ``n`` varchar(5) DEFAULT 'a',`n  ``g`` int(11) GENERATED ALWAYS AS (``id`` * 2) VIRTUAL,`n  PRIMARY KEY (``id``)`n) ENGINE=InnoDB"
+$defs = Get-ColumnDefinitions $create
+$col = { param($name, $type, $cs, $co) [pscustomobject]@{ name = $name; type = $type; null = 'NO'; default = $null; extra = ''; charset = $cs; collation = $co; comment = ''; generation = '' } }
+Check ($defs.Count -eq 4) 'every column line is read, and nothing else' ($defs.Keys -join ',')
+Check ((ColDefinition (& $col 'we`ird' 'varchar(10)' 'latin1' 'latin1_bin') $defs) -ceq "``we````ird`` varchar(10) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL COMMENT 'x, y'") 'a column keeps its character set, collation and comment'
+Check ((ColDefinition (& $col 'n' 'varchar(5)' 'utf8mb4' 'utf8mb4_bin') $defs) -ceq "``n`` varchar(5) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'a'") 'a table-default character set is spelled out'
+Check ((ColDefinition (& $col 'G' 'int(11)' $null $null) $defs) -ceq '`g` int(11) GENERATED ALWAYS AS (`id` * 2) VIRTUAL') 'a generated column keeps its expression'
+Check ((ColDefinition (& $col 'missing' 'int' $null $null) $defs) -ceq 'missing int NOT NULL') 'without a line, the old way'
 
 if ($fail) { "`n  $fail FAILED"; exit 1 } else { "`n  all passed"; exit 0 }

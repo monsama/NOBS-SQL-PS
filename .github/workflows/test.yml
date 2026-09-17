@@ -102,6 +102,11 @@ jobs:
         shell: pwsh
         run: ./tests/TableBinding.Tests.ps1 ./NOBSSQL.ps1
 
+      # Saving grid edits: every change must match exactly one row.
+      - name: Run grid save tests
+        shell: pwsh
+        run: ./tests/GridSave.Tests.ps1 ./NOBSSQL.ps1
+
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
         shell: pwsh

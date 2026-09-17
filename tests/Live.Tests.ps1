@@ -346,6 +346,53 @@ try {
     Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE IF EXISTS nobs_test.csv_live_rt' } | Out-Null
     Remove-Item -LiteralPath $csv1, $csv2, $csvBad -Force -ErrorAction SilentlyContinue
 
+    # The import skipped columns the table does not have, filled short rows with NULL, dropped
+    # extra fields and switched foreign key checks off. Generated columns (which the desktop
+    # edition's CSV export includes) cannot be given a value, so they are skipped and named.
+    foreach ($s in @('DROP TABLE IF EXISTS nobs_test.csv_x_child', 'DROP TABLE IF EXISTS nobs_test.csv_x_parent', 'DROP TABLE IF EXISTS nobs_test.csv_x',
+                     'CREATE TABLE nobs_test.csv_x (id INT PRIMARY KEY, a INT, secret VARCHAR(10) INVISIBLE, g INT GENERATED ALWAYS AS (a * 2) VIRTUAL)',
+                     'CREATE TABLE nobs_test.csv_x_parent (id INT PRIMARY KEY)',
+                     'CREATE TABLE nobs_test.csv_x_child (id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES nobs_test.csv_x_parent (id))')) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $csvCase = {
+        param($name, $lines, $table)
+        $p = Join-Path $csvDir "nobs-live-$name-$PID.csv"
+        Set-Content -LiteralPath $p -Encoding utf8 -Value $lines
+        $r = Api '/api/importcsv' @{ conn = $conn; db = 'nobs_test'; table = $table; file = $p; hasHeader = $true; nullValue = '\N' }
+        Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+        $r
+    }
+    $r = & $csvCase 'gen' @('ID,A,SECRET,g', '1,5,hidden,999') 'csv_x'
+    Check ($r.ok -and $r.message -match 'computed by the server: g') 'CSV headers match ignoring case, and a generated column is skipped' ($r | ConvertTo-Json -Compress)
+    Check ((Scalar "SELECT CONCAT_WS('|', a, secret, g) FROM csv_x" 'nobs_test') -eq '5|hidden|10') 'the invisible column is stored, the generated one computed'
+    $r = & $csvCase 'unknown' @('id,nmae', '2,x') 'csv_x'
+    Check ($r.error -match 'no column named nmae') 'a CSV column the table does not have is refused' ($r | ConvertTo-Json -Compress)
+    $r = & $csvCase 'short' @('id,a', '2,3', '4') 'csv_x'
+    Check ($r.error -match 'Data row 2 has 1 field\(s\), but the header has 2') 'a row with too few fields is refused' ($r | ConvertTo-Json -Compress)
+    $r = & $csvCase 'long' @('id,a', '2,3,9') 'csv_x'
+    Check ($r.error -match 'more than 2 field') 'a row with too many fields is refused' ($r | ConvertTo-Json -Compress)
+    Check ((Scalar 'SELECT COUNT(*) FROM csv_x' 'nobs_test') -eq '1') 'and none of them imported anything'
+    $r = & $csvCase 'fk' @('id,pid', '1,999') 'csv_x_child'
+    Check (-not $r.ok -and (Scalar 'SELECT COUNT(*) FROM csv_x_child' 'nobs_test') -eq '0') 'a row pointing at a missing parent is refused' ($r | ConvertTo-Json -Compress)
+    foreach ($s in @('DROP TABLE nobs_test.csv_x_child', 'DROP TABLE nobs_test.csv_x_parent', 'DROP TABLE nobs_test.csv_x')) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+
+    # A grid save runs a guard before each change (oneRowGuard in the UI): unless the change's
+    # WHERE matches exactly one row, the batch stops (error 1172) and is rolled back. Without it a
+    # FLOAT key - matched by its text now - or a row deleted meanwhile was reported as saved.
+    $guard = { param($where) "SELECT 1 FROM (SELECT 1 AS x UNION ALL SELECT 2) nobs_guard WHERE (SELECT COUNT(*) FROM nobs_test.grid_guard WHERE $where) <> 1 INTO @nobs_one_row;" }
+    foreach ($s in @('DROP TABLE IF EXISTS nobs_test.grid_guard', 'CREATE TABLE nobs_test.grid_guard (k FLOAT PRIMARY KEY, v VARCHAR(10))', "INSERT INTO nobs_test.grid_guard VALUES (1.1, 'a'), (2.5, 'b')")) {
+        Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null
+    }
+    $w = "CAST(``k`` AS CHAR)='1.1'"
+    $g1 = Api '/api/script' @{ conn = $conn; transaction = $true; sql = (& $guard $w) + "`nUPDATE nobs_test.grid_guard SET v='x' WHERE $w LIMIT 1;" }
+    Check ($g1.ok -and (Scalar "SELECT v FROM grid_guard WHERE k > 1 AND k < 2" 'nobs_test') -eq 'x') 'a FLOAT-keyed row is saved' ($g1 | ConvertTo-Json -Compress)
+    $w2 = "CAST(``k`` AS CHAR)='9.9'"
+    $g2 = Api '/api/script' @{ conn = $conn; transaction = $true; sql = "UPDATE nobs_test.grid_guard SET v='y' WHERE k > 2 LIMIT 1;`n" + (& $guard $w2) + "`nDELETE FROM nobs_test.grid_guard WHERE $w2 LIMIT 1;" }
+    Check (-not $g2.ok -and $g2.error -match 'Result consisted of more than one row') 'a change matching no row stops the batch' ($g2 | ConvertTo-Json -Compress)
+    Check ((Scalar "SELECT v FROM grid_guard WHERE k > 2" 'nobs_test') -eq 'b') 'and the changes before it are rolled back'
+    Api '/api/exec' @{ conn = $conn; sql = 'DROP TABLE nobs_test.grid_guard' } | Out-Null
+
     # --- 4d. binary values survive the trip through the CLI ------------------------------------
     # Rows are parsed out of mysql.exe's stdout. Reading that stream as UTF-8 made the decoder
     # replace every byte that was not valid UTF-8 with U+FFFD before any of this app's code saw
@@ -650,6 +697,55 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
     Check ($k1.ok -and @($k1.diffs).Count -eq 1 -and [string]$k1.diffs[0].pk[0] -eq 'single') 'a table with a single common row is compared too' ($k1 | ConvertTo-Json -Compress -Depth 6)
     foreach ($s in @("DROP DATABASE IF EXISTS $ks", "DROP DATABASE IF EXISTS $kt")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
     Api '/api/conn-delete' @{ name = $kn } | Out-Null
+    $cn = $null
+
+    # --- 5e. FLOAT keys, invisible and generated columns in Compare --------------------------------
+    # A FLOAT key is read as rounded text, which matches nothing when compared to the column, so
+    # such rows could not be fetched or updated; an update counted as done whatever it matched;
+    # SELECT * left invisible columns out of copies; a generated column made the insert fail.
+    $fs = "nobs_live_fk_src_$PID"; $ft = "nobs_live_fk_tgt_$PID"; $fn = "nobs_live_fk_$PID"
+    $cn = $fn
+    Api '/api/conn-save' @{ name = $fn; conn = $conn; accent = '#3b82f6'; env = 'test'; readonly = $false; savepw = $true } | Out-Null
+    $fdef = '(k FLOAT PRIMARY KEY, a INT, secret VARCHAR(10) INVISIBLE, g INT GENERATED ALWAYS AS (a * 2) STORED)'
+    foreach ($s in @("DROP DATABASE IF EXISTS $fs", "DROP DATABASE IF EXISTS $ft", "CREATE DATABASE $fs", "CREATE DATABASE $ft",
+                     "CREATE TABLE $fs.t $fdef", "CREATE TABLE $ft.t $fdef",
+                     "INSERT INTO $fs.t (k, a, secret) VALUES (1.1, 5, 's1'), (0.3, 6, 's3')",
+                     "INSERT INTO $ft.t (k, a, secret) VALUES (0.3, 0, 'old')")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $fb = @{ sourceConnName = $fn; sourceDb = $fs; targetConnName = $fn; targetDb = $ft; table = 't' }
+    $fi = Api '/api/compare-rows-insert-all' $fb
+    Check ($fi.ok -and $fi.inserted -eq 1) 'compare copies a FLOAT-keyed missing row' ($fi | ConvertTo-Json -Compress)
+    Check ((Scalar "SELECT CONCAT_WS('|', a, secret, g) FROM $ft.t WHERE k > 1") -eq '5|s1|10') 'whole: invisible column included, generated column computed'
+    $fd = Api '/api/compare-rows-diff' $fb
+    Check ($fd.ok -and @($fd.diffs).Count -eq 1) 'the FLOAT-keyed common row is compared' ($fd | ConvertTo-Json -Compress -Depth 6)
+    if ($fd.ok) {
+        $fa = Api '/api/compare-rows-apply-diff' @{ targetConnName = $fn; targetDb = $ft; table = 't'; pkCols = @($fd.pkCols); updates = @($fd.diffs) }
+        Check ($fa.ok -and (Scalar "SELECT CONCAT_WS('|', a, secret, g) FROM $ft.t WHERE k < 1") -eq '6|s3|12') 'and updated by its key' ($fa | ConvertTo-Json -Compress)
+        Api '/api/exec' @{ conn = $conn; sql = "DELETE FROM $ft.t WHERE k < 1" } | Out-Null
+        $fg = Api '/api/compare-rows-apply-diff' @{ targetConnName = $fn; targetDb = $ft; table = 't'; pkCols = @($fd.pkCols); updates = @($fd.diffs) }
+        Check (-not $fg.ok -and (@($fg.log) -join ' ') -match 'no longer matches exactly one target row') 'a row deleted on the target since fails the batch' ($fg | ConvertTo-Json -Compress)
+    }
+    # Schema sync rebuilt a column from its type, NULL, default and EXTRA: MODIFY COLUMN changed a
+    # latin1_bin column to the table's default collation and dropped its comment, and a generated
+    # column could not be added at all.
+    foreach ($s in @("DROP DATABASE IF EXISTS $fs", "DROP DATABASE IF EXISTS $ft", "CREATE DATABASE $fs DEFAULT CHARACTER SET utf8mb4", "CREATE DATABASE $ft DEFAULT CHARACTER SET utf8mb4",
+                     "CREATE TABLE $fs.t (id INT PRIMARY KEY, name VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL COMMENT 'customer name', a INT, g INT GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+                     "CREATE TABLE $ft.t (id INT PRIMARY KEY, name VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_bin NULL, a INT)")) {
+        $sr = Api '/api/exec' @{ conn = $conn; sql = $s }; if (-not $sr.ok) { "  note  setup: $($sr.error)" }
+    }
+    $sc = Api '/api/compare-schemas' @{ sourceConnName = $fn; sourceDb = $fs; targetConnName = $fn; targetDb = $ft }
+    $stmts = @($sc.tables | ForEach-Object { $_.sql } | Where-Object { $_.checked } | ForEach-Object { [string]$_.stmt })
+    Check ($sc.ok -and $stmts.Count -eq 2) 'schema compare offers one MODIFY and one ADD' (($stmts -join ' ; ') + " $($sc.error)")
+    $sa = Api '/api/compare-apply' @{ targetConnName = $fn; targetDb = $ft; statements = $stmts }
+    $shape = Scalar "SELECT CONCAT_WS('|', COLLATION_NAME, IS_NULLABLE, COLUMN_COMMENT) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$ft' AND COLUMN_NAME='name'"
+    Check ($shape -ceq 'latin1_bin|NO|customer name') 'schema sync keeps a column''s collation and comment' "$shape $($sa | ConvertTo-Json -Compress)"
+    $gen = Scalar "SELECT LOWER(GENERATION_EXPRESSION) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA='$ft' AND COLUMN_NAME='g'"
+    Check (($gen -replace '[`() ]', '') -eq 'a*2') 'and adds a generated column with its expression' $gen
+    $sc2 = Api '/api/compare-schemas' @{ sourceConnName = $fn; sourceDb = $fs; targetConnName = $fn; targetDb = $ft }
+    Check ($sc2.ok -and @($sc2.tables | Where-Object { $_.status -ne 'same' }).Count -eq 0) 'after which nothing is left to sync' ($sc2 | ConvertTo-Json -Compress -Depth 5)
+    foreach ($s in @("DROP DATABASE IF EXISTS $fs", "DROP DATABASE IF EXISTS $ft")) { Api '/api/exec' @{ conn = $conn; sql = $s } | Out-Null }
+    Api '/api/conn-delete' @{ name = $fn } | Out-Null
     $cn = $null
 
     # --- 5d. a table grid reads text holding a NUL exactly ---------------------------------------

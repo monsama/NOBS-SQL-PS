@@ -253,7 +253,8 @@ eq(L.litAs('0x', false), "'0x'", 'in a text column 0x is the two characters');
 eq(L.litAs(null, true), 'NULL', 'NULL is NULL');
 eq(L.litAs('NULL', false), "'NULL'", "the text 'NULL' is quoted");
 eq(L.litAs('0x41', null), '0x41', 'with the type unknown it is lit(), as before');
-eq(/litAs\(t\.rows\[ri\]/.test(applyBody), true, 'applyChanges writes row keys by column type');
+eq(/keyWhere\(t,ri,bc,kt\)/.test(applyBody), true, 'applyChanges finds rows through keyWhere');
+eq(/litAs\(v,bc\?bc\[ci\]:null\)/.test(extractFunction(src, 'keyWhere')), true, 'which writes row keys by column type');
 eq(/litAs\(byRow\[ri\]\[ci\]/.test(applyBody), true, 'applyChanges writes changed cells by column type');
 for (const f of ['insGrid', 'insSel', 'exportFull']) {
   eq(extractFunction(src, f).includes('litAs('), true, f + ' writes rows by column type');
@@ -267,7 +268,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
 // editor hands over '' for it - while text in a binary column is still refused. The GUI pass found
 // the first one refused ("These are binary/BIT columns and only accept a 0x value: b = ''").
 {
-  const names = ['applyChanges', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const names = ['applyChanges', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
   const body = names.map(n => extractFunction(src, n)).join('\n');
   const run = async (upd, ins) => {
     const sent = [], toasts = [];
@@ -275,7 +276,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd, del: new Set(), ins } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, gridBinCols: async () => [false, true, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, true, false],
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
     };
@@ -358,7 +359,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
   CHECK(await f.exactTextQuery('SELECT * FROM t', 'SELECT * FROM u', { db: 'd', table: 't' }) === null, 'SQL not ending in the statement: not exact', '');
 
   // Apply from a grid that was not read that way: saved only when the table holds no such value.
-  const applyNames = ['applyChanges', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
+  const applyNames = ['applyChanges', 'keyWhere', 'oneRowGuard', 'litAs', 'lit', 'strLit', 'pastedHexColumns', 'looksLikePastedHex', 'normalizeHexInput'];
   const applyBody = applyNames.map(n => extractFunction(src, n)).join('\n');
   const run = async (exact, nulRows) => {
     const sent = [], toasts = [];
@@ -366,7 +367,7 @@ for (const f of ['insSel', 'csvSel', 'exportFull']) {
                 pending: { upd: { '0:1': 'y' }, del: new Set(), ins: [] } };
     const env = {
       roBlock: () => false, T: () => t, qid: s => '`' + s + '`', log: () => {}, invalidateTableCache: () => {},
-      openRun: async () => {}, refreshTabDirty: () => {}, gridBinCols: async () => [false, false],
+      openRun: async () => {}, refreshTabDirty: () => {}, tableColTypes: async () => ({}), gridBinCols: async () => [false, false],
       tableNulTextCount: async () => nulRows, fmtCount: n => String(n),
       toast: (m, e) => toasts.push((e === true ? 'ERR ' : '') + m),
       api: async (p, d) => { sent.push(d.sql); return { ok: true }; },
