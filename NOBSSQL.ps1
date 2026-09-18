@@ -6630,8 +6630,12 @@ function viewText(title,text,opts){opts=opts||{};$('vTitle').textContent=title;c
   ta.style.display='block';
   ta.value=(text==null?'':text);ta.readOnly=!!opts.readonly;
   // No Hex tab on this path (an ordinary text column), so this note is the only place the
-  // invisible bytes are mentioned at all.
-  setVNote(ctrlCharNote(ta.value,false));
+  // invisible bytes are mentioned at all. A value shown as hex because its bytes could not be
+  // read as text takes precedence: what that box holds is saved as text either way, and saying so
+  // matters more than counting control characters it does not have.
+  setVNote(opts.hexShownAsText
+   ? "These bytes are not readable as text in this connection's character set, so they are shown as hex. This column is not a binary one, so what the box holds is saved as text - the characters, not the bytes they spell."
+   : ctrlCharNote(ta.value,false));
  }
  const a=$('vActions');a.innerHTML='';const add=(label,cls,fn)=>{const b=document.createElement('button');b.textContent=label;if(cls)b.className=cls;b.onclick=fn;a.appendChild(b);};
  const getVal=()=>{
@@ -6769,9 +6773,27 @@ async function editWidgetFor(id,colName,curVal){
  // you type/read things like bcrypt hashes or tokens directly instead of hand-converting to hex,
  // while Hex stays available (and is all that's offered) for genuinely non-text bytes like images.
  const flaggedBinary=colType&&/^(binary|varbinary|(tiny|medium|long)?blob)\b/i.test(colType);
- const looksHex=typeof curVal==='string'&&/^0x[0-9A-Fa-f]+$/.test(curVal);
- if(flaggedBinary||looksHex)return {hexText:true};
+ const mode=binaryEditMode(flaggedBinary,curVal);
+ if(mode==='hex')return {hexText:true};
+ if(mode==='hexShownAsText')return {hexShownAsText:true};
  return {};
+}
+// Which editor a value gets once ENUM/SET/date are out of the way. The byte editor - the Text/Hex
+// tabs, whose Save writes a hex literal - is offered only for a column the server itself calls
+// binary, because that is the same thing the WRITE path asks: litAs() quotes for any column
+// binCols does not flag, so a value edited as bytes in a column that is not binary would be stored
+// as the characters of its hex, and would read back looking much like it did before.
+//
+// A column that is not declared binary can still arrive here as "0x.." hex all the same: the
+// backend hex-encodes any value whose bytes fail a UTF-8 decode, whatever the column (a legacy
+// non-UTF8 hash in a VARCHAR is the real example). Such a value used to get the byte editor too,
+// which is the disagreement above. It now gets a plain text box, matching what will actually be
+// stored, and the box says so rather than leaving the hex looking like something it is not - the
+// value is only readable as hex, but this column holds text and text is what a save writes.
+function binaryEditMode(flaggedBinary,v){
+ if(flaggedBinary)return 'hex';
+ if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return 'hexShownAsText';
+ return null;
 }
 async function editCell(td,id,ri,ci){clearTimeout(clickTimer);const t=T(id);const key=ri+':'+ci;const cur=(key in t.pending.upd)?t.pending.upd[key]:t.rows[ri][ci];
  const ew=await editWidgetFor(id,t.cols[ci],cur);
