@@ -156,7 +156,7 @@ say - still shows a NUL in text as a space, and is exported that way.
 ## Updates
 
 A few seconds after it starts, the app asks GitHub (`api.github.com`) for the latest release of
-[NOBS-SQL-PS](https://github.com/monsama/NOBS-SQL-PS/releases). If a newer version exists, a small
+[NOBS-SQL-Editor-PowerShell](https://github.com/monsama/NOBS-SQL-Editor-PowerShell/releases). If a newer version exists, a small
 notice with a link appears in the bottom-left corner. Nothing is downloaded or installed. The
 request carries nothing beyond what any web request does: your IP address and a user agent
 naming the app.
