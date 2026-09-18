@@ -935,7 +935,7 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
         # do, into a child scope so nothing here leaks into the HTTP-driven checks above.
         $caOk = & {
             $pe=$null;$pt=$null
-            $pa=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$pt,[ref]$pe)
+            $pa=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$pt,[ref]$pe)
             $pa.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]},$true) |
                 ForEach-Object { Invoke-Expression $_.Extent.Text }
             $script:ToolsDir  = Split-Path -Parent $caClient

@@ -13,7 +13,7 @@ param([Parameter(Mandatory)][string]$ScriptPath)
 
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
-if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
+if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 # The script-level values these functions lean on, taken from the script itself.
 foreach ($name in '$script:DumpDbSource','$script:RawEnc','$script:StrictUtf8') {
     $a = $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq $name},$true) | Select-Object -First 1

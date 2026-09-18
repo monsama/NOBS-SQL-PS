@@ -19,8 +19,8 @@
 param([Parameter(Mandatory)][string]$ScriptPath)
 
 $e=$null;$t=$null
-$ast=[System.Management.Automation.Language.Parser]::ParseFile($ScriptPath,[ref]$t,[ref]$e)
-if($e -and $e.Count){ "PARSE ERRORS: $($e.Count)"; exit 1 }
+$ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
+if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
                         $n.Name -in @('Get-PluginDir','Friendly-AuthErr','Get-CnfSafe')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }

@@ -26,7 +26,7 @@ if (-not $env:NOBS_TEST_TOOLS_DOWNLOAD) {
 
 $e = $null; $t = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path, [ref]$t, [ref]$e)
-if ($e -and $e.Count) { "PARSE ERRORS: $($e.Count)"; exit 1 }
+if ($e -and $e.Count) { $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $n.Name -in @('Api-DownloadTools', 'Api-DownloadMysqlTools', 'Get-MysqlDownloadInfo', 'Get-MysqlZipMember',
                   'Get-PluginDir', 'J-Str', 'Load-Cfg', 'Save-Cfg', 'Use-FileLock') }, $true) |
