@@ -1,0 +1,42 @@
+name: release-check
+
+# Checks a release against what its own notes say about it. The check itself lives in the editor
+# edition (tests/ci/check-release.sh) and is fetched here rather than copied, the way the test
+# servers' setup script already is - one implementation, so the two editions cannot drift into
+# checking different things.
+#
+# This edition's notes promise no checksum for NOBSSQL.ps1, and the check requires none: it holds a
+# release to what it claims, not to a house style. What it does catch here is a release that ships
+# nothing, and a relative link in the body - a release page resolves those against its own URL, so
+# they 404.
+on:
+  release:
+    types: [published, edited]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag of the release to check'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out nobs-sql-editor (the release check)
+        uses: actions/checkout@v7
+        with:
+          repository: monsama/nobs-sql-editor
+          path: editor
+          sparse-checkout: tests/ci
+          sparse-checkout-cone-mode: false
+
+      - name: Check the release describes what it ships
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Through bash on purpose: the executable bit does not survive a checkout made on
+        # Windows, and `./script.sh` then fails with a permission error that says nothing about
+        # what went wrong.
+        run: bash editor/tests/ci/check-release.sh "$GITHUB_REPOSITORY" "${{ github.event.release.tag_name || inputs.tag }}"
