@@ -8,8 +8,9 @@
 # version of it. That is the failure this catches.
 #
 # Nothing has to be registered here. A test is checked when it holds a $test = @'...'@ block and
-# names its source somewhere in its header as tests/ui/<name>.test.mjs, which every one of them
-# already does - so a test file added later is covered the day it is written.
+# names its source somewhere in its header - tests/ui/<name>.test.mjs, or for one that measures
+# layout in a browser, tests/browser/<name>.browser.mjs - which every one of them already does, so a
+# test file added later is covered the day it is written.
 #
 #   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../nobs-sql-editor
 #   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../nobs-sql-editor -Update   fix the copies
@@ -34,9 +35,9 @@ foreach ($file in Get-ChildItem (Join-Path $here '*.Tests.ps1') | Sort-Object Na
 
     # The source is whatever the file's own header says it was generated from.
     $header = ($text -split "`n" | Select-Object -First 15) -join "`n"
-    $named = [regex]::Match($header, 'tests/ui/[a-z0-9-]+\.test\.mjs')
+    $named = [regex]::Match($header, 'tests/(ui/[a-z0-9-]+\.test|browser/[a-z0-9-]+\.browser)\.mjs')
     if (-not $named.Success) {
-        "  FAIL  $($file.Name) embeds a copy but its header does not name the tests/ui file it came from"
+        "  FAIL  $($file.Name) embeds a copy but its header does not name the editor file it came from"
         $fail++; continue
     }
     $source = Join-Path $editor ($named.Value -replace '/', [IO.Path]::DirectorySeparatorChar)

@@ -114,15 +114,18 @@ jobs:
         shell: pwsh
         run: ./tests/UpdateCheck.Tests.ps1 ./NOBSSQL.ps1
 
-      # Six of the tests here carry a copy of a test that lives in the Tauri edition, because both
-      # editions ship the same UI. A stale copy fails nothing - it keeps passing against whatever
-      # it last knew about - so the copies are compared against the originals rather than trusted.
+      # Several of the tests here carry a copy of a test that lives in the Tauri edition, because
+      # both editions ship the same UI. A stale copy fails nothing - it keeps passing against
+      # whatever it last knew about - so the copies are compared against the originals rather than
+      # trusted. tests/browser holds the ones that measure layout in a browser.
       - name: Check out nobs-sql-editor (the shared UI tests)
         uses: actions/checkout@v7
         with:
           repository: monsama/nobs-sql-editor
           path: editor
-          sparse-checkout: tests/ui
+          sparse-checkout: |
+            tests/ui
+            tests/browser
           sparse-checkout-cone-mode: false
 
       - name: Check the shared UI tests are in step
@@ -143,6 +146,12 @@ jobs:
       - name: Run column fit tests
         shell: pwsh
         run: ./tests/ColumnFit.Tests.ps1 ./NOBSSQL.ps1
+
+      # The same gesture as laid out by a browser: the handle on the line, and a fit that does not
+      # grow the column it is measuring. Drives Edge, which this edition needs anyway.
+      - name: Run column fit layout tests
+        shell: pwsh
+        run: ./tests/ColumnFitDom.Tests.ps1 ./NOBSSQL.ps1
 
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
