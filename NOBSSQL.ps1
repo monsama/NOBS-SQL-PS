@@ -5989,14 +5989,14 @@ function scriptShowsResults(stmts){
 }
 // Runs such a script on one connection and shows each result in a tab of its own. These grids
 // are read-only: a result of a script is not tied to one table's rows.
-async function runScriptResults(id,sql,reqId){
- const t=T(id);const st=$('st_'+id);
+async function runScriptResults(id,sql,reqId,seq){
+ const t=T(id);const st=$('st_'+id);const stale=()=>!T(id)||T(id).runSeq!==seq;
  const stmts=splitStmts(sql).filter(s=>!isCommentOnly(s));
  const writes=stmts.some(s=>!/^(select|show|describe|desc|explain|with|table|values|use)\b/i.test(sqlHead(s)));
  if(writes&&roBlock()){st.className='status';st.textContent='Read-only mode: statement blocked.';return;}
  const r=await api('/api/script-results',{sql,db:dbOf(t),requestId:reqId,maxRows:PAGE_BATCH},t.abortCtrl.signal);
- if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
- if(!T(id))return;
+ if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
+ if(stale())return;
  t.table=null;t.pk=null;t.pending=null;t.cursorId=null;t.cursorReqId=null;t.hasMore=false;t.exact=false;
  {const eb=$('edit_'+id);eb.innerHTML='';delete eb.dataset.sig;}
  const selb=$('selbtn_'+id);if(selb)selb.innerHTML='';
@@ -6057,9 +6057,18 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
  if(t.resultSets){t.resultSets=null;renderResultSetTabs(id);}
  const reqId=(crypto.randomUUID?crypto.randomUUID():('r'+Date.now()+Math.random()));
  t.abortCtrl=new AbortController();t.runningReqId=reqId;setRunning(id,true);
+ // Which run this is. A second run can start on this tab while this one is still in flight - the
+ // character-set switch, opening a table from the tree, a refresh after Apply, anything that calls
+ // runSql without going through the Run button. Nothing here used to notice: both runs finished and
+ // the slower one wrote the grid, the table binding, the exact-text flag and the paging cursor, so
+ // the tab could end up showing the result of a query nobody was looking at - and an edit saved
+ // from it was aimed by that stale binding. Every step below asks whether it is still the newest
+ // run before it writes anything, and an older one drops what it fetched rather than applying it.
+ const seq=(t.runSeq=(t.runSeq||0)+1);
+ const stale=()=>!T(id)||t.runSeq!==seq;
  try{
   if(multiResult){
-    await runScriptResults(id,sql,reqId);
+    await runScriptResults(id,sql,reqId,seq);
   } else if(isSelect){
     if(needsScriptStep){
       // Each leading statement was already correctly, individually extracted by splitStmts()
@@ -6078,7 +6087,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       const leadingSql=stmts.slice(0,-1).map(s=>'DELIMITER $$$$$$$$\n'+s+'\n$$$$$$$$\nDELIMITER ;').join('\n');
       const scriptR=await api('/api/script',{sql:leadingSql,db:dbOf(t)},t.abortCtrl.signal);
       if(scriptR.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
-      if(!T(id))return;
+      if(stale())return;
       if(!scriptR.ok){st.className='status err';st.textContent=scriptR.error;$('res_'+id).innerHTML='';log('ERROR: '+scriptR.error);return;}
     }
     const _q=(leadingAreAllUse&&stmts.length>1?sql:lastStmt).trim().replace(/;+\s*$/,'');
@@ -6088,10 +6097,10 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     const tableDb=(leadingAreAllUse&&useTarget(stmts))||runDb;
     const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
     const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
-    if(!T(id))return;
+    if(stale())return;
     const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined},t.abortCtrl.signal);
-    if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
-    if(!T(id))return;
+    if(r.aborted){if(!stale()){st.className='status';st.textContent='Query cancelled.';}return;}
+    if(stale())return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
     t.cols=r.columns;t.binCols=r.binaryCols||[];t.rows=r.rows;t.exact=!!exact;t.pk=null;t.pending=null;t.filters={};t.sortCol=-1;t.sortDir=1;t.selected=new Set();
     // Direct clear (not updateEditBar) since a fresh query's table-ness isn't known yet - gives
@@ -6128,7 +6137,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
         try{const cq=await api('/api/query',{sql:"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA="+lit(t.db)+" AND TABLE_NAME="+lit(t.table)});t.estRows=(cq.ok&&cq.rows.length&&cq.rows[0][0]!=null)?+cq.rows[0][0]:null;}catch(e){t.estRows=null;}
       }
     } else { t.estRows=null; }
-    if(!T(id))return;
+    if(stale())return;
     t.lastElapsedMs=r.elapsedMs;
     if(r.fetchMs!=null&&r.jsonMs!=null&&r.elapsedMs>=300){log(fmtCount(t.rows.length)+' row(s) fetched in '+fmtMs(r.elapsedMs)+' (parse '+fmtMs(r.fetchMs)+', JSON '+fmtMs(r.jsonMs)+').');}
     renderGrid(id);updatePager(id);
@@ -6139,7 +6148,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     const continueOnError=!!($('coe_'+id)&&$('coe_'+id).checked);
     const r=await api('/api/script',{sql,db:dbOf(t),requestId:reqId,continueOnError},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Cancelled.';}return;}
-    if(!T(id))return;
+    if(stale())return;
     if(r.failures){
       // continueOnError response shape: always a full breakdown, whether it ended up fully
       // clean or partially failed - this is the whole point of turning the option on, seeing
@@ -6165,7 +6174,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     else{st.className='status err';st.textContent=r.error;log('SCRIPT ERROR: '+r.error);}
   }
  } finally {
-  if(T(id)){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
+  if(!stale()){t.runningReqId=null;t.abortCtrl=null;setRunning(id,false);}
  }
 }
 
@@ -6210,7 +6219,7 @@ async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReq
  try{
   const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
   if(r.aborted){if(T(id)&&st){st.className='status';st.textContent='Query cancelled.';}return;}
-  if(!T(id))return;
+  if(stale())return;
   if(!r.ok){if(st){st.className='status err';st.textContent=r.error;}log(logErr(r.error));t.cursorId=null;t.cursorReqId=null;t.hasMore=false;return;}
   t.rows=t.rows.concat(r.rows);
   t.hasMore=!!r.hasMore;t.cursorId=r.hasMore?(r.cursorId||t.cursorId):null;t.cursorReqId=t.hasMore?t.cursorReqId:null;
