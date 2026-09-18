@@ -36,7 +36,7 @@
 param([switch]$NoBrowser)
 
 # Shown in the startup banner and the About box. Same numbering as the desktop edition's releases.
-$script:AppVersion = '1.3.11'
+$script:AppVersion = '1.3.12'
 $script:PackedPayload = ''
 # Default MariaDB client-tools download URL, editable in Settings and stored under
 # "mariadb_download_url_template" in the same config file as the tool paths. {version} and
