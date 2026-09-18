@@ -36,7 +36,7 @@
 param([switch]$NoBrowser)
 
 # Shown in the startup banner and the About box. Same numbering as the desktop edition's releases.
-$script:AppVersion = '1.3.9'
+$script:AppVersion = '1.3.10'
 $script:PackedPayload = ''
 # Default MariaDB client-tools download URL, editable in Settings and stored under
 # "mariadb_download_url_template" in the same config file as the tool paths. {version} and
@@ -6187,7 +6187,7 @@ function clip(v,n){const s=String(v);return s.length>n?s.slice(0,n)+'\u2026':s;}
 // that hex form is what makes round-tripping a value with a real embedded NUL byte safe (a raw
 // NUL in the actual SQL text risks truncation when passed as a command-line argument).
 const CTRL_NAMES={0:'NUL',1:'SOH',2:'STX',3:'ETX',4:'EOT',5:'ENQ',6:'ACK',7:'BEL',8:'BS',11:'VT',12:'FF',14:'SO',15:'SI',16:'DLE',17:'DC1',18:'DC2',19:'DC3',20:'DC4',21:'NAK',22:'SYN',23:'ETB',24:'CAN',25:'EM',26:'SUB',27:'ESC',28:'FS',29:'GS',30:'RS',31:'US'};
-function ctrlBadge(b){return '<span class="cellmark" style="background:#4a3a1f;color:#e8c589;border-radius:3px;padding:0 3px;font-size:10px;font-weight:600;margin:0 1px" title="Control character (0x'+b.toString(16).padStart(2,'0').toUpperCase()+') - not printable text">'+CTRL_NAMES[b]+'</span>';}
+function ctrlBadge(b){return '<span class="cellmark" style="background:#4a3a1f;color:#e8c589;border-radius:3px;padding:0 3px;font-size:10px;font-weight:600;margin:0 1px" title="Control character (0x'+b.toString(16).padStart(2,'0').toUpperCase()+') - not printable text">'+CTRL_NAMES[b]+'</span>';}
 // Text holding a control character (a NUL, say) showed it as nothing at all, so 'a<NUL>b' looked
 // like 'ab'. Marked the same way as above.
 const CTRL_RE=/[\x00-\x08\x0B\x0C\x0E-\x1F]/g;
@@ -6236,7 +6236,7 @@ function decodeCtrlCharCell(hexStr,maxChars){
 // renderer and print the marker itself, the one value in a grid shown as its own wire format. It is
 // only said for a column the server declared binary (binCols), because a VARCHAR can perfectly
 // well hold the two characters "0x" and that is exactly what should be shown for it.
-function cellHtml(v,isBit,isBin){if(v===null)return '<span class="cellmark" style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(v==='0x'&&isBin)return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(0 bytes)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return textCellHtml(v,300);}
+function cellHtml(v,isBit,isBin){if(v===null)return '<span class="cellmark" style="color:#999;font-style:italic">(NULL)</span>';if(v==='')return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(empty)</span>';if(v==='0x'&&isBin)return '<span class="cellmark" style="color:#999;font-style:italic;opacity:.6">(0 bytes)</span>';if(typeof v==='string'&&/^0x[0-9A-Fa-f]+$/.test(v))return isBit?esc(hexToBitNumber(v)):decodeCtrlCharCell(v,300);return textCellHtml(v,300);}
 function colgroupHtml(id){const t=T(id);const ed=!!t.pk;const hidden=t.hiddenCols||new Set();let h='<colgroup><col style="width:30px">'+(ed?'<col style="width:34px">':'');t.cols.forEach((c,ci)=>{h+='<col style="width:150px'+(hidden.has(ci)?';display:none':'')+'">';});return h+'<col></colgroup>';}
 // wireColResize(): drag a column edge to resize, double-click to auto-fit (widths saved per table).
 function wireColResize(id){const wrap=$('res_'+id);if(!wrap)return;const table=wrap.querySelector('table.grid');if(!table)return;const cg=table.querySelector('colgroup');if(!cg)return;const t=T(id);const off=(!!t.pk)?2:1;
