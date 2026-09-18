@@ -4492,6 +4492,19 @@ async function tableBinCols(db,table,cols){
   return out;
  }catch(e){return null;}
 }
+// The same answer, read from column types already in hand rather than asked for again: the load
+// path fetches COLUMN_TYPE for every column of a table anyway (for BIT, and for the cell editors),
+// and that says which are binary just as well as DATA_TYPE does - BIN_COL_TYPE stops at the word,
+// so "varbinary(10)" answers like "varbinary". null unless every column of the result is a column
+// of the table: a query can select an expression too, and calling that not binary would be an
+// answer, where null leaves it to the value's own shape, which is all anything knew before.
+function colTypesBinCols(cols,colTypes){
+ if(!cols||!cols.length||!colTypes)return null;
+ const m={};Object.keys(colTypes).forEach(k=>{m[String(k).toLowerCase()]=colTypes[k];});
+ const out=[];
+ for(const c of cols){const k=String(c).toLowerCase();if(!(k in m))return null;out.push(BIN_COL_TYPE.test(String(m[k])));}
+ return out;
+}
 async function gridBinCols(id){
  const t=T(id);if(!t||!t.cols)return null;
  if(t.binCols&&t.binCols.length===t.cols.length)return t.binCols.map(Boolean);
@@ -5996,8 +6009,15 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
       // this is what lets the grid show a BIT column's plain decimal value on first render (see
       // cellHtml's isBit param) instead of only once the user starts editing, which is as far as
       // getColType's own lazy caching (used by editWidgetFor) would otherwise get it for free.
+      // The same answer says which columns are binary. The Editor's backend sends that with the
+      // result (binaryCols in main.rs); this one shells out to mysql.exe and cannot, so without
+      // it the grid had only the value to go on - it drew a BLOB holding no bytes as the two
+      // characters 0x, because a VARCHAR holding those two characters arrives looking identical,
+      // and the guard against a hex paste landing beside a value never fired at all, since the
+      // columns it screens are the ones nothing had flagged. This runs before the first render,
+      // so the grid is drawn once, knowing.
       try{const ct=await api('/api/query',{sql:"SELECT COLUMN_NAME, COLUMN_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA="+lit(t.db)+" AND TABLE_NAME="+lit(t.table)});
-        if(ct.ok){t.colTypes={};ct.rows.forEach(row=>{t.colTypes[row[0]]=row[1];});t.bitCols=t.cols.map(c=>!!(t.colTypes[c]&&/^bit\(/i.test(t.colTypes[c])));}
+        if(ct.ok){t.colTypes={};ct.rows.forEach(row=>{t.colTypes[row[0]]=row[1];});t.bitCols=t.cols.map(c=>!!(t.colTypes[c]&&/^bit\(/i.test(t.colTypes[c])));t.binCols=colTypesBinCols(t.cols,t.colTypes)||[];}
       }catch(e){}
       if(objData && objData.db===t.db && objData.rowCounts && (t.table in objData.rowCounts) && objData.rowCounts[t.table]!=null){
         t.estRows=+objData.rowCounts[t.table];
@@ -7061,10 +7081,12 @@ async function applyChanges(id){if(roBlock())return;const t=T(id);const S=[];con
  // stored 56 - the byte value of the character '8' - silently, with no error, because one byte
  // fits in eight bits. Refuse the batch instead of corrupting the column.
  const isHex=v=>/^0x[0-9A-Fa-f]*$/.test(String(v));
- // Two ways to know a column is binary. binaryCols comes from the server, which reads the real
- // column type - available in the Tauri build. Failing that, fall back to the value already in
- // the cell: both builds render a binary/BIT value as 0x..., so replacing one with something
- // else is the same mistake regardless of who reported the type.
+ // Two ways to know a column is binary. The declared type, which the Editor's backend reads off
+ // the result set and this one reads from information_schema when the table loads (binaryCols in
+ // main.rs, colTypesBinCols here). Failing that - a grid that is not bound to a table, or one
+ // whose columns are not all columns of it - fall back to the value already in the cell: both
+ // editions render a binary or BIT value as 0x..., so replacing one with something else is the
+ // same mistake regardless of who reported the type.
  // With the column types known they decide; the value's shape is only the fallback.
  const binAt=(ci,ri)=>bc?bc[ci]:((t.binCols&&t.binCols[ci])||(ri!=null&&t.rows[ri]&&t.rows[ri][ci]!=null&&isHex(t.rows[ri][ci])));
  const badBin=[];

@@ -53,6 +53,13 @@ jobs:
         shell: pwsh
         run: ./tests/ViewIndices.Tests.ps1 ./NOBSSQL.ps1
 
+      # Which columns of a loaded table are binary. Nothing tells this edition with the result, so
+      # it reads the declared types when the table loads - and what it must not do is answer for a
+      # column that is not one of the table's.
+      - name: Run binary column tests
+        shell: pwsh
+        run: ./tests/GridBinCols.Tests.ps1 ./NOBSSQL.ps1
+
       # The MariaDB and MySQL clients name their SSL options mutually exclusively, so choosing the
       # wrong set does not weaken the connection, it stops it outright. This needs no database: it
       # asks the client binary, which parses the options file before it ever opens a socket.
