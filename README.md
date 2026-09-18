@@ -17,6 +17,18 @@ software.
 powershell -ExecutionPolicy Bypass -File .\NOBSSQL.ps1
 ```
 
+This script is not code-signed, and running it means switching the execution policy off, so it is
+worth knowing you have the file that was published. Every release names its SHA-256, in the notes
+and in `SHA256SUMS.txt` beside the download:
+
+```powershell
+Get-FileHash .\NOBSSQL.ps1 -Algorithm SHA256
+```
+
+[CODE_SIGNING.md](https://github.com/monsama/nobs-sql-editor/blob/main/CODE_SIGNING.md) says what
+that does and does not prove: it tells you the file reached you as it was built, and nothing about
+who wrote it.
+
 If Chrome or Edge is installed, the interface opens in a window of its own, using a
 separate browser profile with extensions switched off - so nothing installed in your
 everyday browser reaches these fields. That matters mostly for password managers, which

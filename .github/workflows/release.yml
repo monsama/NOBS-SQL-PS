@@ -1,0 +1,73 @@
+name: release
+
+# Drafts the release for a version tag: the script itself, its SHA-256 in a file and in the notes,
+# and generated changelog. Review the notes, then publish.
+#
+# This exists because the download here is a PowerShell script that people are told to run with
+# -ExecutionPolicy Bypass, and until now it was the one download of this project that published
+# nothing to check it against - the desktop edition's installers have carried a checksum since
+# 1.3.5, because SignPath declined to sign them. Doing it by hand at release time is how the
+# desktop edition's notes ended up promising checksums they did not carry for four releases
+# running, so it is done here by the thing that makes the release.
+on:
+  push:
+    tags: ["v*"]
+  # So a draft can be rebuilt without moving a tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to draft a release for'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    # Nothing here needs Windows: it hashes one file and writes two.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # The version in the script has to be the version in the tag, or the app's own update notice
+      # compares against something that was never released. Cheap to check, and only checkable here.
+      - name: The tag and the script agree on the version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          said=$(grep -oE "AppVersion = '[^']+'" NOBSSQL.ps1 | head -1 | grep -oE "[0-9]+(\.[0-9]+)*")
+          echo "tag ${tag}, script ${said}"
+          [ "v${said}" = "$tag" ] || { echo "the tag says ${tag} and the script says ${said}"; exit 1; }
+
+      - name: Checksum
+        run: |
+          sha256sum NOBSSQL.ps1 | tee SHA256SUMS.txt
+          {
+            echo
+            echo '### Verify your download'
+            echo
+            echo 'This script is not code-signed. Compare what you downloaded against the SHA-256 below:'
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+            echo
+            echo 'PowerShell: ``Get-FileHash .\NOBSSQL.ps1 -Algorithm SHA256``'
+            echo
+            echo 'See [CODE_SIGNING.md](https://github.com/monsama/nobs-sql-editor/blob/main/CODE_SIGNING.md) for what this does and does not prove.'
+          } > release-notes-append.md
+
+      # A draft, like the desktop edition: the notes are written by hand, the checksum block is not.
+      - name: Draft the release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            NOBSSQL.ps1
+            SHA256SUMS.txt
+          draft: true
+          generate_release_notes: true
+          append_body: true
+          body_path: release-notes-append.md
+          fail_on_unmatched_files: true
