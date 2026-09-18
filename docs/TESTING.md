@@ -62,7 +62,7 @@ on whichever PowerShell runs them; run them under Windows PowerShell 5.1 as well
 
 `SslLines` and `PluginDir` are about the client binary rather than the server, so they need no
 database: `SslLines` asks the real client to parse the options it would be given (`--version` is
-enough — the options file is read before a socket is opened), and `PluginDir` works on a throwaway
+enough - the options file is read before a socket is opened), and `PluginDir` works on a throwaway
 directory tree.
 
 ## The live tests
@@ -73,7 +73,7 @@ pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
 ```
 
 It starts the real server on its usual port, drives the real HTTP API, and stops it again. Load
-the fixture first — it is shared with the sibling
+the fixture first - it is shared with the sibling
 [nobs-sql-editor](https://github.com/monsama/nobs-sql-editor) repo, at
 `tests/fixtures/seed.sql` there:
 
@@ -91,9 +91,9 @@ these was found that way rather than by reading:
 
 - MySQL authenticates with `caching_sha2_password` by default. That is a *client-side* plugin, and
   the app could not connect to a stock MySQL 8 server at all until the downloaded tools started
-  shipping it — see `PluginDir`.
+  shipping it - see `PluginDir`.
 - MySQL and MariaDB name their SSL client options mutually exclusively, so the wrong dialect is not
-  a weaker connection but no connection — see `SslLines`.
+  a weaker connection but no connection - see `SslLines`.
 - MySQL cannot reference the same `TEMPORARY` table twice in one statement, which is why the shared
   fixture builds `bulk_rows` from a plain table.
 - `SLEEP()` interrupted by `KILL QUERY` *returns 1* on MySQL and the statement succeeds; MariaDB
@@ -137,7 +137,7 @@ because the certificate a MySQL server generates for itself never names a real h
 
 Set `NOBS_TEST_SERVER_CA` to the test server's own CA to run the one check that matters most:
 `verify-ca` connecting with it. Without that, the remaining CA checks only show that a *wrong* CA
-is refused — and a CA being silently ignored would be refused in exactly the same way against a
+is refused - and a CA being silently ignored would be refused in exactly the same way against a
 self-signed server. The script says when it skipped this. The Tauri repo's `docs/TESTING.md`
 shows how to take the CA off the wire with `openssl`, no access to the server's files needed.
 
@@ -176,17 +176,17 @@ node ..nobs-sql-editor	estsguiun.mjs --app ps --target .NOBSSQL.ps1
 Every check is a regression test for a bug that actually shipped:
 
 - **The keepalive ping requires the token.** `LastPing` drives the six-hour idle shutdown, so
-  while `/api/ping` was unauthenticated any web page the user had open could hold the server —
-  and the live database connections it owns — open indefinitely, with a periodic cross-origin
+  while `/api/ping` was unauthenticated any web page the user had open could hold the server -
+  and the live database connections it owns - open indefinitely, with a periodic cross-origin
   POST to this fixed, predictable port.
 - **Read-only mode is enforced server-side**, on the SQL endpoints *and* on `/api/rowop` and the
   staged-apply path, not merely by a greyed-out button.
 - **A staged batch is all-or-nothing.** A partial apply is the worst outcome this app can produce
   and the whole reason the pending-changes model exists. Five ways of failing mid-batch are
-  checked, plus the control that a *valid* batch still commits — without which a transaction that
+  checked, plus the control that a *valid* batch still commits - without which a transaction that
   always rolled back would pass every other case.
 - **A cancelled export says `CANCELLED`**, never a `FAILED` line with no reason given.
-- **Compare reports rows that exist only on the target**, including when nothing is missing —
+- **Compare reports rows that exist only on the target**, including when nothing is missing -
   the case that otherwise reads as "no row differences".
 - **Compare copies every value exactly**, through all three write paths (insert-all, apply,
   apply-diff): the text `'NULL'` (which `--batch` output turned into NULL), text that looks like
@@ -210,7 +210,7 @@ tests that existed at the time: the stdout reader destroying every byte that was
 hex pasted into the value editor's Text tab being stored as the characters `0x24…` rather than the
 bytes they denote, and an emptied cell storing the two characters `0x` instead of nothing. None
 were found by reasoning about the code. All three were found by putting a value in, reading it
-back, and comparing bytes — so that comparison is a test now.
+back, and comparing bytes - so that comparison is a test now.
 
 It builds each statement with the **real** editor functions lifted out of `NOBSSQL.ps1`
 (`textToHex`, `normalizeHexInput`, `hexCellValueForSave`, `lit`), sends it through the app's own
@@ -228,24 +228,24 @@ arrive, so on its own it cannot see a client converting from the wrong character
 Two of those cases guard specific fixes and are worth not weakening:
 
 - **64 KB** guards `New-SqlArg`. SQL used to go to `mysql.exe` as a single `-e` argument, and
-  Windows caps a command line at about 32767 characters — so a value over roughly 8 KB became a
+  Windows caps a command line at about 32767 characters - so a value over roughly 8 KB became a
   hex literal too long to pass, and `Process.Start` threw. What the user saw was a raw .NET
   exception naming `mysql.exe`, with nothing in it about SQL or size. Oversized statements now go
   to a temp file that mysql is told to `source`. Raise `New-SqlArg`'s threshold so it never
   triggers and this case fails.
 - **empty** guards `hexCellValueForSave`. Both tabs produce a digit-less `0x` for an empty box,
-  which is not valid SQL and which `lit()` would quote — storing the characters `0` and `x`.
+  which is not valid SQL and which `lit()` would quote - storing the characters `0` and `x`.
 
 The export-cancel case needs the cancel to land while the routines/events dump is in flight. Since
 a cancel during the table loop skips that step entirely, the test excludes every table so
-routines/events is the only work left, then sweeps short delays — and **asserts that it actually
+routines/events is the only work left, then sweeps short delays - and **asserts that it actually
 reached the step**, so it cannot pass by never getting there. An earlier version of the test, using
 fixed delays and no such assertion, passed against the unfixed code.
 
 ## Checking real data for corruption
 
 `tools/Check-BlobIntegrity.ps1` audits a live server for the corruption signatures this app has
-actually produced. It is read-only — it runs SELECTs and writes nothing.
+actually produced. It is read-only - it runs SELECTs and writes nothing.
 
 ```powershell
 pwsh -NoProfile -File tools/Check-BlobIntegrity.ps1 -Dsn '127.0.0.1:3306:root:yourpassword'
@@ -256,14 +256,14 @@ Exit code 0 means nothing was found, 1 means it has findings to look at, 2 means
 
 | signature | what it means |
 |---|---|
-| `hex-text` | the value begins with the two **characters** `0` and `x` — a binary cell is displayed as `0x..`, so a copied one pastes back as hex, and stored as text it becomes the characters rather than the bytes |
-| `embedded-hex` | a `0x` run of 16+ hex digits sits inside other content — a paste that landed alongside the cell's existing value instead of replacing it |
+| `hex-text` | the value begins with the two **characters** `0` and `x` - a binary cell is displayed as `0x..`, so a copied one pastes back as hex, and stored as text it becomes the characters rather than the bytes |
+| `embedded-hex` | a `0x` run of 16+ hex digits sits inside other content - a paste that landed alongside the cell's existing value instead of replacing it |
 | `bare-hex` | the whole value is hex digits with no prefix, and long enough not to be coincidence |
-| `replacement` | the value contains U+FFFD, which nothing stores on purpose — some layer decoded and re-encoded the data |
+| `replacement` | the value contains U+FFFD, which nothing stores on purpose - some layer decoded and re-encoded the data |
 | `nul-in-text` | a NUL byte inside a text column, occasionally the tail of a binary value written to the wrong place |
 
 Findings are candidates, not verdicts. A column that legitimately holds hex text will be reported
-and should be — the row count and sample are there to tell the difference. Two worked examples
+and should be - the row count and sample are there to tell the difference. Two worked examples
 from this codebase:
 
 - A `mediumblob` holding `0x2437…` followed by a crypt hash was a real loss, and recovered by

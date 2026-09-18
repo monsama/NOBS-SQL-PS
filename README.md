@@ -1,4 +1,4 @@
-# NOBS SQL Editor — PowerShell edition
+# NOBS SQL Editor - PowerShell edition
 
 A MySQL / MariaDB client that runs as a **single PowerShell script**. It starts
 a tiny local HTTP server (127.0.0.1 only, no admin rights), shells out to the
@@ -76,7 +76,7 @@ verifying modes check the server against.
 | `verify-ca` | yes | yes | no ¹ |
 | `verify` | yes | yes | yes |
 
-¹ With the MySQL client. The MariaDB client — the one this app downloads — cannot check a CA
+¹ With the MySQL client. The MariaDB client - the one this app downloads - cannot check a CA
 without also checking the host name, except on connections to the local machine, so with it
 `verify-ca` is carried out as full `verify`. It never checks less than you asked for.
 
@@ -86,12 +86,12 @@ for the self-signed certificate MariaDB generates for itself, remote connections
 switched off for accounts without a password.)
 
 **Against a MySQL server using its self-signed, auto-generated certificate**, that does not
-apply: you need the server's CA, and — because the certificate never names a real host — the
+apply: you need the server's CA, and - because the certificate never names a real host - the
 MySQL client with `verify-ca` (point Settings at a MySQL `mysql.exe`). The MariaDB client can only
 do this for a server on the local machine.
 
 Where to get the CA: for MySQL it is `ca.pem` in the server's data directory. MariaDB's generated
-certificate has no separate CA — use the certificate itself. Either can be read off the
+certificate has no separate CA - use the certificate itself. Either can be read off the
 connection, which needs no access to the server's files:
 
 ```sh
@@ -107,7 +107,7 @@ Export and Import use the official MySQL/MariaDB command-line tools, which are
 Settings, or let it download the official MariaDB client tools from
 mariadb.org. The archive is checked against the SHA-256 that MariaDB's own
 release API publishes for it before anything is unpacked, and a mismatch
-installs nothing — the checksum comes from the API, not from the mirror the
+installs nothing - the checksum comes from the API, not from the mirror the
 bytes came from, so a redirected or altered download fails the check. If the
 API lists no checksum, nothing is installed at all.
 
@@ -169,4 +169,4 @@ or run it by hand, under **Settings → Updates**.
 Free software under the **GNU General Public License version 2** (or, at your
 option, any later version). See [LICENSE](LICENSE).
 
-Copyright (C) 2026 Viktor Ljuca — https://monsama.ch
+Copyright (C) 2026 Viktor Ljuca - https://monsama.ch
