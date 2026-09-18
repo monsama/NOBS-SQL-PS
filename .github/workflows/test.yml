@@ -126,11 +126,21 @@ jobs:
           sparse-checkout: |
             tests/ui
             tests/browser
+            src-tauri/src/main.rs
           sparse-checkout-cone-mode: false
 
       - name: Check the shared UI tests are in step
         shell: pwsh
         run: ./tests/SharedUiTests.Tests.ps1 ./editor
+
+      # What this app will ask a server to send text in - and that the desktop edition offers
+      # exactly the same list, since a charset one accepts and the other ignores would look
+      # like the app quietly disregarding the choice. Needs the editor checkout above.
+      - name: Run browse charset tests
+        shell: pwsh
+        env:
+          NOBS_EDITOR_MAIN_RS: editor/src-tauri/src/main.rs
+        run: ./tests/BrowseCharset.Tests.ps1 ./NOBSSQL.ps1
 
       # Which table a result grid saves to, and control characters shown in text.
       - name: Run table binding tests

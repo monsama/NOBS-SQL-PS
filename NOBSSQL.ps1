@@ -277,6 +277,27 @@ $script:ClientAuthPlugins = @(
 # it does nothing for an actual embedded newline character, which this strips outright since none
 # of these fields have any legitimate use for one.
 function Get-CnfSafe { param([string]$s) if(-not $s){ return $s }; return ($s -replace "[\r\n]", '') }
+
+# Browsing in another character set, for when a value's encoding is in doubt. The server transcodes
+# text into the session's charset before sending it, so reading the same row in another one tells a
+# storage problem from a display one: UTF-8 bytes stored in a latin1 column read as mojibake in
+# utf8mb4 and as themselves in latin1. "binary" asks for no transcoding and shows the bytes.
+#
+# A list, not a pattern. The value ends up in a client options file and on a command line, and the
+# same list is in the desktop edition's main.rs (BROWSE_CHARSETS), which is what its server is
+# asked for - so neither edition can widen what the other accepts.
+$script:BrowseCharsets = @(
+    'binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4','ucs2',
+    'cp1250','cp1251','cp1256','cp1257','cp850','cp852','cp866','cp932','koi8r','koi8u',
+    'greek','hebrew','tis620','big5','gbk','gb2312','sjis','ujis','euckr','macroman')
+function Get-BrowseCharset {
+    param($conn)
+    if (-not $conn) { return $null }
+    $want = ([string]$conn.charset).Trim().ToLowerInvariant()
+    if (-not $want -or $want -eq 'default') { return $null }
+    if ($script:BrowseCharsets -contains $want) { return $want }
+    return $null
+}
 # -Tool: the binary the file is for, when it is not the default mysql.exe. SSL option names and
 # the plugin directory both depend on which client reads the file.
 function New-Cnf {
@@ -289,14 +310,27 @@ function New-Cnf {
     # page (cp850 here), so text written through it was converted as if it were cp850: an accented
     # letter was refused by a latin1 column, and stored as other characters elsewhere. MariaDB's
     # client happens to default to utf8mb4. A --default-character-set on the command line still takes precedence.
-    [void]$sb.AppendLine('default-character-set=utf8mb4')
+    # ...unless this connection is browsing in another character set, which is the whole point of
+    # that mode: the server then sends text as it is stored rather than transcoded into utf8mb4.
+    $browseCs = Get-BrowseCharset $conn
+    [void]$sb.AppendLine("default-character-set=$(if ($browseCs) { $browseCs } else { 'utf8mb4' })")
     $maria = if ($Tool) { Test-ClientIsMariaDB $Tool } else { $null }
     foreach ($l in (Get-SslLines $conn.ssl $maria $conn.sslCa)) { [void]$sb.AppendLine($l) }
     $pluginDir = Get-PluginDir $Tool
     if ($pluginDir) { [void]$sb.AppendLine("plugin-dir=$((Get-CnfSafe $pluginDir) -replace '\\','\\')") }
     # Only mysql.exe reads [mysql]; mysqldump shares this file and would reject the option. It
     # writes TIMESTAMP values in UTC on its own (--tz-utc). Set for Compare's connections.
-    if ($conn.utc) { [void]$sb.AppendLine('[mysql]'); [void]$sb.AppendLine("init-command=`"SET time_zone='+00:00'`"") }
+    # A browsing connection is refused by the SERVER, not only by the gate in front of these
+    # endpoints - a write from it would be interpreted in that session's charset and stored as
+    # different bytes than the ones on screen. Only one init-command is read, so the time zone
+    # (Compare's connections) and this share the statement when both are wanted.
+    $initParts = @()
+    if ($conn.utc) { $initParts += "SET time_zone='+00:00'" }
+    if ($browseCs) { $initParts += 'SET SESSION TRANSACTION READ ONLY' }
+    if ($initParts.Count) {
+        [void]$sb.AppendLine('[mysql]')
+        [void]$sb.AppendLine("init-command=`"$($initParts -join '; ')`"")
+    }
     # Create the file empty first, then lock its ACL down to the current user only,
     # BEFORE writing the password content into it.
     [IO.File]::WriteAllText($tmp, '', (New-Object System.Text.UTF8Encoding($false)))
@@ -641,12 +675,16 @@ function J-RowsFast {
 # Output options every result-reading mysql.exe call uses. See NobsXmlRows for why XML: it is the
 # only format in which NULL and the text 'NULL' differ. --binary-as-hex keeps binary and BIT values
 # exact (XML turns a NUL byte into a space) and renders them as 0x.., as the Tauri build does.
-function Get-ResultArgs { param([string]$Client)
+function Get-ResultArgs { param([string]$Client, $Conn)
     if (-not $Client) { $Client = [string]$script:MysqlPath }
     if (-not (Test-ClientHasBinaryAsHex $Client)) {
         throw "This mysql.exe ($Client) does not support --binary-as-hex, which this app needs to read binary values without losing bytes. Open Settings and download the client tools, or select a newer MySQL (8.0.19 or later) or MariaDB client."
     }
-    return @('--xml','--binary-as-hex','--default-character-set=utf8mb4')
+    # On the command line, and so ahead of the options file - including the browse charset, which
+    # would otherwise be overridden here by the default it is meant to replace.
+    $cs = Get-BrowseCharset $Conn
+    if (-not $cs) { $cs = 'utf8mb4' }
+    return @('--xml','--binary-as-hex',"--default-character-set=$cs")
 }
 # Cached against the path it probed, like Test-ClientIsMariaDB. MariaDB's client reports an unknown
 # option and still prints its version with exit code 0, so the text is what tells.
@@ -721,7 +759,7 @@ function Run-Query2 {
     param($conn,$sql,$db,$RequestId,[switch]$WithColumns)
     Initialize-DumpDb
     $my = Get-Mysql $conn
-    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    try { $ra = Get-ResultArgs $my $conn } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf=New-Cnf $conn -Tool $my
     try {
         $a=@("--defaults-extra-file=$cnf") + $ra
@@ -849,7 +887,7 @@ function Open-QueryCursor {
     if ($PageSize -lt 1) { $PageSize = 1000 }
     Initialize-DumpDb
     $my = Get-Mysql $conn
-    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    try { $ra = Get-ResultArgs $my $conn } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf = New-Cnf $conn -Tool $my
     $a=@("--defaults-extra-file=$cnf","--quick") + $ra
     if ($db) { $a += "--database=$db" }
@@ -922,7 +960,7 @@ function Open-QueryCursor {
 function Run-Query2Bulk { param($conn,$sql,$db,$RequestId)
     Initialize-DumpDb
     $my = Get-Mysql $conn
-    try { $ra = Get-ResultArgs $my } catch { return @{ ok=$false; err=$_.Exception.Message } }
+    try { $ra = Get-ResultArgs $my $conn } catch { return @{ ok=$false; err=$_.Exception.Message } }
     $cnf = New-Cnf $conn -Tool $my
     $sa = New-SqlArg $sql
     $p = $null
@@ -1312,7 +1350,7 @@ function Api-Script { param($conn,$data)
 function Api-ScriptResults { param($conn,$data)
     Initialize-DumpDb
     $my = Get-Mysql $conn
-    try { $ra = Get-ResultArgs $my } catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
+    try { $ra = Get-ResultArgs $my $conn } catch { return '{"ok":false,"error":'+(J-Str $_.Exception.Message)+'}' }
     $maxRows = [int]$data.maxRows; if ($maxRows -lt 1) { $maxRows = 1000 }
     $scriptSql = [string]$data.sql
     # The database as an option rather than a USE line, so error line numbers match the script.
@@ -3933,7 +3971,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
   <span id="updNote" style="display:none;position:fixed;left:16px;bottom:16px;z-index:9400;background:var(--panel2);border:1px solid var(--bd);border-left:4px solid var(--accent);border-radius:6px;padding:8px 12px;font-size:13px;white-space:nowrap;box-shadow:0 4px 14px rgba(0,0,0,.3)"><a href="#" id="updLink" style="color:var(--accent)" onclick="openUpdatePage();return false"></a> <a href="#" title="Hide until the next version" style="color:var(--muted);text-decoration:none" onclick="dismissUpdate();return false">&times;</a></span>
 	<select id="connlist" onchange="pickConnGuarded();connTitle()" title="Saved connections" style="width:210px;max-width:210px"><option value="" disabled hidden selected>Connections</option></select>
   <button class="sm" title="Start a new connection (clear the form)" onclick="newConn()">New</button><button class="sm" title="Save these connection details" onclick="saveConn()">Save</button><button id="mgrBtn" class="sm" title="Edit, clone, delete or set primary for the selected connection" onclick="connMenu(event)">Manage &#9662;</button>
-  <span id="connStatusGroup" style="display:inline-flex;gap:6px;align-items:center;min-width:0;margin-left:4px"><span id="pwChip" title="This connection has a saved password" style="display:none;font-size:14px;cursor:default;flex:none">&#128274;</span><span id="connStatus" class="chip bad">Not connected</span><span id="envChip" class="chip bad" style="display:none"></span><span id="schemaBadge" class="chip ok" style="display:none"></span></span>
+  <span id="connStatusGroup" style="display:inline-flex;gap:6px;align-items:center;min-width:0;margin-left:4px"><span id="pwChip" title="This connection has a saved password" style="display:none;font-size:14px;cursor:default;flex:none">&#128274;</span><span id="connStatus" class="chip bad">Not connected</span><span id="envChip" class="chip bad" style="display:none"></span><span id="schemaBadge" class="chip ok" style="display:none"></span><select id="browseCs" class="needsconn" onchange="setBrowseCharset(this.value)" style="max-width:150px;font-size:12px;padding:0 4px" title="Read text in another character set. A value that looks mis-encoded reads correctly in the character set its bytes really are, which tells a storage problem from a display one; binary shows the bytes themselves. The connection is read-only while this is not the server default."></select></span>
   <span style="flex:1"></span><span id="topActions" class="needsconn" style="display:inline-flex;gap:9px;align-items:center"><button class="primary" onclick="newTab()" title="Open a new query tab">+ New Query</button><span class="tbsep"></span><button class="sm" title="View users and privileges" onclick="openUsers()">Users</button><button class="sm" title="View and kill server processes/queries (SHOW FULL PROCESSLIST)" onclick="openProcessList()">Processes</button><button class="sm" title="Browse and reopen previous queries" onclick="openHistory()">History</button><button class="sm" title="Save and browse reusable queries" onclick="openLibrary()">Library</button><span class="tbsep"></span><button class="sm" title="Export databases with mysqldump" onclick="openExport()">Export</button><button class="sm" title="Import SQL files or a whole folder" onclick="openImport()">Import</button><button class="sm" title="Compare table structure between two databases" onclick="openCompare()">Compare DB</button></span><button class="sm" title="Configure or download the mysql / mysqldump client tools" onclick="openSettings()">Settings</button><span class="tbsep" style="margin:2px 10px"></span><a href="https://buymeacoffee.com/monsama" target="_blank" rel="noopener" title="Buy me a coffee, if NOBS SQL Editor saved you some time" style="cursor:pointer;line-height:1;text-decoration:none"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy me a coffee" style="height:26px;vertical-align:middle;opacity:.85;border-radius:4px" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=.85"></a><button class="sm warn" title="Stop the local server and exit (the clean way to close the app)" onclick="quit()" style="margin-left:10px">Quit</button>
  </div>
  <div class="barrow" id="connFormRow">
@@ -4231,6 +4269,50 @@ window.readOnly=false;window.curEnv='';
 // password lock icon already does. Only applyEnv() (below) touches the real enforcement state.
 function renderEnvChip(env,ro,acc){const el=$('envChip');if(!el)return;if(env||ro){el.style.display='inline-flex';el.textContent=(env||'')+(ro?(env?' - ':'')+'READ-ONLY':'');el.title=el.textContent;if(acc){el.className='chip';el.style.background=acc;el.style.color='#fff';el.style.borderColor='transparent';}else{el.className='chip '+(ro?'bad':'ok');el.style.background='';el.style.color='';el.style.borderColor='';}}else{el.style.display='none';}}
 function applyEnv(name){const m=connMeta()[name]||{};window.readOnly=!!m.readonly;window.curEnv=m.env||'';const acc=window.curAccent||accMap()[name]||'';renderEnvChip(window.curEnv,window.readOnly,acc);document.body.classList.toggle('ro',window.readOnly);}
+// ---- reading in another character set ----
+// A value that reads "cafÃ©" is either stored wrong or being read wrong, and nothing in a grid can
+// tell you which. The server transcodes every text column into the session's character set before
+// sending it, so asking for a different one answers the question: UTF-8 bytes sitting in a latin1
+// column read correctly in latin1 and as mojibake in utf8mb4, while data that is genuinely damaged
+// reads badly in both. "binary" asks for no transcoding at all and shows the bytes themselves.
+//
+// The list mirrors BROWSE_CHARSETS in main.rs, which is what the server is actually asked for -
+// anything not in that list is ignored there, so this list cannot widen what is accepted.
+const BROWSE_CHARSETS=['binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4','ucs2',
+ 'cp1250','cp1251','cp1256','cp1257','cp850','cp852','cp866','cp932','koi8r','koi8u',
+ 'greek','hebrew','tis620','big5','gbk','gb2312','sjis','ujis','euckr','macroman'];
+window.browseCharset='';
+window._roBeforeBrowse=false;
+// Writing is off while this is on, and it is not a matter of taste: a value typed into a grid would
+// be interpreted in the session's charset, so the bytes stored would differ from the bytes shown.
+// The backend refuses such a connection's writes on its own (ro_mode, and the server is told
+// SET SESSION TRANSACTION READ ONLY); this is what makes the app stop offering.
+function setBrowseCharset(cs){
+ cs=(cs||'').trim();
+ if(cs===window.browseCharset)return;
+ if(!window.browseCharset)window._roBeforeBrowse=!!window.readOnly;
+ window.browseCharset=cs;
+ window.readOnly=cs?true:window._roBeforeBrowse;
+ document.body.classList.toggle('ro',!!window.readOnly);
+ renderEnvChip(window.curEnv,window.readOnly,window.curAccent||'');
+ renderBrowseCs();
+ if(cs)log('Reading text as '+cs+'. This is a diagnostic: the connection is read-only until it is set back to the server default.');
+ else log('Reading text as the server sends it again.');
+ const t=T(activeTab);
+ // A table tab reruns the same statement; a tab that has not run anything has nothing to show
+ // differently, and will use the new charset the next time it runs.
+ if(t&&t.curRun)runSql(t.id,t.curRun);
+}
+function renderBrowseCs(){
+ const el=$('browseCs');if(!el)return;
+ if(!el.options.length){
+  el.appendChild(new Option('charset: server','',true,true));
+  BROWSE_CHARSETS.forEach(c=>el.appendChild(new Option('charset: '+c,c)));
+ }
+ el.value=window.browseCharset||'';
+ el.style.borderColor=window.browseCharset?'var(--accent)':'';
+ el.style.fontWeight=window.browseCharset?'600':'';
+}
 function roBlock(){if(window.readOnly){toast('This connection is marked READ-ONLY (safe mode). Writes are disabled.\nUncheck "Read-only" in the saved connection to allow changes.',true);return true;}return false;}
 function accMap(){const m=window._connMeta||{};const o={};for(const k in m){if(m[k]&&m[k].accent)o[k]=m[k].accent;}return o;}
 function accSet(n,c){window._connMeta=window._connMeta||{};const cur=window._connMeta[n]||{};window._connMeta[n]={accent:c||'',env:cur.env||'',readonly:!!cur.readonly};}
@@ -4290,6 +4372,9 @@ async function apiCall(path,p,signal){p=p||{};p.token=TOKEN;
  if(path==='/api/connect'){p.conn=getConn();p.ro=!!window.readOnly;}
  else if(path==='/api/conn-save'&&p.conn){p.ro=false;}
  else{p.conn=window._activeConn||getConn();p.ro=(window._activeConn?!!window._activeReadOnly:!!window.readOnly);}
+ // Browsing in another character set rides along on the connection, and makes the request
+ // read-only whatever the profile says. The backend decides the same thing for itself.
+ if(window.browseCharset&&path!=='/api/conn-save'&&p.conn){p.conn=Object.assign({},p.conn,{charset:window.browseCharset});p.ro=true;}
  busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});return await r.json();}catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
 // Floating (draggable, non-blocking) modals remember where they were left, keyed by id, and
 // get bumped to the top of the floating stack whenever they're (re)opened or clicked - a plain
@@ -9000,7 +9085,7 @@ foreach ($fn in $CustomFunctionNames) {
     $fsb = (Get-Item "function:$fn").ScriptBlock
     $iss.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($fn, $fsb)))
 }
-foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload') {
+foreach ($vn in 'MysqlPath','MysqldumpPath','ServerIsMariaDB','ClientIsMariaDB','DumpIsMariaDB','DumpDbSource','CfgFile','ToolsDir','ConnFile','LibFile','ReservedSet','RunningQueries','RunningJobs','OpenCursors','CancelledCompares','NoHeadersNote','ServerFlavor','DefaultMariaDbUrlTemplate','ClientAuthPlugins','AppVersion','ReleasesRepo','RawEnc','StrictUtf8','JStrSpecialChars','PackedPayload','BrowseCharsets') {
     $vv = Get-Variable -Scope Script -Name $vn -ValueOnly -ErrorAction SilentlyContinue
     $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry($vn,$vv,'')))
 }
@@ -9047,7 +9132,10 @@ $RequestHandler = {
             if (-not $data -or $data.token -ne $Token) { Send-Json $client '{"ok":false,"error":"bad token"}'; return }
             $conn=$data.conn
             $roBlocked = $false
-            if ([bool]$data.ro) {
+            # Read-only either because the connection is marked so, or because it is browsing in
+            # another character set - a diagnostic, where what is shown is not what would be
+            # written. The UI disables writing in that mode too; this does not depend on it.
+            if ([bool]$data.ro -or (Get-BrowseCharset $conn)) {
                 switch -Regex ($req.path) {
                     '/api/(rowop|import|importcsv|kill-process)$' { $roBlocked = $true }
                     '/api/(exec|script|script-results|query)$' { if (-not (Test-SqlReadOnly ([string]$data.sql))) { $roBlocked = $true } }
