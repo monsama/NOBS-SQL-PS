@@ -28,7 +28,7 @@ $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB','Get-CnfSafe','Friendly-TlsErr','Test-MySqlHexIdentified')},$true) |
+                        $n.Name -in @('Get-SslLines','Test-ClientIsMariaDB','Get-CnfSafe','Friendly-TlsErr','Test-MySqlHexIdentified','Test-ToolIsMariaDB')},$true) |
   ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $fail = 0

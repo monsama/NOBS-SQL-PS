@@ -29,7 +29,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $
 if ($e -and $e.Count) { $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
     $n.Name -in @('Api-DownloadTools', 'Api-DownloadMysqlTools', 'Get-MysqlDownloadInfo', 'Get-MysqlZipMember',
-                  'Get-PluginDir', 'J-Str', 'Load-Cfg', 'Save-Cfg', 'Use-FileLock') }, $true) |
+                  'Get-PluginDir', 'J-Str', 'Load-Cfg', 'Save-Cfg', 'Use-FileLock', 'Get-MysqlDownloadDefaults') }, $true) |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 # The mirror template and the list of authentication plugins are taken from the script itself, so
 # this test cannot pass against a stale copy of either.

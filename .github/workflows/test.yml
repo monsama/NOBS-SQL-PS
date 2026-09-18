@@ -35,6 +35,13 @@ jobs:
         shell: pwsh
         run: ./tests/Get-CnfSafe.Tests.ps1 ./NOBSSQL.ps1
 
+      # Several tests here run real code by lifting named functions out of the script. When one of
+      # those grows a call to another, the test keeps passing and prints an error instead - so what
+      # they lift is checked against what they call.
+      - name: Check the lifted functions have what they call
+        shell: pwsh
+        run: ./tests/LiftedFunctions.Tests.ps1 ./NOBSSQL.ps1
+
       # viewIndices decides the order every result grid is displayed in. It is JavaScript embedded
       # in NOBSSQL.ps1, so the test extracts it and runs it under node rather than the PowerShell
       # AST the other two use. windows-latest already ships node, so there is nothing to install.

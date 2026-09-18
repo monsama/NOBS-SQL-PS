@@ -26,7 +26,7 @@ foreach ($name in '$script:DumpDbSource','$script:RawEnc','$script:StrictUtf8') 
     Invoke-Expression $a.Extent.Text
 }
 $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-                        $n.Name -in @('Initialize-DumpDb','Test-SqlSafeToRerun','Test-SqlReadOnly','Split-OffKeyword','Get-ExactTextMap')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
+                        $n.Name -in @('Initialize-DumpDb','Test-SqlSafeToRerun','Test-SqlReadOnly','Split-OffKeyword','Get-ExactTextMap','Strip-Parens')},$true) | ForEach-Object { Invoke-Expression $_.Extent.Text }
 Initialize-DumpDb
 
 $fail = 0
