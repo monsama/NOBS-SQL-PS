@@ -17,8 +17,15 @@ software.
 powershell -ExecutionPolicy Bypass -File .\NOBSSQL.ps1
 ```
 
-Your browser opens automatically. **Closing the console window stops the
-server.** Pass `-NoBrowser` to start the server without opening a browser.
+If Chrome or Edge is installed, the interface opens in a window of its own, using a
+separate browser profile with extensions switched off - so nothing installed in your
+everyday browser reaches these fields. That matters mostly for password managers, which
+otherwise offer to fill a saved credential into the box deciding which database server
+you connect to. Without Chrome or Edge it falls back to your default browser, where your
+extensions do apply as usual.
+
+**Closing the console window stops the server.** Pass `-NoBrowser` to start the server
+without opening a browser.
 
 Requires Windows PowerShell 5.1 or later.
 

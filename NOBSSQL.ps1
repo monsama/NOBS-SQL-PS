@@ -8750,7 +8750,13 @@ function Start-AppWindow {
         # hours, and enough of those in a row exhausts all 8 fallback ports and forces a random one,
         # silently resetting every localStorage-based setting (pinned tables, hidden columns, accent
         # colors, session tabs) the next time the app is opened.
-        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
+        # --disable-extensions: this window has its own profile and exists to show one local page,
+        # so nothing installed in the browser has business in it - and a password manager has the
+        # worst business of all, offering to fill a saved credential into the field that decides
+        # which database server gets connected to. A dedicated profile is not enough on its own:
+        # an extension installed by company policy (ExtensionInstallForcelist) lands in every
+        # profile, new ones included, which is how one turned up in these fields.
+        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-extensions","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
         return $true
     }
     return $false
