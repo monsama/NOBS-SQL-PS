@@ -72,9 +72,6 @@ Requires Windows PowerShell 5.1 or later.
   and as themselves in latin1, while data that is genuinely damaged reads badly in both. Nothing
   can be written while this is on - what is shown is not what a write would store - and the
   connection itself is opened read-only at the server, not only in the app.
-  `binary` differs slightly between the editions: both ask the server for no transcoding at all,
-  the desktop one shows every such value as hex, and here `mysql.exe` hexes only what it calls
-  binary itself, so the bytes arrive and are decoded as they read.
 - **Grid edits go to the database the query ran in**, including after a leading `USE`.
 - **Compare runs both connections in UTC.** TIMESTAMP values therefore copy correctly between
   servers in different time zones, and Compare shows them in UTC.
