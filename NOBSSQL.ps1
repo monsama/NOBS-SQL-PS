@@ -287,7 +287,7 @@ function Get-CnfSafe { param([string]$s) if(-not $s){ return $s }; return ($s -r
 # same list is in the desktop edition's main.rs (BROWSE_CHARSETS), which is what its server is
 # asked for - so neither edition can widen what the other accepts.
 $script:BrowseCharsets = @(
-    'binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4','ucs2',
+    'binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4',
     'cp1250','cp1251','cp1256','cp1257','cp850','cp852','cp866','cp932','koi8r','koi8u',
     'greek','hebrew','tis620','big5','gbk','gb2312','sjis','ujis','euckr','macroman')
 function Get-BrowseCharset {
@@ -4278,7 +4278,7 @@ function applyEnv(name){const m=connMeta()[name]||{};window.readOnly=!!m.readonl
 //
 // The list mirrors BROWSE_CHARSETS in main.rs, which is what the server is actually asked for -
 // anything not in that list is ignored there, so this list cannot widen what is accepted.
-const BROWSE_CHARSETS=['binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4','ucs2',
+const BROWSE_CHARSETS=['binary','ascii','latin1','latin2','latin5','latin7','utf8mb3','utf8mb4',
  'cp1250','cp1251','cp1256','cp1257','cp850','cp852','cp866','cp932','koi8r','koi8u',
  'greek','hebrew','tis620','big5','gbk','gb2312','sjis','ujis','euckr','macroman'];
 window.browseCharset='';
@@ -4380,9 +4380,19 @@ async function apiCall(path,p,signal){p=p||{};p.token=TOKEN;
  if(path==='/api/connect'){p.conn=getConn();p.ro=!!window.readOnly;}
  else if(path==='/api/conn-save'&&p.conn){p.ro=false;}
  else{p.conn=window._activeConn||getConn();p.ro=(window._activeConn?!!window._activeReadOnly:!!window.readOnly);}
- // Browsing in another character set rides along on the connection, and makes the request
- // read-only whatever the profile says. The backend decides the same thing for itself.
- if(window.browseCharset&&path!=='/api/conn-save'&&p.conn){p.conn=Object.assign({},p.conn,{charset:window.browseCharset});p.ro=true;}
+ // Browsing in another character set makes every request read-only whatever the profile says. The
+ // charset itself goes only where the caller asks for it, with browse:true - which is the query
+ // that reads the rows on screen, and nothing else.
+ //
+ // It cannot go on everything. The app asks the server what a table's columns are called and builds
+ // its next statement out of the answer, and in a binary session the client hexes every string it
+ // returns - names included. That query came back saying the column was called 0x74 and the
+ // statement built from it was refused: Unknown column '0x74'. Metadata has to arrive as itself.
+ if(window.browseCharset&&path!=='/api/conn-save'){
+  p.ro=true;
+  if(p.browse&&p.conn)p.conn=Object.assign({},p.conn,{charset:window.browseCharset});
+ }
+ if(p)delete p.browse;
  busyStart();try{const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p),signal});return await r.json();}catch(e){if(e&&e.name==='AbortError')return {ok:false,aborted:true};showDead();return {ok:false,error:'Server unavailable'};}finally{busyStop();}}
 // Floating (draggable, non-blocking) modals remember where they were left, keyed by id, and
 // get bumped to the top of the floating stack whenever they're (re)opened or clicked - a plain
@@ -6079,7 +6089,7 @@ async function runSql(id,sql,paging){const t=T(id);if(!t)return;if(sql!=null&&sq
     const bind=t.ddl?null:parseSingleEditableTable(lastStmt,tableDb);
     const exact=bind?await exactTextQuery(_q,lastStmt,bind):null;
     if(!T(id))return;
-    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,exactText:exact&&exact.cols.length?exact.cols:undefined},t.abortCtrl.signal);
+    const r=await api('/api/query',{sql:exact?exact.sql:_q,db:runDb,requestId:reqId,pageSize:PAGE_BATCH,browse:true,exactText:exact&&exact.cols.length?exact.cols:undefined},t.abortCtrl.signal);
     if(r.aborted){if(T(id)){st.className='status';st.textContent='Query cancelled.';}return;}
     if(!T(id))return;
     if(!r.ok){st.className='status err';st.textContent=r.error;$('res_'+id).innerHTML='';log(logErr(r.error));return;}
