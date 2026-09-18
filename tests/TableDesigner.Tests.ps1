@@ -8,6 +8,11 @@
 
 param([Parameter(Mandatory)][string]$ScriptPath)
 
+# An error from a function lifted out of the script is a failure of this test, not a line of red
+# text above "all passed" - a function that calls something which was not lifted goes unnoticed
+# otherwise. GitHub sets this for its pwsh steps, which is why CI once saw what a local run did not.
+$ErrorActionPreference = 'Stop'
+
 if (-not (Test-Path $ScriptPath)) { "  FAIL  script not found: $ScriptPath"; exit 1 }
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) { "  FAIL  node not found on PATH - this UI is JavaScript and needs it to run"; exit 1 }

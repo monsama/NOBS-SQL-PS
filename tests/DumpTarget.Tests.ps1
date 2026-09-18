@@ -13,6 +13,11 @@
 
 param([Parameter(Mandatory)][string]$ScriptPath)
 
+# An error from a function lifted out of the script is a failure of this test, not a line of red
+# text above "all passed" - a function that calls something which was not lifted goes unnoticed
+# otherwise. GitHub sets this for its pwsh steps, which is why CI once saw what a local run did not.
+$ErrorActionPreference = 'Stop'
+
 $e=$null;$t=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $ScriptPath).Path,[ref]$t,[ref]$e)
 if($e -and $e.Count){ $e | ForEach-Object { "  PARSE ERROR  line $($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
