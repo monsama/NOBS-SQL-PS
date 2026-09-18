@@ -3978,7 +3978,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
 <div class="modal floating" id="mView"><div class="box" style="width:1000px;max-width:95vw;display:flex;flex-direction:column;overflow:hidden;top:60px;left:100px"><div style="display:flex;align-items:center;justify-content:space-between;cursor:move;user-select:none;flex:none" onmousedown="floatDragStart(event,'mView')" title="Drag to move"><h3 id="vTitle" style="margin:0 0 10px">Value</h3><span style="display:flex;gap:2px"><span onmousedown="event.stopPropagation()" onclick="floatToggleMaximize('mView')" title="Maximize" id="maxBtn_mView" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:14px;line-height:1">&#9974;</span><span onmousedown="event.stopPropagation()" onclick="floatMinimize('mView')" title="Minimize" style="cursor:pointer;padding:2px 10px;font-weight:700;font-size:16px;line-height:1">&#8722;</span></span></div>
  <img id="vImg" style="display:none;max-width:100%;max-height:340px;margin-bottom:6px;border:1px solid var(--bd);border-radius:3px;flex:none">
  <div id="vNote" style="display:none;font-size:11px;color:var(--log-warn);margin-bottom:4px;flex:none"></div>
- <textarea id="vText" style="width:100%;height:520px;flex:1;min-height:0;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></textarea>
+ <textarea id="vText" spellcheck="false" style="width:100%;height:520px;flex:1;min-height:0;font-family:'Cascadia Code',Consolas,'SF Mono',Menlo,'DejaVu Sans Mono',monospace;font-size:12px"></textarea>
  <select id="vSelect" style="width:100%;display:none;padding:8px;font-size:13px;flex:none"></select>
  <div id="vMulti" style="width:100%;display:none;max-height:520px;overflow:auto;padding:8px;border:1px solid var(--bd);border-radius:3px;background:var(--in);box-sizing:border-box;font-size:13px;flex:1;min-height:0"></div>
  <input id="vDate" style="width:100%;display:none;padding:8px;font-size:13px;box-sizing:border-box;flex:none">
@@ -8568,6 +8568,16 @@ function listNav(box,e){const items=[...box.querySelectorAll('.item')];if(!items
  else if(e.key==='Enter'){e.preventDefault();if(i>=0)items[i].click();return;}
  else return;
  items.forEach(x=>x.classList.remove('kbsel'));if(i<0)i=0;items[i].classList.add('kbsel');items[i].scrollIntoView({block:'nearest'});}
+// A file dropped anywhere the page does not handle is a navigation: the browser replaces this app
+// with the file it was given, and every unsaved query tab goes with it. Dragging a .sql file onto
+// the editor is a reasonable thing to try, so the cost of not saying anything here is someone's
+// afternoon. Only drags carrying files are refused - reordering a tab drags text/plain and is left
+// alone - and refusing means the drop does nothing at all rather than navigating.
+['dragover','drop'].forEach(type=>window.addEventListener(type,e=>{
+ if(!e.dataTransfer||![...(e.dataTransfer.types||[])].includes('Files'))return;
+ e.preventDefault();
+ try{e.dataTransfer.dropEffect='none';}catch(_){}
+}));
 // The browser remembers what was typed into a field and offers it back the next time that field is
 // clicked - its own form history, nothing to do with any extension, which is why it shows up in the
 // desktop edition's WebView2 as well. Here that list is a nuisance at best: it covers the value
@@ -8775,7 +8785,7 @@ function Start-AppWindow {
         # which database server gets connected to. A dedicated profile is not enough on its own:
         # an extension installed by company policy (ExtensionInstallForcelist) lands in every
         # profile, new ones included, which is how one turned up in these fields.
-        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-extensions","--disable-save-password-bubble","--disable-features=AutofillServerCommunication","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
+        $script:BrowserProcess = Start-Process $exe -ArgumentList @("--app=$Url","--user-data-dir=`"$profile`"","--no-first-run","--no-default-browser-check","--disable-extensions","--disable-save-password-bubble","--disable-session-crashed-bubble","--disable-features=AutofillServerCommunication,Translate","--start-maximized","--window-position=0,0","--window-size=$w,$h") -PassThru
         return $true
     }
     return $false
