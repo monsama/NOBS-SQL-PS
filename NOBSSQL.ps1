@@ -6215,6 +6215,10 @@ function closeCursorFor(t){if(!t||!t.cursorId)return;const cid=t.cursorId;t.curs
 async function fetchNextBatch(id){const t=T(id);if(!t||!t.cursorId||t.runningReqId||t.fetchingMore)return;
  const st=$('st_'+id);const wasClassName=st?st.className:'';const wasText=st?st.textContent:'';
  t.fetchingMore=true;t.abortCtrl=new AbortController();t.runningReqId=t.cursorReqId;setRunning(id,true);
+ // The rows this appends belong to the run that opened the cursor. If a newer run has started
+ // since, they are someone else's rows - see the run stamp in runSql.
+ const seq=t.runSeq;
+ const stale=()=>!T(id)||t.runSeq!==seq;
  if(st){st.className='status';st.textContent='Fetching next '+PAGE_BATCH+' rows\u2026';}
  try{
   const r=await api('/api/fetch-cursor-batch',{cursorId:t.cursorId,requestId:t.cursorReqId,pageSize:PAGE_BATCH},t.abortCtrl.signal);
