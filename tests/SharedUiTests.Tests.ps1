@@ -1,7 +1,7 @@
 # Checks every test in this directory that carries a copy of a test from the Tauri edition against
 # the file it was copied from.
 #
-# Both editions ship the same UI, so they share its tests: the JavaScript lives in NOBS-SQL-Editor
+# Both editions ship the same UI, so they share its tests: the JavaScript lives in nobs-sql-editor
 # under tests/ui/, and the tests here embed a copy of it to run against NOBSSQL.ps1. Keeping a copy
 # in step was a comment asking politely, and a stale copy fails nothing - it goes on passing
 # against whatever it last knew about, so this edition reports a tested UI while testing an older
@@ -11,8 +11,8 @@
 # names its source somewhere in its header as tests/ui/<name>.test.mjs, which every one of them
 # already does - so a test file added later is covered the day it is written.
 #
-#   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../NOBS-SQL-Editor
-#   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../NOBS-SQL-Editor -Update   fix the copies
+#   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../nobs-sql-editor
+#   pwsh -NoProfile -File tests/SharedUiTests.Tests.ps1 ../nobs-sql-editor -Update   fix the copies
 #
 # -Update rewrites each drifted copy from its source, which is the fix when this fails; review what
 # it changed before committing, since it is the shared test that decides what this edition tests.

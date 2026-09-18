@@ -110,10 +110,10 @@ jobs:
       # Six of the tests here carry a copy of a test that lives in the Tauri edition, because both
       # editions ship the same UI. A stale copy fails nothing - it keeps passing against whatever
       # it last knew about - so the copies are compared against the originals rather than trusted.
-      - name: Check out NOBS-SQL-Editor (the shared UI tests)
+      - name: Check out nobs-sql-editor (the shared UI tests)
         uses: actions/checkout@v7
         with:
-          repository: monsama/NOBS-SQL-Editor
+          repository: monsama/nobs-sql-editor
           path: editor
           sparse-checkout: tests/ui
           sparse-checkout-cone-mode: false
@@ -138,7 +138,7 @@ jobs:
         run: ./tests/DdlRecreate.Tests.ps1 ./NOBSSQL.ps1
 
   # The live suite against real MariaDB and MySQL servers, started on this runner by the setup
-  # script in NOBS-SQL-Editor (which also holds the shared fixture). MySQL is unpacked where a real
+  # script in nobs-sql-editor (which also holds the shared fixture). MySQL is unpacked where a real
   # installation lives, so the app finds MySQL's own client there, and MariaDB's client tools go
   # where the app's own download puts them.
   live:
@@ -147,10 +147,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Check out NOBS-SQL-Editor (setup script and fixture)
+      - name: Check out nobs-sql-editor (setup script and fixture)
         uses: actions/checkout@v7
         with:
-          repository: monsama/NOBS-SQL-Editor
+          repository: monsama/nobs-sql-editor
           path: editor
 
       - name: Cache server downloads

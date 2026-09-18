@@ -2740,7 +2740,7 @@ function Api-SaveConfig { param($data)
 # ---------- update notice ----------
 # The app says when a newer release exists and links to it; it never downloads or installs
 # anything itself. The page asks once per start unless that is switched off in Settings.
-$script:ReleasesRepo = 'monsama/NOBS-SQL-Editor-PowerShell'
+$script:ReleasesRepo = 'monsama/nobs-sql-editor-powershell'
 function Test-ReleaseIsNewer { param([string]$Latest, [string]$Current)
     $a = $null; $b = $null
     if (-not [version]::TryParse(([string]$Latest).Trim().TrimStart('v', 'V'), [ref]$a)) { return $false }
@@ -4170,7 +4170,7 @@ table.grid td input[type="checkbox"]{display:block;margin:0 auto;vertical-align:
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">LINKS</div>
  <div class="muted" style="font-size:12px;line-height:1.8;font-family:Consolas,monospace;user-select:text">
   Website&nbsp;&nbsp;&nbsp;https://monsama.ch<br>
-  Source&nbsp;&nbsp;&nbsp;&nbsp;https://github.com/monsama/NOBS-SQL-Editor-PowerShell<br>
+  Source&nbsp;&nbsp;&nbsp;&nbsp;https://github.com/monsama/nobs-sql-editor-powershell<br>
   License&nbsp;&nbsp;&nbsp;https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
  </div>
  <div style="margin:12px 0 4px;font-size:11px;font-weight:700;letter-spacing:.6px;color:var(--muted)">THIRD PARTY</div>

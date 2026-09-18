@@ -54,7 +54,7 @@ under `node`, which the `windows-latest` CI image already ships. If `node` is mi
 rather than skipping.
 
 `ConnSslCa`, `TableDesigner`, `DdlRecreate`, `UpdateCheck`, `TableBinding` and `GridSave` embed the very same test files the Tauri edition
-runs (`tests/ui/*.test.mjs` in NOBS-SQL-Editor), pointed at this file through `NOBS_UI_SOURCE`.
+runs (`tests/ui/*.test.mjs` in nobs-sql-editor), pointed at this file through `NOBS_UI_SOURCE`.
 They are generated from those files - regenerate rather than edit them by hand.
 
 `DumpTarget` and `ResultRows` compile the script's small C# helper, so they also prove it builds
@@ -74,11 +74,11 @@ pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
 
 It starts the real server on its usual port, drives the real HTTP API, and stops it again. Load
 the fixture first — it is shared with the sibling
-[NOBS-SQL-Editor](https://github.com/monsama/NOBS-SQL-Editor) repo, at
+[nobs-sql-editor](https://github.com/monsama/nobs-sql-editor) repo, at
 `tests/fixtures/seed.sql` there:
 
 ```powershell
-mysql -u root -p < ..\NOBS-SQL-Editor\tests\fixtures\seed.sql
+mysql -u root -p < ..\nobs-sql-editor\tests\fixtures\seed.sql
 ```
 
 It creates only `nobs_test` and touches no other schema. The live tests restore what they change,
@@ -151,7 +151,7 @@ no test, and this project has been bitten by exactly that before.
 ### In CI
 
 GitHub's service containers are Linux-only while this app targets Windows, so the `live` job in
-`.github/workflows/test.yml` starts the servers itself. It checks out NOBS-SQL-Editor and runs
+`.github/workflows/test.yml` starts the servers itself. It checks out nobs-sql-editor and runs
 `tests/ci/start-test-servers.ps1` from there (see that repo's `docs/TESTING.md`):
 
 - It downloads and starts MariaDB and MySQL and loads the shared fixture.
@@ -163,12 +163,12 @@ own network address, so the `verify-ca` check runs too.
 
 After that the same job runs the GUI tests, which drive this script's UI in headless Edge: grid
 editing, Compare, the export and import dialogs, and a script's results. The scenarios are
-shared with the desktop edition and live in NOBS-SQL-Editor (`tests/gui`, see its
+shared with the desktop edition and live in nobs-sql-editor (`tests/gui`, see its
 `docs/TESTING.md`). To run them here:
 
 ```powershell
 $env:NOBS_TEST_DSN = '127.0.0.1:3306:root:yourpassword'
-node ..NOBS-SQL-Editor	estsguiun.mjs --app ps --target .NOBSSQL.ps1
+node ..nobs-sql-editor	estsguiun.mjs --app ps --target .NOBSSQL.ps1
 ```
 
 ### What it covers

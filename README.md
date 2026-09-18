@@ -6,7 +6,7 @@ a tiny local HTTP server (127.0.0.1 only, no admin rights), shells out to the
 browser.
 
 This is the same application as
-[NOBS-SQL-Editor](https://github.com/monsama/NOBS-SQL-Editor), which packages
+[nobs-sql-editor](https://github.com/monsama/nobs-sql-editor), which packages
 the same UI as a native desktop app using [Tauri](https://tauri.app). Use this
 edition when you want zero installation, or a machine where you cannot install
 software.
@@ -156,7 +156,7 @@ say - still shows a NUL in text as a space, and is exported that way.
 ## Updates
 
 A few seconds after it starts, the app asks GitHub (`api.github.com`) for the latest release of
-[NOBS-SQL-Editor-PowerShell](https://github.com/monsama/NOBS-SQL-Editor-PowerShell/releases). If a newer version exists, a small
+[nobs-sql-editor-powershell](https://github.com/monsama/nobs-sql-editor-powershell/releases). If a newer version exists, a small
 notice with a link appears in the bottom-left corner. Nothing is downloaded or installed. The
 request carries nothing beyond what any web request does: your IP address and a user agent
 naming the app.

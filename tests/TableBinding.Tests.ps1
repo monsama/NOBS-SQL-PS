@@ -1,6 +1,6 @@
 # Tests for which table a result grid edits, and how control characters in text are shown, run against the UI inline in NOBSSQL.ps1.
 #
-# The JavaScript below is the same test file the Tauri edition (NOBS-SQL-Editor,
+# The JavaScript below is the same test file the Tauri edition (nobs-sql-editor,
 # tests/ui/table-binding.test.mjs) runs against its ui/index.html - both editions share the UI, so they share
 # the test. Generated from that file; keep the two in step.
 #

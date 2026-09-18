@@ -7,7 +7,7 @@
 #   $env:NOBS_TEST_DSN = '127.0.0.1:3306:root:yourpassword'
 #   pwsh -NoProfile -File tests/Live.Tests.ps1 ./NOBSSQL.ps1
 #
-# Load the fixture first (it lives in the sibling NOBS-SQL-Editor repo, which shares this UI):
+# Load the fixture first (it lives in the sibling nobs-sql-editor repo, which shares this UI):
 #   mysql -u root -p < tests/fixtures/seed.sql
 #
 # Not run in CI: windows-latest has no database, and GitHub's service containers are Linux-only
