@@ -1048,7 +1048,13 @@ console.log(JSON.stringify(out).replace(/[\u007f-\uffff]/g, c => '\\u' + c.charC
             }
             Check $killed 'the mid-apply batch was found and its connection killed'
 
-            $res = Receive-Job $job -Wait -AutoRemoveJob
+            # Wait, read, then remove - rather than Receive-Job -AutoRemoveJob, which races with a
+            # thread job's own teardown and failed a CI run with "cannot remove the job because it
+            # does not exist or because it is a child job". The writer job earlier in this file is
+            # waited on this way already; this was the one place that was not.
+            $null = $job | Wait-Job -Timeout 60
+            $res = Receive-Job $job
+            $job | Remove-Job -Force -ErrorAction SilentlyContinue
             $left = "$(Sql 'SELECT COUNT(*) FROM nobs_test.tx_drop')".Trim()
             # The two rows that had already been inserted must be gone: the transaction never
             # reached its COMMIT, and the server discards an open one when the connection dies.
