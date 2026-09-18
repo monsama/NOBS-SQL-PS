@@ -195,14 +195,32 @@ jobs:
         shell: pwsh
         run: |
           $env:NOBS_TEST_DSN = $env:NOBS_CI_MARIADB_DSN
+          # Exit 3 means the run never reached a scenario: the window did not open, the browser
+          # did not answer, the database did not connect. Nothing was evaluated, so trying again
+          # hides nothing - and the line it prints is what makes the frequency countable later.
+          # Any other failure is a check that found something and fails the build as it is.
           node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          if ($LASTEXITCODE -eq 3) {
+            "  the app never started - trying once more (exit 3)"
+            node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: GUI tests against MySQL
         if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $env:NOBS_TEST_DSN = $env:NOBS_CI_MYSQL_DSN
+          # Exit 3 means the run never reached a scenario: the window did not open, the browser
+          # did not answer, the database did not connect. Nothing was evaluated, so trying again
+          # hides nothing - and the line it prints is what makes the frequency countable later.
+          # Any other failure is a check that found something and fails the build as it is.
           node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          if ($LASTEXITCODE -eq 3) {
+            "  the app never started - trying once more (exit 3)"
+            node editor/tests/gui/run.mjs --app ps --target ./NOBSSQL.ps1
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Server logs
         if: ${{ failure() }}
