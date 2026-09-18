@@ -139,6 +139,11 @@ jobs:
         shell: pwsh
         run: ./tests/GridSave.Tests.ps1 ./NOBSSQL.ps1
 
+      # Fitting a column to its contents measures the values, not the rows that happen to be drawn.
+      - name: Run column fit tests
+        shell: pwsh
+        run: ./tests/ColumnFit.Tests.ps1 ./NOBSSQL.ps1
+
       # On MySQL a failed recreate of a procedure/function/trigger left it dropped.
       - name: Run DDL recreate tests
         shell: pwsh
